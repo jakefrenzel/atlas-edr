@@ -1,3 +1,3 @@
 # EDR
 
-Coming soon...
+EDR built in rust
