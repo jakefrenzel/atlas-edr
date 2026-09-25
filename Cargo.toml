@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+atlas-proto = { path = "crates/atlas-proto" }
+blake3 = "1.8"
+criterion = "0.8"
+prost = "0.14"
+prost-build = "0.14"
+prost-reflect = { version = "0.16", features = ["serde"] }
+proptest = "1.11"
+protox = "0.9"
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1.26", features = ["v7"] }

@@ -1,0 +1,48 @@
+// OCSF Windows extension: Registry Key Activity (201001) and Registry Value Activity (201002).
+syntax = "proto3";
+
+package atlas.events.v1;
+
+import "atlas/events/v1/objects.proto";
+
+message RegistryKeyActivity {
+  ProcessRef actor = 1;
+  // OCSF `reg_key.path`. For Rename: the new path.
+  string path = 2;
+  oneof activity {
+    RegistryKeyCreate create = 3; // activity_id 1
+    RegistryKeyDelete delete = 4; // activity_id 4
+    RegistryKeyRename rename = 5; // activity_id 5
+  }
+}
+
+message RegistryKeyCreate {}
+message RegistryKeyDelete {}
+
+message RegistryKeyRename {
+  // OCSF `prev_reg_key.path`: the original path.
+  string prev_path = 1;
+}
+
+message RegistryValueActivity {
+  ProcessRef actor = 1;
+  // OCSF `reg_value.path`: the containing key.
+  string key_path = 2;
+  // OCSF `reg_value.name`. Empty string means the default value of the key.
+  string name = 3;
+  oneof activity {
+    RegistryValueSet set = 4;       // activity_id 2
+    RegistryValueDelete delete = 5; // activity_id 4
+  }
+}
+
+message RegistryValueSet {
+  // Windows REG_* constant (REG_NONE = 0 .. REG_QWORD = 11). Not an OCSF type_id.
+  // `optional` because REG_NONE is 0: without presence an unset type would
+  // silently read as REG_NONE. Absent is rejected as Missing.
+  optional uint32 type = 1;
+  bytes data = 2;
+  bool data_truncated = 3;
+}
+
+message RegistryValueDelete {}

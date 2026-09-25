@@ -1,0 +1,30 @@
+{
+  "eventId": "AZIqblsAcACAAAAAAAAAAQ==",
+  "time": "1790000000123456789",
+  "sensor": "SENSOR_ETW",
+  "device": {
+    "uid": "0NDQ0NDQ0NDQ0NDQ0NDQ0A==",
+    "bootId": "sLCwsLCwsLCwsLCwsLCwsA=="
+  },
+  "module": {
+    "actor": {
+      "uid": "Rbyh0W87kN60U7HhEUzkUg==",
+      "pid": 7788,
+      "file": {
+        "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "name": "powershell.exe"
+      },
+      "user": {
+        "uid": "S-1-5-21-1000-1000-1000-1001",
+        "name": "DESK-01\\jake"
+      }
+    },
+    "load": {
+      "file": {
+        "path": "C:\\Windows\\System32\\amsi.dll",
+        "name": "amsi.dll"
+      },
+      "baseAddress": "140716318916608"
+    }
+  }
+}

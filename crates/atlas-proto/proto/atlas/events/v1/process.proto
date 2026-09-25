@@ -1,0 +1,25 @@
+// OCSF Process Activity (class_uid 1007).
+syntax = "proto3";
+
+package atlas.events.v1;
+
+import "atlas/events/v1/objects.proto";
+
+message ProcessActivity {
+  oneof activity {
+    ProcessLaunch launch = 1;       // activity_id 1
+    ProcessTerminate terminate = 2; // activity_id 2
+  }
+}
+
+message ProcessLaunch {
+  // The process that actually issued the creation (the real creator).
+  ProcessRef actor = 1;
+  // The new process, full detail.
+  Process process = 2;
+}
+
+message ProcessTerminate {
+  ProcessRef process = 1;
+  optional int32 exit_code = 2;
+}

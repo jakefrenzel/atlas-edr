@@ -1,6 +1,6 @@
 # Sub-project 0a — Event Schema Design
 
-**Status:** Draft for review (brainstorm 2026-09-24)
+**Status:** Implemented (2026-09-24). Reference: docs/schema-reference.md
 **Roadmap:** Sub-project 0 was split into **0a — Event schema** (this spec) and **0b — Scaffolding** (monorepo, Docker Compose, Hyper-V VM, CI).
 **Depends on:** nothing. **Depended on by:** every other sub-project.
 
@@ -50,6 +50,7 @@ Define the normalized event model that all Atlas telemetry uses: produced by sen
 - Package `atlas.events.v1`.
 - Compiled in `build.rs` with **`prost-build` + `protox`** (pure-Rust protobuf compiler — no `protoc` binary on Windows or CI).
 - No hand-written logic.
+- Wire layout: `meta` fields are flattened into `Event` (fields 1–3); per-activity fields live in oneof sub-messages mirroring the domain enums.
 
 **`atlas-schema`** — hand-written domain model.
 - `Event { meta: EventMeta, device: DeviceContext, kind: EventKind }`
@@ -163,7 +164,7 @@ OCSF defines further activities, such as Process Inject, Network Refuse/Listen, 
 - `cmd_line_truncated` (bool)
 - `created_time` (`i64` ns)
 - `integrity` (enum `Untrusted | Low | Medium | High | System | Protected`; optional)
-- `parent_process` (`ProcessRef`; the *claimed* parent — see §5.2)
+- `parent_process` (`ProcessRef`, optional: absent when the OS reports no parent, e.g. early-boot processes; the *claimed* parent — see §5.2)
 - `file.hashes` (SHA-256; optional — sensor decides caching)
 - `file.signature` (signer string + status enum `Valid | Invalid | Unsigned`; optional)
 
@@ -213,7 +214,7 @@ Whether the sensor emits Read is a sub-project 1 decision; the schema defines it
 
 | Activity | Fields |
 |---|---|
-| Set | `reg_value.path` (key path), `reg_value.name`, `reg_value.type` (enum of `REG_*` types), `reg_value.data` (bytes), `reg_value.data_truncated` (bool), `actor.process` |
+| Set | `reg_value.path` (key path), `reg_value.name`, `reg_value.type` (enum of `REG_*` types; carries explicit presence on the wire because `REG_NONE` = 0, and absent is rejected as `Missing`), `reg_value.data` (bytes), `reg_value.data_truncated` (bool), `actor.process` |
 | Delete | `reg_value.path`, `reg_value.name`, `actor.process` |
 
 ### 5.8 DNS Activity
@@ -238,6 +239,7 @@ An `atlas` extension namespace is reserved for Atlas-specific fields with no OCS
 
 - **Structure:** `oneof kind` is set; the activity is valid for the class; every field required for that class/activity is present (§5).
 - **Enums:** unknown enum values are **rejected** (not mapped to "Other"). Operational rule: **upgrade the server before agents.** Every proto enum has a mandatory proto3 zero value named `*_UNSPECIFIED`, and it is also rejected. An unset enum never silently becomes a real value.
+- **Newer-schema data:** a class or activity this build does not know (an unknown oneof field) is rejected as `Missing` on `kind` / `activity`.
 - **Identifiers:** `event_id` is a well-formed UUIDv7; every `uid` / `device.uid` is exactly 16 bytes.
 - **Size limits** (an honest sensor truncates to fit and sets the matching `*_truncated` flag; the validator rejects anything over):
 
@@ -248,6 +250,9 @@ An `atlas` extension namespace is reserved for Atlas-specific fields with no OCS
 | `reg_value.data` | 4 KiB |
 | `query.hostname`, `answers[].data` | 1 KiB each |
 | `answers[]` | 64 entries |
+| `user.uid` (SID) | 256 B |
+| `user.name` | 1 KiB |
+| `file.signature.signer` | 1 KiB |
 | encoded event | 256 KiB (checked before decode) |
 
 - **Text:** protobuf `string` must be valid UTF-8. Windows UTF-16 strings containing unpaired surrogates are converted lossily by the sensor (U+FFFD). **Known limitation:** an attacker can craft names that lose information in conversion; recorded for sub-project 3.
@@ -276,7 +281,7 @@ e.g. `process.file.path: TooLarge`. The crate reports; callers decide policy. In
 - **Round-trip property tests** (`proptest`): arbitrary valid domain `Event` → wire → domain equals the original.
 - **Validator tests:** table-driven; one negative case per rule in §6.1, asserting exact `field_path` and `kind`.
 - **Fuzzing** (`cargo-fuzz`): arbitrary bytes → decode → `TryFrom` must never panic, hang, or allocate unboundedly. Runs on Linux CI (crates are platform-neutral).
-- **Golden fixtures:** one protobuf-JSON example per class/activity in `crates/atlas-schema/tests/fixtures/`; decoded and validated in tests; double as documentation.
+- **Golden fixtures:** one protobuf-JSON file per class/activity in `crates/atlas-schema/tests/fixtures/`, generated from the named samples with `ATLAS_UPDATE_FIXTURES=1` and reviewed by hand before commit; decoded and validated in tests; double as documentation.
 - **OCSF ID table test:** derived `class_uid` / `activity_id` / `type_uid` equal the pinned OCSF values (§5.0).
 - **`process.uid` test vectors:** fixed inputs → known outputs, so any other implementation can prove conformance.
 - **Benchmarks** (`criterion`): encode, decode, validate throughput recorded as a baseline. Not a gate (performance budgets are sub-project 8).

@@ -1,0 +1,32 @@
+// OCSF File System Activity (class_uid 1001).
+syntax = "proto3";
+
+package atlas.events.v1;
+
+import "atlas/events/v1/objects.proto";
+
+message FileSystemActivity {
+  ProcessRef actor = 1;
+  // For Rename: the original file.
+  File file = 2;
+  oneof activity {
+    FileCreate create = 3;                // activity_id 1
+    FileRead read = 4;                    // activity_id 2
+    FileUpdate update = 5;                // activity_id 3
+    FileDelete delete = 6;                // activity_id 4
+    FileRename rename = 7;                // activity_id 5
+    FileSetAttributes set_attributes = 8; // activity_id 6
+  }
+}
+
+message FileCreate {}
+message FileRead {}
+message FileUpdate {}
+message FileDelete {}
+
+message FileRename {
+  // The file after the rename (OCSF `file_result`).
+  File file_result = 1;
+}
+
+message FileSetAttributes {}

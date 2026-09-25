@@ -1,0 +1,18 @@
+// OCSF Module Activity (class_uid 1005).
+syntax = "proto3";
+
+package atlas.events.v1;
+
+import "atlas/events/v1/objects.proto";
+
+message ModuleActivity {
+  ProcessRef actor = 1;
+  oneof activity {
+    ModuleLoad load = 2; // activity_id 1
+  }
+}
+
+message ModuleLoad {
+  File file = 1;
+  uint64 base_address = 2;
+}
