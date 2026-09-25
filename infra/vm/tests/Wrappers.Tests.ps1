@@ -19,6 +19,7 @@ Describe 'Wrapper scripts' {
         @{ Script = 'Set-EdrTestNetwork.ps1'; Function = 'Set-EdrTestNetwork'; Params = @{ Mode = 'Isolated' } }
         @{ Script = 'Copy-ToEdrTestVm.ps1'; Function = 'Copy-ToEdrTestVm'; Params = @{ Path = @('C:\a', 'C:\b') } }
         @{ Script = 'Reset-EdrTestVm.ps1'; Function = 'Reset-EdrTestVm'; Params = @{ Checkpoint = 'pre-driver' } }
+        @{ Script = 'guest\Initialize-EdrTestGuest.ps1'; Function = 'Initialize-EdrTestGuest'; Params = @{} }
     ) {
         Mock Import-Module {}
         Mock $Function {}

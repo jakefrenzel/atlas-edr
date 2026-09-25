@@ -285,6 +285,170 @@ function Reset-EdrTestVm {
     }
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Guest: Initialize-EdrTestGuest (runs inside the VM, Windows PowerShell 5.1)
+# ---------------------------------------------------------------------------------------------------------------------
+
+function Invoke-EdrBcdedit {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string[]]$ArgumentList)
+    $output = & bcdedit.exe @ArgumentList 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "bcdedit $($ArgumentList -join ' ') failed ($LASTEXITCODE): $output"
+    }
+    , [string[]]$output
+}
+
+function Invoke-EdrWinget {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Id)
+    & winget.exe install --exact --id $Id --silent --accept-source-agreements --accept-package-agreements
+    # -1978335189 (0x8A15002B): already installed, no applicable upgrade.
+    if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+        throw "winget install $Id failed ($LASTEXITCODE)."
+    }
+}
+
+function ConvertFrom-EdrDbgSetting {
+    # Parses `bcdedit /dbgsettings` output ("name   value" lines) into a hashtable.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Text)
+    $settings = @{}
+    foreach ($line in $Text) {
+        if ($line -match '^(?<name>[a-z]+)\s+(?<value>\S+)\s*$') {
+            $settings[$Matches.name] = $Matches.value
+        }
+    }
+    $settings
+}
+
+function Find-EdrGuestAdapter {
+    # Returns the guest interface alias whose Hyper-V device name is $HyperVName, or $null.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$HyperVName)
+    $match = Get-NetAdapterAdvancedProperty -DisplayName 'Hyper-V Network Adapter Name' -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayValue -eq $HyperVName } | Select-Object -First 1
+    if ($match) { $match.Name } else { $null }
+}
+
+function Test-EdrGuestPrecondition {
+    # Returns one message per unmet precondition; empty when the guest is ready.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+    $c = $script:Config
+    $problems = @()
+    if (-not (Test-EdrElevated)) {
+        $problems += 'Not elevated: run from an administrator PowerShell.'
+    }
+    if (Confirm-SecureBootUEFI) {
+        $problems += 'Secure Boot is on: shut down the VM and run Complete-EdrTestVmInstall.ps1 on the host.'
+    }
+    if ((Get-MpComputerStatus).IsTamperProtected) {
+        $problems += 'Tamper Protection is on: turn it off in Windows Security > Virus & threat protection > Manage settings.'
+    }
+    if (-not (Find-EdrGuestAdapter -HyperVName $c.InternalAdapter)) {
+        $problems += "No NIC named '$($c.InternalAdapter)': check the VM's network adapters on the host."
+    }
+    if (-not (Find-EdrGuestAdapter -HyperVName $c.OnlineAdapter)) {
+        $problems += 'Not online: run Set-EdrTestNetwork.ps1 -Mode Online on the host (winget needs internet).'
+    }
+    if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+        $problems += 'winget is not available yet: update "App Installer" from the Microsoft Store, then re-run.'
+    }
+    , $problems
+}
+
+function Set-EdrGuestAddress {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    $c = $script:Config
+    $alias = Find-EdrGuestAdapter -HyperVName $c.InternalAdapter
+    if (Get-NetIPAddress -InterfaceAlias $alias -IPAddress $c.GuestIp -ErrorAction SilentlyContinue) {
+        Write-Verbose "Guest address $($c.GuestIp) already on '$alias'."
+        return
+    }
+    if ($PSCmdlet.ShouldProcess($alias, "Static $($c.GuestIp)/$($c.PrefixLength), no gateway")) {
+        Set-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv4 -Dhcp Disabled
+        New-NetIPAddress -InterfaceAlias $alias -IPAddress $c.GuestIp -PrefixLength $c.PrefixLength | Out-Null
+    }
+}
+
+function Set-EdrGuestKdnet {
+    # Enables KDNET. Keeps an existing matching configuration so the key doesn't change on re-runs.
+    # Returns the key.
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string])]
+    param()
+    $c = $script:Config
+    $current = ConvertFrom-EdrDbgSetting -Text (Invoke-EdrBcdedit -ArgumentList '/dbgsettings')
+    $reuse = $current['debugtype'] -eq 'NET' -and $current['hostip'] -eq $c.HostIp -and
+        $current['port'] -eq "$($c.KdnetPort)" -and $current['key']
+    if ($reuse) {
+        $key = $current['key']
+    } elseif ($PSCmdlet.ShouldProcess('boot configuration', "KDNET to $($c.HostIp):$($c.KdnetPort)")) {
+        $out = Invoke-EdrBcdedit -ArgumentList '/dbgsettings', 'net', "hostip:$($c.HostIp)", "port:$($c.KdnetPort)"
+        $key = ((@($out) -join "`n") | Select-String -Pattern 'Key=(\S+)').Matches[0].Groups[1].Value
+    } else {
+        return $null
+    }
+    if ($PSCmdlet.ShouldProcess('boot configuration', 'bcdedit /debug on')) {
+        Invoke-EdrBcdedit -ArgumentList '/debug', 'on' | Out-Null
+    }
+    $key
+}
+
+function Write-EdrRegistryDword {
+    # Creates the key if needed. No ShouldProcess here: the caller gates it.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][int]$Value)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -Force | Out-Null
+    }
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+}
+
+function Initialize-EdrTestGuest {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    $c = $script:Config
+    $problems = Test-EdrGuestPrecondition
+    if ($problems.Count -gt 0) {
+        throw ("The guest is not ready; nothing was changed:`n  " + ($problems -join "`n  "))
+    }
+
+    Set-EdrGuestAddress
+    if ($PSCmdlet.ShouldProcess('boot configuration', 'bcdedit /set testsigning on')) {
+        Invoke-EdrBcdedit -ArgumentList '/set', 'testsigning', 'on' | Out-Null
+    }
+    $key = Set-EdrGuestKdnet
+    $hvci = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+    if ($PSCmdlet.ShouldProcess('Memory Integrity (HVCI)', 'Turn off')) {
+        Write-EdrRegistryDword -Path $hvci -Name 'Enabled' -Value 0
+    }
+    if ($PSCmdlet.ShouldProcess('Microsoft Defender', 'Cloud protection, sample submission and real-time protection off')) {
+        Set-MpPreference -MAPSReporting Disabled -SubmitSamplesConsent NeverSend -DisableRealtimeMonitoring $true
+    }
+    foreach ($id in $c.WingetPackages) {
+        if ($PSCmdlet.ShouldProcess($id, 'winget install')) {
+            Invoke-EdrWinget -Id $id
+        }
+    }
+
+    $lines = @()
+    if ($key) {
+        $lines += '', 'KDNET key (save it; the runbook needs it):', "  windbg -k net:port=$($c.KdnetPort),key=$key"
+    }
+    $lines += '', 'Next: restart this VM, then on the host run', '  Set-EdrTestNetwork.ps1 -Mode Isolated',
+    "  Checkpoint-VM -Name $($c.VmName) -SnapshotName $($c.BaselineCheckpoint)"
+    foreach ($line in $lines) {
+        Write-Information -MessageData $line -InformationAction Continue
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-EdrTestVmConfig'
     'New-EdrTestVm'
@@ -292,4 +456,5 @@ Export-ModuleMember -Function @(
     'Set-EdrTestNetwork'
     'Copy-ToEdrTestVm'
     'Reset-EdrTestVm'
+    'Initialize-EdrTestGuest'
 )
