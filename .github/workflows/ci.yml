@@ -63,6 +63,32 @@ jobs:
           archive: false
           pr_comment: false
 
+  powershell:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Pester and PSScriptAnalyzer
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -RequiredVersion 5.9.1 -Scope CurrentUser -SkipPublisherCheck -Force
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+      - name: PSScriptAnalyzer
+        run: |
+          $findings = Invoke-ScriptAnalyzer -Path infra/vm -Recurse -Settings infra/vm/PSScriptAnalyzerSettings.psd1
+          $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize -Wrap
+          if ($findings) { throw "PSScriptAnalyzer: $(@($findings).Count) finding(s)" }
+      - name: Pester
+        run: |
+          Import-Module Pester -RequiredVersion 5.9.1
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'infra/vm/tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
   audit:
     runs-on: ubuntu-latest
     steps:

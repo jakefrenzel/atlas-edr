@@ -200,7 +200,96 @@ function New-EdrTestVm {
     New-EdrTestVmMachine -IsoPath $IsoPath
 }
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Host: day-to-day operations
+# ---------------------------------------------------------------------------------------------------------------------
+
+function Complete-EdrTestVmInstall {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    Assert-EdrElevated
+    $vm = Get-EdrTestVmRequired
+    if ("$($vm.State)" -ne 'Off') {
+        throw "VM '$($vm.Name)' is $($vm.State). Shut it down from inside Windows first, then re-run."
+    }
+    if ($PSCmdlet.ShouldProcess($vm.Name, 'Turn Secure Boot off, eject ISO, boot from disk')) {
+        Set-VMFirmware -VMName $vm.Name -EnableSecureBoot Off
+        foreach ($drive in @(Get-VMDvdDrive -VMName $vm.Name)) {
+            Remove-VMDvdDrive -VMDvdDrive $drive
+        }
+        Set-VMFirmware -VMName $vm.Name -FirstBootDevice (Get-VMHardDiskDrive -VMName $vm.Name | Select-Object -First 1)
+    }
+}
+
+function Set-EdrTestNetwork {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][ValidateSet('Isolated', 'Online')][string]$Mode)
+    Assert-EdrElevated
+    $c = $script:Config
+    $vm = Get-EdrTestVmRequired
+    $online = Get-VMNetworkAdapter -VMName $vm.Name -Name $c.OnlineAdapter -ErrorAction SilentlyContinue
+    if ($Mode -eq 'Online') {
+        if ($online) {
+            Write-Verbose 'Already online.'
+            return
+        }
+        if ($PSCmdlet.ShouldProcess($vm.Name, "Add NIC '$($c.OnlineAdapter)' on '$($c.OnlineSwitch)'")) {
+            Add-VMNetworkAdapter -VMName $vm.Name -Name $c.OnlineAdapter -SwitchName $c.OnlineSwitch -DeviceNaming On
+        }
+    } else {
+        if (-not $online) {
+            Write-Verbose 'Already isolated.'
+            return
+        }
+        if ($PSCmdlet.ShouldProcess($vm.Name, "Remove NIC '$($c.OnlineAdapter)'")) {
+            Remove-VMNetworkAdapter -VMName $vm.Name -Name $c.OnlineAdapter
+        }
+    }
+}
+
+function Copy-ToEdrTestVm {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][string[]]$Path)
+    Assert-EdrElevated
+    $c = $script:Config
+    $vm = Get-EdrTestVmRequired
+    if ("$($vm.State)" -ne 'Running') {
+        throw "VM '$($vm.Name)' is $($vm.State); Copy-VMFile needs it Running."
+    }
+    # Validate everything before copying anything.
+    $files = foreach ($p in $Path) {
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+            throw "Not a file: '$p'. Copy-ToEdrTestVm copies files, not folders."
+        }
+        (Resolve-Path -LiteralPath $p).ProviderPath
+    }
+    foreach ($file in $files) {
+        $dest = Join-Path $c.GuestDropPath (Split-Path -Leaf $file)
+        if ($PSCmdlet.ShouldProcess($vm.Name, "Copy '$file' to '$dest'")) {
+            Copy-VMFile -Name $vm.Name -SourcePath $file -DestinationPath $dest -FileSource Host -CreateFullPath -Force
+        }
+    }
+}
+
+function Reset-EdrTestVm {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Checkpoint = $script:Config.BaselineCheckpoint)
+    Assert-EdrElevated
+    $vm = Get-EdrTestVmRequired
+    if (-not (Get-VMCheckpoint -VMName $vm.Name -Name $Checkpoint -ErrorAction SilentlyContinue)) {
+        throw "VM '$($vm.Name)' has no checkpoint named '$Checkpoint'."
+    }
+    if ($PSCmdlet.ShouldProcess($vm.Name, "Restore checkpoint '$Checkpoint' and start")) {
+        Restore-VMCheckpoint -VMName $vm.Name -Name $Checkpoint -Confirm:$false
+        Start-VM -Name $vm.Name
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-EdrTestVmConfig'
     'New-EdrTestVm'
+    'Complete-EdrTestVmInstall'
+    'Set-EdrTestNetwork'
+    'Copy-ToEdrTestVm'
+    'Reset-EdrTestVm'
 )
