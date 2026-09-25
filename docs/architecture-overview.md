@@ -96,8 +96,8 @@ Each row: its own spec → plan → implementation.
 
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
-| 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Spec in review |
-| 0b | **Foundations: scaffolding** | Monorepo, Docker Compose, Hyper-V VM setup, CI (incl. `buf breaking`) | Next up (after 0a spec) |
+| 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done |
+| 0b | **Foundations: scaffolding** | Monorepo, Docker Compose, Hyper-V VM setup, CI (incl. `buf breaking`) | Next up |
 | 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Next up (with 0) |
 | 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
@@ -134,3 +134,4 @@ Each row: its own spec → plan → implementation.
 | 2026-09-24 | Process identity: `uid = BLAKE3(device.uid, boot_id, ProcessStartKey)`, which is deterministic and stateless across sensors. |
 | 2026-09-24 | v1 event classes: Process, Module, Network, File System, Registry Key, Registry Value, DNS. |
 | 2026-09-24 | Events carry an actor-process core; full process detail is only in Launch, and a process cache fills in the rest. |
+| 2026-09-24 | 0a implemented: `atlas-proto` + `atlas-schema`; unknown classes/activities from newer agents are rejected as Missing; `parent_process` optional. |
