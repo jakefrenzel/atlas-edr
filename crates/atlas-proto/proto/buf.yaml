@@ -1,0 +1,10 @@
+# buf config for the atlas.events.v1 wire contract. Spec: docs/specs/2026-09-25-scaffolding-design.md section 3.3.
+# The 0a protos pass STANDARD unmodified; never edit a v1 proto just to satisfy lint.
+version: v2
+lint:
+  use:
+    - STANDARD
+breaking:
+  # Strictest category: these messages are also persisted in agent disk buffers.
+  use:
+    - FILE

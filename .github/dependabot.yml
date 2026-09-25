@@ -1,0 +1,13 @@
+# Spec: docs/specs/2026-09-25-scaffolding-design.md section 3.4.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - "/"
+      - "/crates/atlas-schema/fuzz"
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
