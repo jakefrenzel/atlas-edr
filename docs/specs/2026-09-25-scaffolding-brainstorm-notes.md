@@ -1,6 +1,6 @@
 # Sub-project 0b: Scaffolding (Brainstorm Notes)
 
-**Status:** Brainstorm in progress. **This is not the spec.** It is the handoff between sessions.
+**Status:** Superseded by the spec [2026-09-25-scaffolding-design.md](2026-09-25-scaffolding-design.md) (design §3 approved 2026-09-25). Kept as the brainstorm record. **This is not the spec.** It is the handoff between sessions.
 The next session resumes the brainstorm at **"Next steps"** below and then writes the real spec
 (`docs/specs/<date>-scaffolding-design.md`) from these notes.
 

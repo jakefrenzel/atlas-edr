@@ -97,7 +97,7 @@ Each row: its own spec → plan → implementation.
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
 | 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done (10-min fuzz run pending in 0b CI) |
-| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | In brainstorm ([notes](specs/2026-09-25-scaffolding-brainstorm-notes.md); design §1–2 approved) |
+| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | Spec written, awaiting review ([spec](specs/2026-09-25-scaffolding-design.md)) |
 | 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Next up (with 0) |
 | 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres (incl. Docker Compose stack) | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
@@ -141,3 +141,4 @@ Each row: its own spec → plan → implementation.
 | 2026-09-24 | Docker Compose (ClickHouse, Postgres) moved from 0b to sub-project 2, where its first consumer lives; 0b = CI + Hyper-V test VM. |
 | 2026-09-24 | 0b CI: GitHub Actions. Linux and Windows Rust jobs, `buf lint` + `buf breaking`, PSScriptAnalyzer/Pester, `cargo audit` on every push and PR; `cargo fuzz` nightly for 10 min, plus 2 min on schema/proto PRs; Dependabot weekly. |
 | 2026-09-24 | 0b test VM: scripted Hyper-V build plus a runbook; isolated internal switch by default with NAT on demand; Windows 11 Enterprise Evaluation; test-signing and KDNET on; Secure Boot, HVCI and Defender real-time protection off (VM only, never the host). |
+| 2026-09-25 | 0b design approved (repo layout, Pester-with-mocks + PSScriptAnalyzer for VM scripts, manual acceptance checklist, DoD). Verified: Win11 setup needs Secure Boot on (turned off after install); KDNET uses VMBus (no `busparams`), so VM NICs are identified by Hyper-V device naming; 0a protos pass `buf lint` STANDARD unmodified. |
