@@ -1,0 +1,59 @@
+{
+  "eventId": "AZIqblsAcACAAAAAAAAAAQ==",
+  "time": "1790000000123456789",
+  "sensor": "SENSOR_ETW",
+  "device": {
+    "uid": "0NDQ0NDQ0NDQ0NDQ0NDQ0A==",
+    "bootId": "sLCwsLCwsLCwsLCwsLCwsA=="
+  },
+  "process": {
+    "launch": {
+      "actor": {
+        "uid": "vO6S+WktTFqyjBFk0+lseA==",
+        "pid": 4120,
+        "file": {
+          "path": "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+          "name": "WINWORD.EXE"
+        },
+        "user": {
+          "uid": "S-1-5-21-1000-1000-1000-1001",
+          "name": "DESK-01\\jake"
+        }
+      },
+      "process": {
+        "uid": "Rbyh0W87kN60U7HhEUzkUg==",
+        "pid": 7788,
+        "file": {
+          "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+          "name": "powershell.exe",
+          "hashes": {
+            "sha256": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="
+          },
+          "signature": {
+            "signer": "Microsoft Windows",
+            "status": "SIGNATURE_STATUS_VALID"
+          }
+        },
+        "user": {
+          "uid": "S-1-5-21-1000-1000-1000-1001",
+          "name": "DESK-01\\jake"
+        },
+        "cmdLine": "powershell.exe -enc SQBFAFgA",
+        "createdTime": "1790000000123000000",
+        "integrity": "INTEGRITY_MEDIUM",
+        "parentProcess": {
+          "uid": "vO6S+WktTFqyjBFk0+lseA==",
+          "pid": 4120,
+          "file": {
+            "path": "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+            "name": "WINWORD.EXE"
+          },
+          "user": {
+            "uid": "S-1-5-21-1000-1000-1000-1001",
+            "name": "DESK-01\\jake"
+          }
+        }
+      }
+    }
+  }
+}
