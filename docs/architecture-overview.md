@@ -97,7 +97,7 @@ Each row: its own spec → plan → implementation.
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
 | 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done (10-min fuzz run pending in 0b CI) |
-| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | Spec written, awaiting review ([spec](specs/2026-09-25-scaffolding-design.md)) |
+| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | Plan written, awaiting review ([spec](specs/2026-09-25-scaffolding-design.md), [plan](plans/2026-09-25-scaffolding-plan.md)) |
 | 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Next up (with 0) |
 | 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres (incl. Docker Compose stack) | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
