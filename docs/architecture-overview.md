@@ -97,9 +97,9 @@ Each row: its own spec → plan → implementation.
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
 | 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done (10-min fuzz run pending in 0b CI) |
-| 0b | **Foundations: scaffolding** | Monorepo, Docker Compose, Hyper-V VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | Next up |
+| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | In brainstorm |
 | 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Next up (with 0) |
-| 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres | — |
+| 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres (incl. Docker Compose stack) | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
 | 4 | **Response** | Command channel; kill process, quarantine file, network-isolate host (WFP) | — |
 | 5 | **Console** | Alerts, host view, process tree, event search, response actions | — |
@@ -137,3 +137,5 @@ Each row: its own spec → plan → implementation.
 | 2026-09-24 | 0a implemented: `atlas-proto` + `atlas-schema`; unknown classes/activities from newer agents are rejected as Missing; `parent_process` optional. |
 | 2026-09-24 | 0a's 10-minute `cargo fuzz` run deferred to 0b CI (Docker Desktop was unavailable). Stable hostile-input property tests cover the decoder until then. |
 | 2026-09-24 | From the 0a final review: `reg_value.type` has explicit wire presence (absent means `Missing`, not `REG_NONE`); every class checks its activity before class fields; `user.uid` ≤ 256 B, `user.name` and `signature.signer` ≤ 1 KiB. |
+| 2026-09-24 | Repo made public (free GitHub-hosted CI). Licensed AGPL-3.0-only: open for lab/personal use, modified network deployments must share source, and the sole copyright holder keeps the dual-licensing (product) option. Replaces the unfiled `MIT OR Apache-2.0` Cargo metadata. |
+| 2026-09-24 | Docker Compose (ClickHouse, Postgres) moved from 0b to sub-project 2, where its first consumer lives; 0b = CI + Hyper-V test VM. |
