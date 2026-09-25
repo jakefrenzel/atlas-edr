@@ -52,7 +52,7 @@ Agent shape: `[OS-specific sensor] → normalize → [shared pipeline: buffer, l
 | State storage | **PostgreSQL** | Agents, alerts, rules, users, command history — relational, transactional. |
 | Detection | **Sigma → compiled streaming matcher (Rust)** | Industry-standard rule format with large community corpus; compiled for speed. |
 | Console | **TypeScript + React** (or Svelte — decide in sub-project 5) | Conventional; nothing EDR-specific. |
-| Event schema | **ECS or OCSF-based** — decide in sub-project 0 | Most important design decision in the project. |
+| Event schema | **Own typed model, OCSF-modeled** (OCSF 1.9.0); protobuf wire + Rust domain types | See [0a spec](specs/2026-09-24-event-schema-design.md). |
 
 Repo: single monorepo — Cargo workspace (agent, server, shared crates) + driver + UI.
 
@@ -96,7 +96,8 @@ Each row: its own spec → plan → implementation.
 
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
-| 0 | **Foundations** | Monorepo, shared event-schema crate, Docker Compose, Hyper-V VM setup, CI | Next up |
+| 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Spec in review |
+| 0b | **Foundations: scaffolding** | Monorepo, Docker Compose, Hyper-V VM setup, CI (incl. `buf breaking`) | Next up (after 0a spec) |
 | 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Next up (with 0) |
 | 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
@@ -114,7 +115,6 @@ Each row: its own spec → plan → implementation.
 
 ## 8. Open Decisions
 
-- Event schema basis: ECS vs OCSF vs custom (sub-project 0).
 - Console framework: React vs Svelte (sub-project 5).
 - Whether to pursue an EV cert for production driver signing (before relying on the driver on daily machines).
 
@@ -128,3 +128,9 @@ Each row: its own spec → plan → implementation.
 | 2026-09-24 | Stack: C driver, Rust agent/server, gRPC+mTLS, ClickHouse + Postgres, Sigma, TS console. |
 | 2026-09-24 | Detect + respond first; prevention seam built in, enforcement later (audit/enforce rule modes). |
 | 2026-09-24 | Build order: ETW sensor before kernel driver. |
+| 2026-09-24 | Sub-project 0 split into 0a (event schema) and 0b (scaffolding). |
+| 2026-09-24 | Event schema: own typed model modeled on OCSF 1.9.0; OCSF/ECS exporters as later adapters. |
+| 2026-09-24 | Schema source of truth: protobuf is the wire contract, Rust domain types are the code model, and a validating `TryFrom` sits between them. |
+| 2026-09-24 | Process identity: `uid = BLAKE3(device.uid, boot_id, ProcessStartKey)`, which is deterministic and stateless across sensors. |
+| 2026-09-24 | v1 event classes: Process, Module, Network, File System, Registry Key, Registry Value, DNS. |
+| 2026-09-24 | Events carry an actor-process core; full process detail is only in Launch, and a process cache fills in the rest. |
