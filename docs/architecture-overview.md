@@ -97,7 +97,7 @@ Each row: its own spec → plan → implementation.
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
 | 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done (10-min fuzz run pending in 0b CI) |
-| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | In brainstorm |
+| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | In brainstorm ([notes](specs/2026-09-25-scaffolding-brainstorm-notes.md); design §1–2 approved) |
 | 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Next up (with 0) |
 | 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres (incl. Docker Compose stack) | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
@@ -139,3 +139,5 @@ Each row: its own spec → plan → implementation.
 | 2026-09-24 | From the 0a final review: `reg_value.type` has explicit wire presence (absent means `Missing`, not `REG_NONE`); every class checks its activity before class fields; `user.uid` ≤ 256 B, `user.name` and `signature.signer` ≤ 1 KiB. |
 | 2026-09-24 | Repo made public (free GitHub-hosted CI). Licensed AGPL-3.0-only: open for lab/personal use, modified network deployments must share source, and the sole copyright holder keeps the dual-licensing (product) option. Replaces the unfiled `MIT OR Apache-2.0` Cargo metadata. |
 | 2026-09-24 | Docker Compose (ClickHouse, Postgres) moved from 0b to sub-project 2, where its first consumer lives; 0b = CI + Hyper-V test VM. |
+| 2026-09-24 | 0b CI: GitHub Actions. Linux and Windows Rust jobs, `buf lint` + `buf breaking`, PSScriptAnalyzer/Pester, `cargo audit` on every push and PR; `cargo fuzz` nightly for 10 min, plus 2 min on schema/proto PRs; Dependabot weekly. |
+| 2026-09-24 | 0b test VM: scripted Hyper-V build plus a runbook; isolated internal switch by default with NAT on demand; Windows 11 Enterprise Evaluation; test-signing and KDNET on; Secure Boot, HVCI and Defender real-time protection off (VM only, never the host). |
