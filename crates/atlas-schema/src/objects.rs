@@ -7,7 +7,7 @@ use atlas_proto::v1 as wire;
 use crate::convert::{Result, bounded, err, fixed, join, require, u16_field, wire_enum};
 use crate::error::SchemaErrorKind;
 use crate::ids::ProcessUid;
-use crate::limits::{CMD_LINE_MAX, PATH_MAX};
+use crate::limits::{CMD_LINE_MAX, PATH_MAX, SIGNER_MAX, USER_NAME_MAX, USER_UID_MAX};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
@@ -169,8 +169,19 @@ impl From<NetworkEndpoint> for wire::NetworkEndpoint {
 // ---- wire → domain (validating) ----
 
 impl User {
-    pub(crate) fn from_wire(w: wire::User) -> Self {
-        Self { uid: w.uid, name: w.name }
+    pub(crate) fn from_wire(w: wire::User, path: &str) -> Result<Self> {
+        Ok(Self {
+            uid: bounded(w.uid, USER_UID_MAX, path, "uid")?,
+            name: bounded(w.name, USER_NAME_MAX, path, "name")?,
+        })
+    }
+
+    /// An optional `User` sub-message at `parent.user`.
+    pub(crate) fn optional(w: Option<wire::User>, parent: &str) -> Result<Option<Self>> {
+        match w {
+            Some(u) => Ok(Some(Self::from_wire(u, &join(parent, "user"))?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -197,7 +208,11 @@ impl Signature {
             path,
             "status",
         )?;
-        Ok(Self { signer: w.signer, status })
+        let signer = match w.signer {
+            Some(s) => Some(bounded(s, SIGNER_MAX, path, "signer")?),
+            None => None,
+        };
+        Ok(Self { signer, status })
     }
 }
 
@@ -230,7 +245,7 @@ impl ProcessRef {
             uid: ProcessUid::from_bytes(fixed::<16>(w.uid, path, "uid")?),
             pid: w.pid,
             file: File::required(w.file, path, "file")?,
-            user: w.user.map(User::from_wire),
+            user: User::optional(w.user, path)?,
         })
     }
 
@@ -264,7 +279,7 @@ impl Process {
             uid: ProcessUid::from_bytes(fixed::<16>(w.uid, path, "uid")?),
             pid: w.pid,
             file: File::required(w.file, path, "file")?,
-            user: w.user.map(User::from_wire),
+            user: User::optional(w.user, path)?,
             cmd_line: bounded(w.cmd_line, CMD_LINE_MAX, path, "cmd_line")?,
             cmd_line_truncated: w.cmd_line_truncated,
             created_time: w.created_time,

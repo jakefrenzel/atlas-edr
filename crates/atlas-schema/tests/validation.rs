@@ -223,6 +223,31 @@ const CASES: &[(&str, Mutation, &str, K)] = &[
     // registry value
     ("registry_value_set", |w| reg_value(w).key_path = long(PATH_MAX + 1), "reg_value.path", K::TooLarge),
     ("registry_value_set", |w| reg_value(w).name = long(PATH_MAX + 1), "reg_value.name", K::TooLarge),
+    // user / signer strings (bounded so attacker-controlled actor fields stay small)
+    (
+        "process_launch",
+        |w| launch(w).actor.as_mut().unwrap().user.as_mut().unwrap().uid = long(USER_UID_MAX + 1),
+        "actor.process.user.uid",
+        K::TooLarge,
+    ),
+    (
+        "process_launch",
+        |w| launch_process(w).user.as_mut().unwrap().name = long(USER_NAME_MAX + 1),
+        "process.user.name",
+        K::TooLarge,
+    ),
+    (
+        "process_launch",
+        |w| launch_process(w).parent_process.as_mut().unwrap().user.as_mut().unwrap().uid = long(USER_UID_MAX + 1),
+        "process.parent_process.user.uid",
+        K::TooLarge,
+    ),
+    (
+        "process_launch",
+        |w| launch_file(w).signature.as_mut().unwrap().signer = Some(long(SIGNER_MAX + 1)),
+        "process.file.signature.signer",
+        K::TooLarge,
+    ),
     ("registry_value_set", |w| reg_value_set(w).r#type = Some(12), "reg_value.type", K::UnknownEnum),
     ("registry_value_set", |w| reg_value_set(w).data = vec![0; REG_DATA_MAX + 1], "reg_value.data", K::TooLarge),
     // dns

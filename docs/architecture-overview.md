@@ -96,8 +96,8 @@ Each row: its own spec → plan → implementation.
 
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
-| 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done |
-| 0b | **Foundations: scaffolding** | Monorepo, Docker Compose, Hyper-V VM setup, CI (incl. `buf breaking`) | Next up |
+| 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done (10-min fuzz run pending in 0b CI) |
+| 0b | **Foundations: scaffolding** | Monorepo, Docker Compose, Hyper-V VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | Next up |
 | 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Next up (with 0) |
 | 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
@@ -135,3 +135,5 @@ Each row: its own spec → plan → implementation.
 | 2026-09-24 | v1 event classes: Process, Module, Network, File System, Registry Key, Registry Value, DNS. |
 | 2026-09-24 | Events carry an actor-process core; full process detail is only in Launch, and a process cache fills in the rest. |
 | 2026-09-24 | 0a implemented: `atlas-proto` + `atlas-schema`; unknown classes/activities from newer agents are rejected as Missing; `parent_process` optional. |
+| 2026-09-24 | 0a's 10-minute `cargo fuzz` run deferred to 0b CI (Docker Desktop was unavailable). Stable hostile-input property tests cover the decoder until then. |
+| 2026-09-24 | From the 0a final review: `reg_value.type` has explicit wire presence (absent means `Missing`, not `REG_NONE`); every class checks its activity before class fields; `user.uid` ≤ 256 B, `user.name` and `signature.signer` ≤ 1 KiB. |

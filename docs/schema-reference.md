@@ -117,7 +117,7 @@ All activities: `actor.process`, `reg_value.path` (containing key), `reg_value.n
 
 | Activity | Extra fields |
 |---|---|
-| Set | `reg_value.type` (Windows `REG_*` constant 0–11, **not** the OCSF `type_id`), `reg_value.data` (raw bytes), `data_truncated` |
+| Set | `reg_value.type` (Windows `REG_*` constant 0–11, **not** the OCSF `type_id`; required, and absent is `Missing` rather than `REG_NONE`), `reg_value.data` (raw bytes), `data_truncated` |
 | Delete | none |
 
 ### DNS Activity
@@ -138,6 +138,9 @@ The validator rejects anything over a limit with `TooLarge`.
 | `reg_value.data` | 4 KiB |
 | `query.hostname`, each `answers[].data` | 1 KiB |
 | `answers[]` | 64 entries |
+| `user.uid` (SID) | 256 B |
+| `user.name` | 1 KiB |
+| `file.signature.signer` | 1 KiB |
 | whole encoded event | 256 KiB (checked before decoding) |
 
 ## Validation errors

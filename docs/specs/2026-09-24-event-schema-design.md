@@ -214,7 +214,7 @@ Whether the sensor emits Read is a sub-project 1 decision; the schema defines it
 
 | Activity | Fields |
 |---|---|
-| Set | `reg_value.path` (key path), `reg_value.name`, `reg_value.type` (enum of `REG_*` types), `reg_value.data` (bytes), `reg_value.data_truncated` (bool), `actor.process` |
+| Set | `reg_value.path` (key path), `reg_value.name`, `reg_value.type` (enum of `REG_*` types; carries explicit presence on the wire because `REG_NONE` = 0, and absent is rejected as `Missing`), `reg_value.data` (bytes), `reg_value.data_truncated` (bool), `actor.process` |
 | Delete | `reg_value.path`, `reg_value.name`, `actor.process` |
 
 ### 5.8 DNS Activity
@@ -250,6 +250,9 @@ An `atlas` extension namespace is reserved for Atlas-specific fields with no OCS
 | `reg_value.data` | 4 KiB |
 | `query.hostname`, `answers[].data` | 1 KiB each |
 | `answers[]` | 64 entries |
+| `user.uid` (SID) | 256 B |
+| `user.name` | 1 KiB |
+| `file.signature.signer` | 1 KiB |
 | encoded event | 256 KiB (checked before decode) |
 
 - **Text:** protobuf `string` must be valid UTF-8. Windows UTF-16 strings containing unpaired surrogates are converted lossily by the sensor (U+FFFD). **Known limitation:** an attacker can craft names that lose information in conversion; recorded for sub-project 3.

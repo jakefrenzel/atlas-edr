@@ -15,6 +15,12 @@ pub const DNS_HOSTNAME_MAX: usize = 1024;
 pub const DNS_ANSWER_DATA_MAX: usize = 1024;
 /// Number of `answers[]` entries.
 pub const DNS_ANSWERS_MAX: usize = 64;
+/// `user.uid` (a SID string; the longest real SID is under 200 characters).
+pub const USER_UID_MAX: usize = 256;
+/// `user.name` (`DOMAIN\user`).
+pub const USER_NAME_MAX: usize = 1024;
+/// `file.signature.signer`.
+pub const SIGNER_MAX: usize = 1024;
 /// A whole encoded event, checked before protobuf decoding.
 pub const EVENT_MAX: usize = 256 * 1024;
 
