@@ -44,7 +44,9 @@ jobs:
         env:
           # 10 minutes nightly and on manual runs (closes 0a DoD 8.2.2); 2 minutes on pull requests.
           SECONDS_TO_RUN: ${{ github.event_name == 'pull_request' && '120' || '600' }}
-        run: cargo fuzz run decode_event -- -max_total_time="$SECONDS_TO_RUN"
+        # --target: the prebuilt cargo-fuzz is a static musl binary and would otherwise default to the musl
+        # target, which AddressSanitizer does not support.
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu decode_event -- -max_total_time="$SECONDS_TO_RUN"
       - name: Save corpus
         if: always()
         uses: actions/cache/save@v6
