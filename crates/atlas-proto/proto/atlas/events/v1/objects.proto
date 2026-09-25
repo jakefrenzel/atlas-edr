@@ -1,0 +1,85 @@
+// Shared objects used by several event classes.
+// Modeled on OCSF 1.9.0 objects; see docs/specs/2026-09-24-event-schema-design.md section 5.1.
+syntax = "proto3";
+
+package atlas.events.v1;
+
+// OCSF `user`.
+message User {
+  // Windows SID string, e.g. "S-1-5-21-...". Stable identity.
+  string uid = 1;
+  // "DOMAIN\\user".
+  string name = 2;
+}
+
+// OCSF `fingerprint` subset.
+message Hashes {
+  // SHA-256 digest, exactly 32 bytes when present.
+  optional bytes sha256 = 1;
+}
+
+enum SignatureStatus {
+  SIGNATURE_STATUS_UNSPECIFIED = 0;
+  SIGNATURE_STATUS_VALID = 1;
+  SIGNATURE_STATUS_INVALID = 2;
+  SIGNATURE_STATUS_UNSIGNED = 3;
+}
+
+// OCSF `digital_signature` subset.
+message Signature {
+  // Signer subject; absent when unsigned.
+  optional string signer = 1;
+  SignatureStatus status = 2;
+}
+
+// OCSF `file`.
+message File {
+  string path = 1;
+  string name = 2;
+  // Optional enrichment; the sensor decides when to compute it.
+  optional Hashes hashes = 3;
+  optional Signature signature = 4;
+}
+
+// The actor core carried by every event (spec D5). OCSF `process` subset.
+message ProcessRef {
+  // 16-byte process uid: BLAKE3("atlas.process.v1" || device.uid || boot_id || start_key)[0..16].
+  bytes uid = 1;
+  uint32 pid = 2;
+  // Executable; only path and name are expected here.
+  File file = 3;
+  optional User user = 4;
+}
+
+enum Integrity {
+  INTEGRITY_UNSPECIFIED = 0;
+  INTEGRITY_UNTRUSTED = 1;
+  INTEGRITY_LOW = 2;
+  INTEGRITY_MEDIUM = 3;
+  INTEGRITY_HIGH = 4;
+  INTEGRITY_SYSTEM = 5;
+  INTEGRITY_PROTECTED = 6;
+}
+
+// Full process detail. Only carried by Process Launch.
+message Process {
+  bytes uid = 1;
+  uint32 pid = 2;
+  File file = 3;
+  optional User user = 4;
+  string cmd_line = 5;
+  bool cmd_line_truncated = 6;
+  // Nanoseconds since the Unix epoch, UTC.
+  int64 created_time = 7;
+  optional Integrity integrity = 8;
+  // The parent as recorded by the OS (can be spoofed; compare with the Launch actor).
+  ProcessRef parent_process = 9;
+}
+
+// OCSF `network_endpoint` subset.
+message NetworkEndpoint {
+  // 4 bytes (IPv4) or 16 bytes (IPv6), network byte order.
+  bytes ip = 1;
+  // 0..=65535.
+  uint32 port = 2;
+}

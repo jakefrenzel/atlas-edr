@@ -1,0 +1,43 @@
+// The Atlas event envelope. The package version is part of the contract:
+// within atlas.events.v1 all changes are additive only (spec section 7).
+syntax = "proto3";
+
+package atlas.events.v1;
+
+import "atlas/events/v1/dns.proto";
+import "atlas/events/v1/file.proto";
+import "atlas/events/v1/module.proto";
+import "atlas/events/v1/network.proto";
+import "atlas/events/v1/process.proto";
+import "atlas/events/v1/registry.proto";
+
+enum Sensor {
+  SENSOR_UNSPECIFIED = 0;
+  SENSOR_ETW = 1;
+  SENSOR_DRIVER = 2;
+}
+
+message Device {
+  // 16-byte random id generated at agent install.
+  bytes uid = 1;
+  // 16-byte opaque per-boot id.
+  bytes boot_id = 2;
+}
+
+message Event {
+  // 16-byte UUIDv7.
+  bytes event_id = 1;
+  // Nanoseconds since the Unix epoch, UTC.
+  int64 time = 2;
+  Sensor sensor = 3;
+  Device device = 4;
+  oneof kind {
+    ProcessActivity process = 10;
+    ModuleActivity module = 11;
+    NetworkActivity network = 12;
+    FileSystemActivity file = 13;
+    RegistryKeyActivity registry_key = 14;
+    RegistryValueActivity registry_value = 15;
+    DnsActivity dns = 16;
+  }
+}

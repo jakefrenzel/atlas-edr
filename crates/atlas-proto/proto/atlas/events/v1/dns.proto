@@ -1,0 +1,31 @@
+// OCSF DNS Activity (class_uid 4003).
+syntax = "proto3";
+
+package atlas.events.v1;
+
+import "atlas/events/v1/objects.proto";
+
+message DnsActivity {
+  ProcessRef actor = 1;
+  // OCSF `query.hostname`.
+  string hostname = 2;
+  // Numeric DNS RR type (e.g. 28 = AAAA). 0..=65535.
+  uint32 query_type = 3;
+  oneof activity {
+    DnsResponse response = 4; // activity_id 2
+  }
+}
+
+message DnsAnswer {
+  // Numeric DNS RR type. 0..=65535.
+  uint32 type = 1;
+  string data = 2;
+}
+
+message DnsResponse {
+  // DNS response code, when the sensor could map the platform status. 0..=65535.
+  optional uint32 rcode = 1;
+  // Raw platform status (Windows: Win32/DNS status from DNS-Client event 3008).
+  optional uint32 platform_status = 2;
+  repeated DnsAnswer answers = 3;
+}

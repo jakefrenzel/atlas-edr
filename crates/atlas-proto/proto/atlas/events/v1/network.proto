@@ -1,0 +1,37 @@
+// OCSF Network Activity (class_uid 4001).
+syntax = "proto3";
+
+package atlas.events.v1;
+
+import "atlas/events/v1/objects.proto";
+
+enum NetworkProtocol {
+  NETWORK_PROTOCOL_UNSPECIFIED = 0;
+  NETWORK_PROTOCOL_TCP = 1;
+  NETWORK_PROTOCOL_UDP = 2;
+}
+
+enum NetworkDirection {
+  NETWORK_DIRECTION_UNSPECIFIED = 0;
+  NETWORK_DIRECTION_INBOUND = 1;
+  NETWORK_DIRECTION_OUTBOUND = 2;
+}
+
+message NetworkActivity {
+  ProcessRef actor = 1;
+  NetworkEndpoint src_endpoint = 2;
+  NetworkEndpoint dst_endpoint = 3;
+  NetworkProtocol protocol = 4;
+  NetworkDirection direction = 5;
+  oneof activity {
+    NetworkOpen open = 6;   // activity_id 1
+    NetworkClose close = 7; // activity_id 2
+  }
+}
+
+message NetworkOpen {}
+
+message NetworkClose {
+  optional uint64 bytes_in = 1;
+  optional uint64 bytes_out = 2;
+}
