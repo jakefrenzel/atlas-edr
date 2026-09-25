@@ -38,7 +38,9 @@ message RegistryValueActivity {
 
 message RegistryValueSet {
   // Windows REG_* constant (REG_NONE = 0 .. REG_QWORD = 11). Not an OCSF type_id.
-  uint32 type = 1;
+  // `optional` because REG_NONE is 0: without presence an unset type would
+  // silently read as REG_NONE. Absent is rejected as Missing.
+  optional uint32 type = 1;
   bytes data = 2;
   bool data_truncated = 3;
 }

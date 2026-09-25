@@ -30,8 +30,10 @@ impl From<ModuleActivity> for wire::ModuleActivity {
 
 impl ModuleActivity {
     pub(crate) fn from_wire(w: wire::ModuleActivity) -> Result<Self> {
+        // Activity first: an unknown (newer) activity must read as `activity: Missing`.
+        let activity = require(w.activity, "", "activity")?;
         let actor = ProcessRef::required(w.actor, "", "actor.process")?;
-        let action = match require(w.activity, "", "activity")? {
+        let action = match activity {
             W::Load(l) => {
                 ModuleAction::Load { file: File::required(l.file, "", "module.file")?, base_address: l.base_address }
             }

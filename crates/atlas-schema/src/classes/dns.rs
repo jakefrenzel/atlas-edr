@@ -59,11 +59,13 @@ impl From<DnsActivity> for wire::DnsActivity {
 
 impl DnsActivity {
     pub(crate) fn from_wire(w: wire::DnsActivity) -> Result<Self> {
+        // Activity first: an unknown (newer) activity must read as `activity: Missing`.
+        let activity = require(w.activity, "", "activity")?;
         Ok(Self {
             actor: ProcessRef::required(w.actor, "", "actor.process")?,
             hostname: bounded(w.hostname, DNS_HOSTNAME_MAX, "", "query.hostname")?,
             query_type: u16_field(w.query_type, "", "query.type")?,
-            action: match require(w.activity, "", "activity")? {
+            action: match activity {
                 W::Response(r) => {
                     if r.answers.len() > DNS_ANSWERS_MAX {
                         return err("", "answers", SchemaErrorKind::TooLarge);

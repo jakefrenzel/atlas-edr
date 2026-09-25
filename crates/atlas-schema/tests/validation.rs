@@ -223,7 +223,7 @@ const CASES: &[(&str, Mutation, &str, K)] = &[
     // registry value
     ("registry_value_set", |w| reg_value(w).key_path = long(PATH_MAX + 1), "reg_value.path", K::TooLarge),
     ("registry_value_set", |w| reg_value(w).name = long(PATH_MAX + 1), "reg_value.name", K::TooLarge),
-    ("registry_value_set", |w| reg_value_set(w).r#type = 12, "reg_value.type", K::UnknownEnum),
+    ("registry_value_set", |w| reg_value_set(w).r#type = Some(12), "reg_value.type", K::UnknownEnum),
     ("registry_value_set", |w| reg_value_set(w).data = vec![0; REG_DATA_MAX + 1], "reg_value.data", K::TooLarge),
     // dns
     ("dns_response", |w| dns_activity(w).hostname = long(DNS_HOSTNAME_MAX + 1), "query.hostname", K::TooLarge),
@@ -354,4 +354,80 @@ fn activity_from_a_newer_schema_is_rejected_as_missing_activity() {
     bytes.extend_from_slice(&process_activity);
     let err = decode_event(&bytes).unwrap_err();
     assert_eq!((err.field_path.as_str(), err.kind), ("activity", K::Missing));
+}
+
+/// A length-delimited protobuf field: key (`tag`, wire type 2), length, bytes.
+fn field(tag: u32, inner: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, &mut out);
+    prost::encoding::encode_varint(inner.len() as u64, &mut out);
+    out.extend_from_slice(inner);
+    out
+}
+
+#[test]
+fn unknown_activity_is_reported_before_class_fields() {
+    // A newer activity may omit fields today's activities require (e.g. a future
+    // Network Listen has no dst_endpoint). Version skew must read as `activity: Missing`,
+    // not as a missing class field. (sample, Event oneof tag, first unused activity tag)
+    let cases: &[(&str, u32, u32)] = &[
+        ("module_load", 11, 3),
+        ("network_open", 12, 8),
+        ("file_create", 13, 9),
+        ("registry_key_create", 14, 6),
+        ("registry_value_set", 15, 6),
+        ("dns_response", 16, 5),
+    ];
+    for &(sample, event_tag, unknown_activity_tag) in cases {
+        let mut w = wire_sample(sample);
+        let mut inner = match w.kind.take().expect("sample has a kind") {
+            Kind::Module(mut c) => {
+                (c.activity, c.actor) = (None, None);
+                c.encode_to_vec()
+            }
+            Kind::Network(mut c) => {
+                (c.activity, c.actor, c.dst_endpoint) = (None, None, None);
+                c.encode_to_vec()
+            }
+            Kind::File(mut c) => {
+                (c.activity, c.actor, c.file) = (None, None, None);
+                c.encode_to_vec()
+            }
+            Kind::RegistryKey(mut c) => {
+                (c.activity, c.actor) = (None, None);
+                c.encode_to_vec()
+            }
+            Kind::RegistryValue(mut c) => {
+                (c.activity, c.actor) = (None, None);
+                c.encode_to_vec()
+            }
+            Kind::Dns(mut c) => {
+                (c.activity, c.actor) = (None, None);
+                c.encode_to_vec()
+            }
+            Kind::Process(_) => unreachable!("process has no class-level fields"),
+        };
+        inner.extend(field(unknown_activity_tag, &[]));
+        let mut bytes = w.encode_to_vec();
+        bytes.extend(field(event_tag, &inner));
+        let err = decode_event(&bytes).unwrap_err();
+        assert_eq!((err.field_path.as_str(), err.kind), ("activity", K::Missing), "{sample}");
+    }
+}
+
+#[test]
+fn registry_value_set_without_type_is_missing_not_reg_none() {
+    // proto3 cannot tell an absent uint32 from 0, so `type` needs explicit presence;
+    // otherwise an unset type silently becomes REG_NONE (spec 6.1).
+    let mut w = wire_sample("registry_value_set");
+    reg_value_set(&mut w).r#type = None; // field absent on the wire
+    let err = check(w).unwrap_err();
+    assert_eq!((err.field_path.as_str(), err.kind), ("reg_value.type", K::Missing));
+}
+
+#[test]
+fn explicit_reg_none_is_a_valid_value_type() {
+    let mut w = wire_sample("registry_value_set");
+    reg_value_set(&mut w).r#type = Some(0); // REG_NONE, present on the wire
+    check(w).expect("REG_NONE is a real Windows value type");
 }

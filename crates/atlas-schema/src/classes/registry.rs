@@ -98,7 +98,7 @@ impl From<RegistryValueActivity> for wire::RegistryValueActivity {
     fn from(v: RegistryValueActivity) -> Self {
         let activity = match v.action {
             RegistryValueAction::Set { value_type, data, data_truncated } => {
-                WV::Set(wire::RegistryValueSet { r#type: value_type as u32, data, data_truncated })
+                WV::Set(wire::RegistryValueSet { r#type: Some(value_type as u32), data, data_truncated })
             }
             RegistryValueAction::Delete => WV::Delete(wire::RegistryValueDelete {}),
         };
@@ -108,10 +108,12 @@ impl From<RegistryValueActivity> for wire::RegistryValueActivity {
 
 impl RegistryKeyActivity {
     pub(crate) fn from_wire(w: wire::RegistryKeyActivity) -> Result<Self> {
+        // Activity first: an unknown (newer) activity must read as `activity: Missing`.
+        let activity = require(w.activity, "", "activity")?;
         Ok(Self {
             actor: ProcessRef::required(w.actor, "", "actor.process")?,
             path: bounded(w.path, PATH_MAX, "", "reg_key.path")?,
-            action: match require(w.activity, "", "activity")? {
+            action: match activity {
                 WK::Create(_) => RegistryKeyAction::Create,
                 WK::Delete(_) => RegistryKeyAction::Delete,
                 WK::Rename(r) => {
@@ -124,13 +126,16 @@ impl RegistryKeyActivity {
 
 impl RegistryValueActivity {
     pub(crate) fn from_wire(w: wire::RegistryValueActivity) -> Result<Self> {
+        // Activity first: an unknown (newer) activity must read as `activity: Missing`.
+        let activity = require(w.activity, "", "activity")?;
         Ok(Self {
             actor: ProcessRef::required(w.actor, "", "actor.process")?,
             key_path: bounded(w.key_path, PATH_MAX, "", "reg_value.path")?,
             name: bounded(w.name, PATH_MAX, "", "reg_value.name")?,
-            action: match require(w.activity, "", "activity")? {
+            action: match activity {
                 WV::Set(s) => {
-                    let Some(value_type) = RegValueType::from_raw(s.r#type) else {
+                    let raw = require(s.r#type, "", "reg_value.type")?;
+                    let Some(value_type) = RegValueType::from_raw(raw) else {
                         return err("", "reg_value.type", SchemaErrorKind::UnknownEnum);
                     };
                     if s.data.len() > REG_DATA_MAX {
@@ -194,7 +199,7 @@ mod tests {
     fn unknown_value_type_and_oversized_data_are_rejected() {
         let mut w = wire::RegistryValueActivity::from(set(vec![]));
         let Some(WV::Set(s)) = w.activity.as_mut() else { unreachable!() };
-        s.r#type = 12;
+        s.r#type = Some(12);
         let e = RegistryValueActivity::from_wire(w).unwrap_err();
         assert_eq!((e.field_path.as_str(), e.kind), ("reg_value.type", SchemaErrorKind::UnknownEnum));
 

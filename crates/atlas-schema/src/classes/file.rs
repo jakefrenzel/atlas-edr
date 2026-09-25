@@ -40,10 +40,12 @@ impl From<FileSystemActivity> for wire::FileSystemActivity {
 
 impl FileSystemActivity {
     pub(crate) fn from_wire(w: wire::FileSystemActivity) -> Result<Self> {
+        // Activity first: an unknown (newer) activity must read as `activity: Missing`.
+        let activity = require(w.activity, "", "activity")?;
         Ok(Self {
             actor: ProcessRef::required(w.actor, "", "actor.process")?,
             file: File::required(w.file, "", "file")?,
-            action: match require(w.activity, "", "activity")? {
+            action: match activity {
                 W::Create(_) => FileAction::Create,
                 W::Read(_) => FileAction::Read,
                 W::Update(_) => FileAction::Update,

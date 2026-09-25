@@ -61,6 +61,8 @@ impl From<NetworkActivity> for wire::NetworkActivity {
 
 impl NetworkActivity {
     pub(crate) fn from_wire(w: wire::NetworkActivity) -> Result<Self> {
+        // Activity first: an unknown (newer) activity must read as `activity: Missing`.
+        let activity = require(w.activity, "", "activity")?;
         Ok(Self {
             actor: ProcessRef::required(w.actor, "", "actor.process")?,
             src_endpoint: NetworkEndpoint::required(w.src_endpoint, "", "src_endpoint")?,
@@ -85,7 +87,7 @@ impl NetworkActivity {
                 "",
                 "direction",
             )?,
-            action: match require(w.activity, "", "activity")? {
+            action: match activity {
                 W::Open(_) => NetworkAction::Open,
                 W::Close(c) => NetworkAction::Close { bytes_in: c.bytes_in, bytes_out: c.bytes_out },
             },
