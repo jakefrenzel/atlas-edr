@@ -2,6 +2,7 @@
 //!
 //! Design: `docs/specs/2026-09-24-event-schema-design.md`.
 
+pub mod classes;
 mod convert;
 mod error;
 mod ids;
