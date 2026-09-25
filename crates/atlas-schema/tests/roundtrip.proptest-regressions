@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 2ef20d3e7fb908531c2c644afff9c661638f89c3f4ae99467d7dc9106c3f5696 # shrinks to event = Event { meta: EventMeta { event_id: EventId(00000000-0000-7000-8000-000000000000), time: 0, sensor: Etw }, device: Device { uid: DeviceUid(00000000000000000000000000000000), boot_id: BootId(00000000000000000000000000000000) }, kind: Process(Launch { actor: ProcessRef { uid: ProcessUid(00000000000000000000000000000000), pid: 0, file: File { path: "", name: "", hashes: None, signature: None }, user: None }, process: Process { uid: ProcessUid(00000000000000000000000000000000), pid: 0, file: File { path: "", name: "", hashes: None, signature: None }, user: None, cmd_line: "", cmd_line_truncated: false, created_time: 0, integrity: Some(Protected), parent_process: None } }) }
