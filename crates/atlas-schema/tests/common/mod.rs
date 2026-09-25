@@ -14,6 +14,7 @@ use atlas_schema::classes::registry::{
     RegValueType, RegistryKeyAction, RegistryKeyActivity, RegistryValueAction, RegistryValueActivity,
 };
 use atlas_schema::*;
+use proptest::prelude::*;
 
 // ---------------------------------------------------------------- samples
 
@@ -164,4 +165,188 @@ pub fn samples() -> Vec<(&'static str, Event)> {
             })),
         ),
     ]
+}
+
+// ------------------------------------------------------------- strategies
+
+pub fn arb_string(max_chars: usize) -> impl Strategy<Value = String> {
+    prop::collection::vec(any::<char>(), 0..=max_chars).prop_map(String::from_iter)
+}
+
+fn arb_uid<T: 'static + std::fmt::Debug>(f: fn([u8; 16]) -> T) -> impl Strategy<Value = T> {
+    any::<[u8; 16]>().prop_map(f)
+}
+
+pub fn arb_event_id() -> impl Strategy<Value = EventId> {
+    (0u64..(1 << 48), any::<[u8; 10]>()).prop_map(|(ms, rand)| {
+        EventId::from_uuid(uuid::Builder::from_unix_timestamp_millis(ms, &rand).into_uuid()).expect("v7")
+    })
+}
+
+pub fn arb_user() -> BoxedStrategy<User> {
+    (arb_string(20), arb_string(20)).prop_map(|(uid, name)| User { uid, name }).boxed()
+}
+
+pub fn arb_file() -> BoxedStrategy<File> {
+    let status =
+        prop_oneof![Just(SignatureStatus::Valid), Just(SignatureStatus::Invalid), Just(SignatureStatus::Unsigned)];
+    (
+        arb_string(40),
+        arb_string(20),
+        prop::option::of(prop::option::of(any::<[u8; 32]>()).prop_map(|sha256| Hashes { sha256 })),
+        prop::option::of(
+            (prop::option::of(arb_string(20)), status).prop_map(|(signer, status)| Signature { signer, status }),
+        ),
+    )
+        .prop_map(|(path, name, hashes, signature)| File { path, name, hashes, signature })
+        .boxed()
+}
+
+pub fn arb_process_ref() -> BoxedStrategy<ProcessRef> {
+    (arb_uid(ProcessUid::from_bytes), any::<u32>(), arb_file(), prop::option::of(arb_user()))
+        .prop_map(|(uid, pid, file, user)| ProcessRef { uid, pid, file, user })
+        .boxed()
+}
+
+pub fn arb_integrity() -> impl Strategy<Value = Integrity> {
+    prop_oneof![
+        Just(Integrity::Untrusted),
+        Just(Integrity::Low),
+        Just(Integrity::Medium),
+        Just(Integrity::High),
+        Just(Integrity::System),
+        Just(Integrity::Protected),
+    ]
+}
+
+pub fn arb_process() -> BoxedStrategy<Process> {
+    (
+        arb_process_ref(),
+        arb_string(60),
+        any::<bool>(),
+        any::<i64>(),
+        prop::option::of(arb_integrity()),
+        prop::option::of(arb_process_ref()),
+    )
+        .prop_map(|(r, cmd_line, cmd_line_truncated, created_time, integrity, parent_process)| Process {
+            uid: r.uid,
+            pid: r.pid,
+            file: r.file,
+            user: r.user,
+            cmd_line,
+            cmd_line_truncated,
+            created_time,
+            integrity,
+            parent_process,
+        })
+        .boxed()
+}
+
+pub fn arb_endpoint() -> BoxedStrategy<NetworkEndpoint> {
+    let ip = prop_oneof![
+        any::<[u8; 4]>().prop_map(|o| IpAddr::V4(Ipv4Addr::from(o))),
+        any::<[u8; 16]>().prop_map(|o| IpAddr::V6(Ipv6Addr::from(o))),
+    ];
+    (ip, any::<u16>()).prop_map(|(ip, port)| NetworkEndpoint { ip, port }).boxed()
+}
+
+fn arb_reg_value_type() -> impl Strategy<Value = RegValueType> {
+    (0u32..=11).prop_map(|raw| RegValueType::from_raw(raw).expect("0..=11 are valid"))
+}
+
+pub fn arb_kind() -> BoxedStrategy<EventKind> {
+    let process = prop_oneof![
+        (arb_process_ref(), arb_process()).prop_map(|(actor, process)| ProcessActivity::Launch { actor, process }),
+        (arb_process_ref(), any::<Option<i32>>())
+            .prop_map(|(process, exit_code)| ProcessActivity::Terminate { process, exit_code }),
+    ]
+    .prop_map(EventKind::Process);
+
+    let module = (arb_process_ref(), arb_file(), any::<u64>()).prop_map(|(actor, file, base_address)| {
+        EventKind::Module(ModuleActivity { actor, action: ModuleAction::Load { file, base_address } })
+    });
+
+    let net_action = prop_oneof![
+        Just(NetworkAction::Open),
+        (any::<Option<u64>>(), any::<Option<u64>>())
+            .prop_map(|(bytes_in, bytes_out)| NetworkAction::Close { bytes_in, bytes_out }),
+    ];
+    let protocol = prop_oneof![Just(NetworkProtocol::Tcp), Just(NetworkProtocol::Udp)];
+    let direction = prop_oneof![Just(NetworkDirection::Inbound), Just(NetworkDirection::Outbound)];
+    let network = (arb_process_ref(), arb_endpoint(), arb_endpoint(), protocol, direction, net_action).prop_map(
+        |(actor, src_endpoint, dst_endpoint, protocol, direction, action)| {
+            EventKind::Network(NetworkActivity { actor, src_endpoint, dst_endpoint, protocol, direction, action })
+        },
+    );
+
+    let file_action = prop_oneof![
+        Just(FileAction::Create),
+        Just(FileAction::Read),
+        Just(FileAction::Update),
+        Just(FileAction::Delete),
+        arb_file().prop_map(|file_result| FileAction::Rename { file_result }),
+        Just(FileAction::SetAttributes),
+    ];
+    let file = (arb_process_ref(), arb_file(), file_action)
+        .prop_map(|(actor, file, action)| EventKind::File(FileSystemActivity { actor, file, action }));
+
+    let key_action = prop_oneof![
+        Just(RegistryKeyAction::Create),
+        Just(RegistryKeyAction::Delete),
+        arb_string(40).prop_map(|prev_path| RegistryKeyAction::Rename { prev_path }),
+    ];
+    let reg_key = (arb_process_ref(), arb_string(40), key_action)
+        .prop_map(|(actor, path, action)| EventKind::RegistryKey(RegistryKeyActivity { actor, path, action }));
+
+    let value_action = prop_oneof![
+        (arb_reg_value_type(), prop::collection::vec(any::<u8>(), 0..64), any::<bool>()).prop_map(
+            |(value_type, data, data_truncated)| RegistryValueAction::Set { value_type, data, data_truncated }
+        ),
+        Just(RegistryValueAction::Delete),
+    ];
+    let reg_value = (arb_process_ref(), arb_string(40), arb_string(20), value_action).prop_map(
+        |(actor, key_path, name, action)| {
+            EventKind::RegistryValue(RegistryValueActivity { actor, key_path, name, action })
+        },
+    );
+
+    let answer = (any::<u16>(), arb_string(30)).prop_map(|(rr_type, data)| DnsAnswer { rr_type, data });
+    let dns = (
+        arb_process_ref(),
+        arb_string(30),
+        any::<u16>(),
+        any::<Option<u16>>(),
+        any::<Option<u32>>(),
+        prop::collection::vec(answer, 0..5),
+    )
+        .prop_map(|(actor, hostname, query_type, rcode, platform_status, answers)| {
+            EventKind::Dns(DnsActivity {
+                actor,
+                hostname,
+                query_type,
+                action: DnsAction::Response { rcode, platform_status, answers },
+            })
+        });
+
+    prop_oneof![
+        process.boxed(),
+        module.boxed(),
+        network.boxed(),
+        file.boxed(),
+        reg_key.boxed(),
+        reg_value.boxed(),
+        dns.boxed()
+    ]
+    .boxed()
+}
+
+pub fn arb_event() -> BoxedStrategy<Event> {
+    let sensor = prop_oneof![Just(Sensor::Etw), Just(Sensor::Driver)];
+    (arb_event_id(), any::<i64>(), sensor, arb_uid(DeviceUid::from_bytes), arb_uid(BootId::from_bytes), arb_kind())
+        .prop_map(|(event_id, time, sensor, uid, boot_id, kind)| Event {
+            meta: EventMeta { event_id, time, sensor },
+            device: Device { uid, boot_id },
+            kind,
+        })
+        .boxed()
 }
