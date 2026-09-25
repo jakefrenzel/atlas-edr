@@ -1,0 +1,60 @@
+# Fuzzes atlas_schema::decode_event. Spec: docs/specs/2026-09-25-scaffolding-design.md section 3.2.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # nightly, 03:17 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/atlas-schema/**"
+      - "crates/atlas-proto/**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  decode_event:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly Rust
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/atlas-schema/fuzz -> target
+      # Each run saves a new corpus entry; restore-keys picks up the most recent one.
+      - name: Restore corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: crates/atlas-schema/fuzz/corpus
+          key: fuzz-corpus-decode_event-${{ github.run_id }}
+          restore-keys: fuzz-corpus-decode_event-
+      - name: Fuzz
+        working-directory: crates/atlas-schema
+        env:
+          # 10 minutes nightly and on manual runs (closes 0a DoD 8.2.2); 2 minutes on pull requests.
+          SECONDS_TO_RUN: ${{ github.event_name == 'pull_request' && '120' || '600' }}
+        run: cargo fuzz run decode_event -- -max_total_time="$SECONDS_TO_RUN"
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: crates/atlas-schema/fuzz/corpus
+          key: fuzz-corpus-decode_event-${{ github.run_id }}
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-decode_event
+          path: crates/atlas-schema/fuzz/artifacts/
+          if-no-files-found: ignore
