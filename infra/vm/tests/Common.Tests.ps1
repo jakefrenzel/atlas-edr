@@ -63,6 +63,20 @@ Describe 'Test stubs' {
     It 'make an unmocked Hyper-V call fail loudly instead of reaching the real host' {
         InModuleScope EdrTestVm { { Get-VM -Name 'edr-test' } | Should -Throw 'Unmocked call to Get-VM' }
     }
+    # These probes are harmless if the stub is missing: '/?' and '--version' only print, and the registry path
+    # does not exist. With the stub in place they must never reach the real program.
+    It 'make an unmocked bcdedit call fail loudly instead of changing the host boot configuration' {
+        InModuleScope EdrTestVm { { Invoke-EdrBcdedit -ArgumentList '/?' } | Should -Throw '*Unmocked call to bcdedit.exe*' }
+    }
+    It 'make an unmocked winget call fail loudly instead of installing on the host' {
+        InModuleScope EdrTestVm { { & winget.exe --version } | Should -Throw 'Unmocked call to winget.exe' }
+    }
+    It 'make an unmocked registry write fail loudly instead of changing the host' {
+        InModuleScope EdrTestVm {
+            { New-ItemProperty -LiteralPath 'HKCU:\Software\Atlas-EdrTest-DoesNotExist' -Name 'x' -Value 1 -PropertyType DWord } |
+                Should -Throw 'Unmocked call to New-ItemProperty'
+        }
+    }
 }
 
 Describe 'Windows PowerShell 5.1 compatibility' {

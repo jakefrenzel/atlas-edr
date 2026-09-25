@@ -42,10 +42,20 @@ $script:EdrTestStubs = [ordered]@{
     'Confirm-SecureBootUEFI'      = @()
     'Get-MpComputerStatus'        = @()
     'Set-MpPreference'            = @('MAPSReporting', 'SubmitSamplesConsent', 'DisableRealtimeMonitoring')
+    # Registry writes (Write-EdrRegistryDword)
+    'New-ItemProperty'            = @('LiteralPath', 'Name', 'Value', 'PropertyType', '[switch]Force')
+    # Programs the module runs. A function named 'x.exe' outranks the application, and takes any arguments.
+    'bcdedit.exe'                 = $null
+    'winget.exe'                  = $null
 }
 
 function Register-EdrTestStub {
     foreach ($name in $script:EdrTestStubs.Keys) {
+        if ($null -eq $script:EdrTestStubs[$name]) {
+            $body = "throw 'Unmocked call to $name'"
+            Set-Item -Path "function:global:$name" -Value ([scriptblock]::Create($body))
+            continue
+        }
         $params = foreach ($p in $script:EdrTestStubs[$name]) {
             if ($p -like '`[switch`]*') { '[switch]$' + $p.Substring(8) } else { '$' + $p }
         }

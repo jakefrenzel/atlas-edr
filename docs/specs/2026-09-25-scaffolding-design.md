@@ -192,6 +192,8 @@ Default rule set plus `PSUseShouldProcessForStateChangingFunctions`, `PSUseCompa
 6. Online mode, after a guest reboot: note whether KDNET still attaches (§4.4). Either result passes; the runbook records it.
 7. `Copy-ToEdrTestVm` delivers a file while isolated.
 8. `Reset-EdrTestVm` restores `baseline`: a file created after the checkpoint is gone.
+9. After a restore, Defender real-time protection and Tamper Protection are off, and HVCI is not running.
+10. Record which adapter carries `192.168.77.10` after KDNET is enabled (it may be the Kernel Debug Network Adapter). If the address is lost, item 4 fails.
 
 ### 5.4 Definition of done
 
@@ -224,3 +226,8 @@ Sources: [Microsoft Learn — KDNET for a Hyper-V VM](https://learn.microsoft.co
 - Rust toolchains are installed with `rustup` directly: `dtolnay/rust-toolchain` has no major-version tags (§3.4).
 - `cargo audit` also checks `crates/atlas-schema/fuzz/Cargo.lock`.
 - Pinned tool versions: Pester 5.9.1, PSScriptAnalyzer 1.25.0; actions `checkout@v7`, `cache@v6`, `upload-artifact@v7`, `rust-cache@v2`, `install-action@v2`, `buf-action@v1`.
+- From the final branch review:
+  - The baseline is taken after going Isolated **and then restarting**. The checkpoint includes memory, so the restored kernel must have booted with only `edr-internal` present; this is what makes §4.4's claim hold.
+  - The test stubs also cover `bcdedit.exe`, `winget.exe` and `New-ItemProperty`, so a missed mock can't change the host's boot configuration, software or registry.
+  - The 90-day rebuild deletes the base disk and every checkpoint differencing disk by name.
+  - Acceptance items 9 and 10 were added.

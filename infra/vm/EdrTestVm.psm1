@@ -442,7 +442,10 @@ function Initialize-EdrTestGuest {
     if ($key) {
         $lines += '', 'KDNET key (save it; the runbook needs it):', "  windbg -k net:port=$($c.KdnetPort),key=$key"
     }
-    $lines += '', 'Next: restart this VM, then on the host run', '  Set-EdrTestNetwork.ps1 -Mode Isolated',
+    # Isolate BEFORE the restart: the baseline must capture a kernel that booted with only the internal NIC, so
+    # KDNET binds to it (spec section 4.4).
+    $lines += '', 'Next, on the host, in this order (wait for the sign-in screen before the checkpoint):',
+    '  Set-EdrTestNetwork.ps1 -Mode Isolated', "  Restart-VM -Name $($c.VmName) -Force",
     "  Checkpoint-VM -Name $($c.VmName) -SnapshotName $($c.BaselineCheckpoint)"
     foreach ($line in $lines) {
         Write-Information -MessageData $line -InformationAction Continue

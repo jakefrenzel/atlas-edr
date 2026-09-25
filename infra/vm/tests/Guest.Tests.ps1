@@ -110,6 +110,20 @@ Describe 'Initialize-EdrTestGuest' {
         }
     }
 
+    It 'tells the user to isolate, then restart, then checkpoint, so the baseline kernel booted with one NIC' {
+        $script:said = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName EdrTestVm Write-Information { $script:said.Add("$MessageData") }
+
+        Initialize-EdrTestGuest
+
+        $isolate = $script:said.FindIndex({ param($l) $l -like '*Set-EdrTestNetwork.ps1 -Mode Isolated*' })
+        $restart = $script:said.FindIndex({ param($l) $l -like '*Restart-VM -Name edr-test*' })
+        $checkpoint = $script:said.FindIndex({ param($l) $l -like '*Checkpoint-VM -Name edr-test -SnapshotName baseline*' })
+        $isolate | Should -BeGreaterOrEqual 0
+        $restart | Should -BeGreaterThan $isolate
+        $checkpoint | Should -BeGreaterThan $restart
+    }
+
     It 'keeps an existing matching KDNET configuration so the key does not change' {
         Mock -ModuleName EdrTestVm Invoke-EdrBcdedit { $ConfiguredDbgSettings } -ParameterFilter { "$ArgumentList" -eq '/dbgsettings' }
         Mock -ModuleName EdrTestVm Get-NetIPAddress { [pscustomobject]@{ IPAddress = '192.168.77.10' } }

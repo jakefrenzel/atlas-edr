@@ -53,12 +53,14 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
    powershell -ExecutionPolicy Bypass -File C:\atlas\Initialize-EdrTestGuest.ps1
    ```
    It checks its preconditions first, lists everything unmet, and changes nothing until all are met.
-   **Save the printed `windbg -k net:...` line** in your password manager; it holds the KDNET key. The script is safe to re-run, and a re-run keeps the same key.
-9. **Restart the guest** (`Restart-Computer`), then **go isolated** (host):
+   **Save the printed `windbg -k net:...` line** in your password manager; it holds the KDNET key. The script is safe to re-run, and a re-run keeps the same key. One exception: if, after the reboot, KDNET has replaced the internal NIC (checklist item 10), a re-run stops at "No NIC named 'edr-internal'".
+9. **Go isolated, then restart** (host). The order matters. The baseline checkpoint includes memory, so every restore resumes the kernel from this boot. That kernel must have booted with only `edr-internal` present, so KDNET binds to that NIC and not to one that is later removed:
    ```powershell
    .\infra\vm\Set-EdrTestNetwork.ps1 -Mode Isolated
+   Restart-VM -Name edr-test -Force
    ```
-10. **Take the baseline** (host):
+   Wait until the guest reaches the sign-in screen.
+10. **Take the baseline** (host). If a `baseline` already exists, remove it first (`Remove-VMCheckpoint -VMName edr-test -Name baseline`), because two checkpoints with the same name make the restore ambiguous:
     ```powershell
     Checkpoint-VM -Name edr-test -SnapshotName baseline
     ```
@@ -89,14 +91,16 @@ Enhanced session can time out while the guest is stopped at a breakpoint; use a 
 
 The evaluation expires after 90 days. Rebuilding also tests that the scripts still work.
 
+By now the VM runs from a checkpoint's differencing disk (`edr-test_<GUID>.avhdx`), so delete the base disk and every differencing disk by name, not by the VM's current disk path:
+
 ```powershell
 Stop-VM edr-test -TurnOff
-$vhd = (Get-VMHardDiskDrive -VMName edr-test).Path
 Remove-VM edr-test -Force
-Remove-Item $vhd
+$dir = (Get-VMHost).VirtualHardDiskPath
+Get-ChildItem $dir -Filter 'edr-test*.*vhdx' | Remove-Item
 ```
 
-Then repeat §1 from step 2. The switch, host address and firewall rule are reused. `New-EdrTestVm` refuses to run while an old `edr-test.vhdx` is still present.
+Check that `Get-ChildItem $dir -Filter 'edr-test*'` prints nothing. Then repeat §1 from step 2. The switch, host address and firewall rule are reused. `New-EdrTestVm` refuses to run while an old `edr-test.vhdx` is still present.
 
 ## 5. Branch protection (one-time, user action)
 
@@ -138,9 +142,13 @@ Run after every build or rebuild. Record the date and results in the table below
 | 6 | KDNET while Online | Still Online: restart the guest with WinDbg waiting | Record the result; either result passes. If it fails, debug only in Isolated mode (§3) |
 | 7 | Copy while isolated | `Set-EdrTestNetwork.ps1 -Mode Isolated`; `Copy-ToEdrTestVm.ps1 -Path .\README.md` | `C:\atlas\README.md` exists in the guest |
 | 8 | Reset | Guest: `New-Item C:\atlas\canary.txt`; host: `Reset-EdrTestVm.ps1` | After restore, `C:\atlas\canary.txt` is gone |
+| 9 | Protections off | Guest (admin), after a restore: `Get-MpComputerStatus \| Select RealTimeProtectionEnabled, IsTamperProtected`; `(Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard Win32_DeviceGuard).SecurityServicesRunning` | `False`, `False`; and the list has no `2` (HVCI not running) |
+| 10 | Internal NIC after KDNET | Guest: `Get-NetAdapter \| Format-Table Name, InterfaceDescription`; `Get-NetIPAddress -IPAddress 192.168.77.10` | Record which adapter carries `192.168.77.10`. If KDNET replaced the NIC with "Microsoft Kernel Debug Network Adapter" and the address is gone, item 4 fails: stop and report it. The scripts then need a fix (0b review finding #3) |
+
+If item 9 shows real-time protection back on, Defender reverted the setting. Record it; the fix is the `DisableRealtimeMonitoring` policy value, and it goes through a script change, not a manual edit.
 
 ### Results
 
-| Date | Build | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | |
+| Date | Build | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | | | | | |
