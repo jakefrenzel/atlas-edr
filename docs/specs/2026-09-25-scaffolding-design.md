@@ -1,6 +1,6 @@
 # Sub-project 0b — Scaffolding Design (CI + Test VM)
 
-**Status:** Spec, awaiting review (2026-09-25). Brainstorm handoff: [scaffolding-brainstorm-notes](2026-09-25-scaffolding-brainstorm-notes.md).
+**Status:** Approved (2026-09-25); implementation plan: [2026-09-25-scaffolding-plan](../plans/2026-09-25-scaffolding-plan.md). Brainstorm handoff: [scaffolding-brainstorm-notes](2026-09-25-scaffolding-brainstorm-notes.md).
 **Depends on:** 0a (event schema: the crates CI builds, the protos `buf` checks, the fuzz target).
 **Depended on by:** sub-project 1 (runs and verifies the ETW sensor in the VM), sub-project 6 (driver work happens only in the VM), and every later sub-project (CI).
 
@@ -211,3 +211,16 @@ Default rule set plus `PSUseShouldProcessForStateChangingFunctions`, `PSUseCompa
 | `buf lint` STANDARD on 0a protos | Passes unmodified (8 files, buf 1.73.0). | No rule exceptions in `buf.yaml`. |
 
 Sources: [Microsoft Learn — KDNET for a Hyper-V VM](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/setting-up-network-debugging-of-a-virtual-machine-host); [Microsoft Learn — KDNET manual setup](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/setting-up-a-network-debugging-connection); [TechTarget — Windows 11 on Hyper-V](https://techtarget.com/searchvirtualdesktop/tip/What-to-do-when-a-PC-cant-run-Windows-11-on-Hyper-V); [Rafael Rivera — synthetic kernel debugging for Hyper-V](https://withinrafael.com/2015/02/01/how-to-set-up-synthetic-kernel-debugging-for-hyper-v-virtual-machines/).
+
+## 7. Clarifications made during planning (2026-09-25)
+
+- The guest imports `EdrTestVm.psm1`, so `Copy-ToEdrTestVm` copies both the module and `guest/Initialize-EdrTestGuest.ps1` into `C:\atlas\`.
+- Additional guest precondition: `winget.exe` must be present (it can be missing on a fresh install until App Installer updates). All unmet preconditions are reported at once.
+- `New-EdrTestVm` refuses a leftover `edr-test.vhdx` when the VM doesn't exist, and disables automatic checkpoints.
+- `Copy-ToEdrTestVm` copies files only, validates every path before copying any, and requires the VM to be Running.
+- `Complete-EdrTestVmInstall` requires the VM to be Off and is safe to re-run.
+- The guest's internal NIC gets DHCP disabled and a static address with no gateway.
+- The VM-name guard is case-insensitive, matching Hyper-V.
+- Rust toolchains are installed with `rustup` directly: `dtolnay/rust-toolchain` has no major-version tags (§3.4).
+- `cargo audit` also checks `crates/atlas-schema/fuzz/Cargo.lock`.
+- Pinned tool versions: Pester 5.9.1, PSScriptAnalyzer 1.25.0; actions `checkout@v7`, `cache@v6`, `upload-artifact@v7`, `rust-cache@v2`, `install-action@v2`, `buf-action@v1`.
