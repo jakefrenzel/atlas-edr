@@ -152,6 +152,7 @@ A guest cannot checkpoint itself, so the final runbook step is `Checkpoint-VM -N
 - In a Hyper-V VM, KDNET detects virtualization and talks over **VMBus to the host**, which exposes the debug endpoint. After reboot, the guest shows a "Microsoft Kernel Debug Network Adapter" in place of the synthetic NIC, which is why §4.1 finds NICs by device name.
 - **`busparams` is not used.** Gen 2 synthetic NICs are VMBus devices, not PCI, so there is no bus/device/function to give.
 - Microsoft's guide uses an external switch. This design uses the internal switch instead, because the debugger runs on the host and only needs the host at `192.168.77.1` to be reachable.
+- **Confirmed 2026-10-01 (acceptance item 10, review finding #3):** KDNET takes over the only NIC and Windows sees just the Kernel Debug Network Adapter, without the static address. The design keeps that adapter as the internal NIC (it shares the NIC for normal traffic): the guest script finds it by its description and `-NetworkOnly` re-applies `192.168.77.10` after the isolated restart, before the baseline (§7).
 - **Known risk:** KDNET binds to one NIC at boot, and with no `busparams` we can't choose which. The `baseline` checkpoint is taken in Isolated mode, so after a restore or reboot there is only `edr-internal` and the binding is unambiguous. The acceptance checklist (§5.3) also tests a reboot in Online mode. If KDNET binds to `edr-online` there, the runbook states the rule "kernel-debug only in Isolated mode" and no design change is needed.
 
 ### 4.5 Runbook `docs/runbooks/edr-test-vm.md`
@@ -231,3 +232,14 @@ Sources: [Microsoft Learn — KDNET for a Hyper-V VM](https://learn.microsoft.co
   - The test stubs also cover `bcdedit.exe`, `winget.exe` and `New-ItemProperty`, so a missed mock can't change the host's boot configuration, software or registry.
   - The 90-day rebuild deletes the base disk and every checkpoint differencing disk by name.
   - Acceptance items 9 and 10 were added.
+
+## 8. Changes from the first VM build (2026-10-01)
+
+Found while building `edr-test` from the runbook for the first time. Each change went through Pester first.
+
+- **Host guard:** the guest script's first precondition requires a Hyper-V VM (`Win32_ComputerSystem` Manufacturer `Microsoft Corporation`, Model `Virtual Machine`). It turns off Defender real-time protection, HVCI and driver-signature enforcement, and a run on the host had been stopped only by unrelated preconditions.
+- **winget:** packages install with `--source winget`. On a fresh install the `msstore` source can fail (`0x8A15005E`, certificate mismatch), and winget then refuses to choose a source (`-1978335138`).
+- **KDNET replaces the internal NIC** (acceptance item 10, review finding #3 confirmed). The internal NIC is now "the Hyper-V adapter named `edr-internal`, or else the Microsoft Kernel Debug Network Adapter". A new `-NetworkOnly` guest run, after the isolated restart and before the baseline, sets `192.168.77.10` on it and changes nothing else. Decision: keep KDNET with its shared adapter. Rejected: serial debugging (much slower for dumps and symbols), a second NIC dedicated to KDNET (we can't choose which NIC KDNET takes).
+- **Defender real-time protection reverted** (acceptance item 9, review finding #5 confirmed). The guest script also sets the `DisableRealtimeMonitoring` policy value. `-NetworkOnly` warns if real-time protection is still on.
+- **`Copy-ToEdrTestVm`** says "Not found" for a missing path, rather than "copies files, not folders".
+- **Runbook:** a ~5 s "press any key to boot from DVD" warning; guest-only steps labelled "inside the VM"; WinDbg must be installed on the host; the daily loop needs a built agent.

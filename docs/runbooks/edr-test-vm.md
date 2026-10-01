@@ -62,11 +62,16 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
    Restart-VM -Name edr-test -Force
    ```
    Wait until the guest reaches the sign-in screen.
-10. **Take the baseline** (host). If a `baseline` already exists, remove it first (`Remove-VMCheckpoint -VMName edr-test -Name baseline`), because two checkpoints with the same name make the restore ambiguous:
+10. **Re-apply the internal address** (**inside the VM**, Administrator Windows PowerShell). KDNET took over the internal NIC during that boot: Windows now shows only "Ethernet (Kernel Debugger)" (Microsoft Kernel Debug Network Adapter), which still carries normal traffic but has lost the static address. Copy the latest guest files in first if they changed (step 7), then:
+    ```powershell
+    powershell -ExecutionPolicy Bypass -File C:\atlas\Initialize-EdrTestGuest.ps1 -NetworkOnly
+    ```
+    It only sets `192.168.77.10` on that adapter, and warns if Defender real-time protection is still on. If it warns, stop and report acceptance item 9 before taking the baseline.
+11. **Take the baseline** (host). If a `baseline` already exists, remove it first (`Remove-VMCheckpoint -VMName edr-test -Name baseline`), because two checkpoints with the same name make the restore ambiguous:
     ```powershell
     Checkpoint-VM -Name edr-test -SnapshotName baseline
     ```
-11. Run the **acceptance checklist** (§6).
+12. Run the **acceptance checklist** (§6).
 
 ## 2. Daily loop
 
@@ -149,9 +154,9 @@ Run after every build or rebuild. Record the date and results in the table below
 | 7 | Copy while isolated | `Set-EdrTestNetwork.ps1 -Mode Isolated`; `Copy-ToEdrTestVm.ps1 -Path .\README.md` | `C:\atlas\README.md` exists in the guest |
 | 8 | Reset | Guest: `New-Item C:\atlas\canary.txt`; host: `Reset-EdrTestVm.ps1` | After restore, `C:\atlas\canary.txt` is gone |
 | 9 | Protections off | Guest (admin), after a restore: `Get-MpComputerStatus \| Select RealTimeProtectionEnabled, IsTamperProtected`; `(Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard Win32_DeviceGuard).SecurityServicesRunning` | `False`, `False`; and the list has no `2` (HVCI not running) |
-| 10 | Internal NIC after KDNET | Guest: `Get-NetAdapter \| Format-Table Name, InterfaceDescription`; `Get-NetIPAddress -IPAddress 192.168.77.10` | Record which adapter carries `192.168.77.10`. If KDNET replaced the NIC with "Microsoft Kernel Debug Network Adapter" and the address is gone, item 4 fails: stop and report it. The scripts then need a fix (0b review finding #3) |
+| 10 | Internal NIC after KDNET | Guest: `Get-NetAdapter \| Format-Table Name, InterfaceDescription`; `Get-NetIPAddress -IPAddress 192.168.77.10` | `192.168.77.10` is on "Ethernet (Kernel Debugger)" (Microsoft Kernel Debug Network Adapter). If the address is missing, step 10 (`-NetworkOnly`) was skipped |
 
-If item 9 shows real-time protection back on, Defender reverted the setting. Record it; the fix is the `DisableRealtimeMonitoring` policy value, and it goes through a script change, not a manual edit.
+If item 9 shows real-time protection back on, Defender reverted the setting. Since 2026-10-01 the guest script also sets the `DisableRealtimeMonitoring` **policy** value, which Defender honours while Tamper Protection is off. If it still comes back, record it; fixes go through a script change, not a manual edit.
 
 ### Results
 
