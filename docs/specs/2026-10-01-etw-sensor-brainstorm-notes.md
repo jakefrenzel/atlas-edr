@@ -150,4 +150,7 @@ Clarifying questions done (E1–E9). Present the design in sections for approval
 4. **Section 4: testing, verification spikes, performance budget, DoD: APPROVED 2026-10-01.** Content is in the spec (§12–§14).
 5. **Spec written:** [2026-10-01-etw-sensor-design.md](2026-10-01-etw-sensor-design.md). Rev 1 had an independent review (2 blockers,
    10 major, ~11 minor); the user decided E11; all findings folded into **rev 2** (spec §17). **Rev 2 approved 2026-10-01.**
-6. After approval: write the implementation plan (`docs/plans/<date>-etw-sensor-plan.md`); phase 0 = spikes S1–S10.
+6. **Plan structure decided (2026-10-01):** two plans, each reviewed and approved before it runs:
+   - **Plan 1a** (`docs/plans/<date>-etw-sensor-spikes-plan.md`): spikes S1–S10 as throwaway code in a git-ignored `spikes/` folder; results go into spec §15.3 and the decision log. S1/S2 need reboots and clock changes, so they prefer the VM if it is ready and fall back to the host.
+   - **Plan 1b**: the build, with full code, written from the spike results.
+7. **Next:** write plan 1a.

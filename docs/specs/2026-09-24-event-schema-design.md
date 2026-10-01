@@ -1,6 +1,6 @@
 # Sub-project 0a — Event Schema Design
 
-**Status:** Implemented (2026-09-24). Reference: docs/schema-reference.md
+**Status:** Done. Implemented 2026-09-24; DoD §8.2.2 (10-minute fuzz run) closed 2026-10-01 by the clean nightly CI fuzz runs. Reference: docs/schema-reference.md. Sub-project 1 adds three additive schema changes: [ETW sensor spec §10](2026-10-01-etw-sensor-design.md).
 **Roadmap:** Sub-project 0 was split into **0a — Event schema** (this spec) and **0b — Scaffolding** (monorepo, Docker Compose, Hyper-V VM, CI).
 **Depends on:** nothing. **Depended on by:** every other sub-project.
 

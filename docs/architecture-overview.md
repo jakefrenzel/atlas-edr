@@ -96,9 +96,9 @@ Each row: its own spec → plan → implementation.
 
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
-| 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done (10-min fuzz run pending in 0b CI) |
-| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | In build ([spec](specs/2026-09-25-scaffolding-design.md), [plan](plans/2026-09-25-scaffolding-plan.md), [runbook](runbooks/edr-test-vm.md)) |
-| 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Planning ([spec](specs/2026-10-01-etw-sensor-design.md), [notes](specs/2026-10-01-etw-sensor-brainstorm-notes.md)) |
+| 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done |
+| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | In build: VM build in progress ([spec](specs/2026-09-25-scaffolding-design.md), [plan](plans/2026-09-25-scaffolding-plan.md), [runbook](runbooks/edr-test-vm.md)) |
+| 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Planning: plan 1a (spikes) next ([spec](specs/2026-10-01-etw-sensor-design.md), [notes](specs/2026-10-01-etw-sensor-brainstorm-notes.md)) |
 | 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres (incl. Docker Compose stack) | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
 | 4 | **Response** | Command channel; kill process, quarantine file, network-isolate host (WFP) | — |
@@ -157,3 +157,6 @@ Each row: its own spec → plan → implementation.
 | 2026-10-01 | Schema deviations: Event Log Activity has an optional actor and Sensor Health has none (0a D5 assumed one on every event); Sensor Health is an Atlas extension *class* (0a §5.9 reserved the namespace for fields). |
 | 2026-10-01 | While there is no transport, the buffer runs as rolling local retention; head-plus-tail overflow switches on with sub-project 2. The agent installs to `Program Files` and refuses to start if its `ProgramData` directory's owner or DACL is wrong or it contains a reparse point. |
 | 2026-10-01 | Sub-project 1 design approved (spec rev 2, after an independent review). Next is the implementation plan; its phase 0 is spikes S1–S10 on the host. |
+| 2026-10-01 | 0a done. The scheduled nightly 10-minute `cargo fuzz` runs of `decode_event` have been clean every night since 2026-09-27, which closes 0a DoD §8.2.2. |
+| 2026-10-01 | 0b: the VM build started after disk space was freed. The runbook now notes the ~5 s "press any key to boot from DVD" prompt; missing it produces Hyper-V event 18603. |
+| 2026-10-01 | Sub-project 1 gets two plans, each reviewed and approved before it runs. Plan 1a covers spikes S1–S10: throwaway code in a git-ignored `spikes/` folder, with results written into spec §15.3. Plan 1b, the build with full code, is written from the spike results. S1/S2 (reboots, clock changes) prefer the VM if it is ready. |

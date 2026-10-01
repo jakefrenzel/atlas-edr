@@ -2150,7 +2150,7 @@ git push
 
 This task finishes the spec's §5.4 definition of done. Items marked **(user)** need the user; ask, don't do.
 
-- [ ] **Step 1: Open the PR and confirm CI is green**
+- [x] **Step 1: Open the PR and confirm CI is green** (PR #2)
 
 ```powershell
 gh pr create --base main --head feat-0b-scaffolding --title "0b: CI + Hyper-V test VM scaffolding" --body-file -
@@ -2162,11 +2162,11 @@ The body should:
 
 Then run `gh pr checks --watch`. Expected: all `ci` jobs pass.
 
-- [ ] **Step 2: (user) Merge**
+- [x] **Step 2: (user) Merge** (2026-09-25, `c671dfb`)
 
 Ask the user to review and merge, or to authorize merging. Use superpowers:finishing-a-development-branch.
 
-- [ ] **Step 3: First 10-minute fuzz run on `main`**
+- [x] **Step 3: First 10-minute fuzz run on `main`** (manual run clean, 29.2M runs; scheduled nightly runs clean every night since 2026-09-27; they start around 09:30 UTC rather than 03:17 because GitHub delays scheduled jobs)
 
 ```powershell
 gh workflow run fuzz.yml --ref main
@@ -2177,17 +2177,17 @@ Expected: `decode_event` runs about 10 minutes and succeeds.
 - **On a crash:** download the artifact (`gh run download <id> -n fuzz-artifacts-decode_event`) and hand it to the user. This is a 0a bug and needs its own fix cycle, starting with superpowers:systematic-debugging.
 - The DoD item is the first **scheduled** nightly run. Check it the next day with `gh run list --workflow fuzz --event schedule --limit 1`.
 
-- [ ] **Step 4: (user) Build the VM and run the acceptance checklist**
+- [ ] **Step 4: (user) Build the VM and run the acceptance checklist** (in progress: VM created and Windows Setup started 2026-10-01, after disk space was freed)
 
 The user follows `docs/runbooks/edr-test-vm.md` §1, runs §6, and fills in the results table. Fix any step that doesn't match reality in the runbook, and in the scripts too if needed (TDD applies). Record the result of acceptance item 6 (KDNET while Online) in the runbook.
 
-- [ ] **Step 5: (user) Branch protection**
+- [x] **Step 5: (user) Branch protection** (5 required checks, strict)
 
 Point the user to runbook §5. Claude does not change repo settings.
 
 - [ ] **Step 6: Close out 0b**
 
-Once Steps 3 (scheduled run) and 4 pass, on a new branch, update `docs/architecture-overview.md`:
+Once Steps 3 (scheduled run) and 4 pass, on a new branch, update `docs/architecture-overview.md`. (The 0a half was done early, on 2026-10-01, once Step 3 passed; only the 0b half and its decision-log entry remain.)
 - **Roadmap:**
   - 0a's status becomes `Done`, with the "(10-min fuzz run pending in 0b CI)" note removed.
   - 0b's status becomes `Done ([spec](...), [runbook](...))`.
