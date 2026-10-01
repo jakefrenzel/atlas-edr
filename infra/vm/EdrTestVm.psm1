@@ -10,6 +10,7 @@ $script:Config = [pscustomobject]@{
     VmName             = 'edr-test'
     InternalSwitch     = 'edr-internal'
     InternalAdapter    = 'edr-internal'
+    KdnetAdapter       = 'Microsoft Kernel Debug Network Adapter'
     OnlineSwitch       = 'Default Switch'
     OnlineAdapter      = 'edr-online'
     HostIp             = '192.168.77.1'
@@ -339,11 +340,28 @@ function Find-EdrGuestAdapter {
     if ($match) { $match.Name } else { $null }
 }
 
+function Find-EdrGuestInternalAdapter {
+    # Returns the alias of the internal NIC, or $null. Before KDNET starts it is the Hyper-V adapter named
+    # 'edr-internal'. Once KDNET has booted, it takes that NIC over and Windows sees only the Kernel Debug Network
+    # Adapter in its place, which still carries normal traffic (acceptance item 10, 2026-10-01).
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    $c = $script:Config
+    $alias = Find-EdrGuestAdapter -HyperVName $c.InternalAdapter
+    if ($alias) {
+        return $alias
+    }
+    $kdnet = @(Get-NetAdapter | Where-Object { $_.InterfaceDescription -eq $c.KdnetAdapter })
+    if ($kdnet.Count -eq 1) { $kdnet[0].Name } else { $null }
+}
+
 function Test-EdrGuestPrecondition {
     # Returns one message per unmet precondition; empty when the guest is ready.
+    # -NetworkOnly (the run after the KDNET restart) needs only a VM, elevation and the internal NIC.
     [CmdletBinding()]
     [OutputType([string[]])]
-    param()
+    param([switch]$NetworkOnly)
     $c = $script:Config
     $problems = @()
     # This script turns off Defender real-time protection, HVCI and driver-signature enforcement. Never on a host.
@@ -354,14 +372,17 @@ function Test-EdrGuestPrecondition {
     if (-not (Test-EdrElevated)) {
         $problems += 'Not elevated: run from an administrator PowerShell.'
     }
+    if (-not (Find-EdrGuestInternalAdapter)) {
+        $problems += "No internal NIC (Hyper-V '$($c.InternalAdapter)' or the $($c.KdnetAdapter)): check the VM's network adapters on the host."
+    }
+    if ($NetworkOnly) {
+        return , $problems
+    }
     if (Confirm-SecureBootUEFI) {
         $problems += 'Secure Boot is on: shut down the VM and run Complete-EdrTestVmInstall.ps1 on the host.'
     }
     if ((Get-MpComputerStatus).IsTamperProtected) {
         $problems += 'Tamper Protection is on: turn it off in Windows Security > Virus & threat protection > Manage settings.'
-    }
-    if (-not (Find-EdrGuestAdapter -HyperVName $c.InternalAdapter)) {
-        $problems += "No NIC named '$($c.InternalAdapter)': check the VM's network adapters on the host."
     }
     if (-not (Find-EdrGuestAdapter -HyperVName $c.OnlineAdapter)) {
         $problems += 'Not online: run Set-EdrTestNetwork.ps1 -Mode Online on the host (winget needs internet).'
@@ -376,7 +397,7 @@ function Set-EdrGuestAddress {
     [CmdletBinding(SupportsShouldProcess)]
     param()
     $c = $script:Config
-    $alias = Find-EdrGuestAdapter -HyperVName $c.InternalAdapter
+    $alias = Find-EdrGuestInternalAdapter
     if (Get-NetIPAddress -InterfaceAlias $alias -IPAddress $c.GuestIp -ErrorAction SilentlyContinue) {
         Write-Verbose "Guest address $($c.GuestIp) already on '$alias'."
         return
@@ -422,15 +443,28 @@ function Write-EdrRegistryDword {
 }
 
 function Initialize-EdrTestGuest {
+    # Full run: first-time setup, Online mode. -NetworkOnly: after the isolated restart, when KDNET has replaced the
+    # internal NIC, put the static address on the adapter that replaced it, and nothing else.
     [CmdletBinding(SupportsShouldProcess)]
-    param()
+    param([switch]$NetworkOnly)
     $c = $script:Config
-    $problems = Test-EdrGuestPrecondition
+    $problems = Test-EdrGuestPrecondition -NetworkOnly:$NetworkOnly
     if ($problems.Count -gt 0) {
         throw ("The guest is not ready; nothing was changed:`n  " + ($problems -join "`n  "))
     }
 
     Set-EdrGuestAddress
+    if ($NetworkOnly) {
+        if ((Get-MpComputerStatus).RealTimeProtectionEnabled) {
+            Write-Warning 'Defender real-time protection is still on. Do not take the baseline yet; report acceptance item 9.'
+        }
+        $lines = '', "Internal address $($c.GuestIp) is on '$(Find-EdrGuestInternalAdapter)'.",
+        'Next, on the host:', "  Checkpoint-VM -Name $($c.VmName) -SnapshotName $($c.BaselineCheckpoint)"
+        foreach ($line in $lines) {
+            Write-Information -MessageData $line -InformationAction Continue
+        }
+        return
+    }
     if ($PSCmdlet.ShouldProcess('boot configuration', 'bcdedit /set testsigning on')) {
         Invoke-EdrBcdedit -ArgumentList '/set', 'testsigning', 'on' | Out-Null
     }
@@ -441,6 +475,10 @@ function Initialize-EdrTestGuest {
     }
     if ($PSCmdlet.ShouldProcess('Microsoft Defender', 'Cloud protection, sample submission and real-time protection off')) {
         Set-MpPreference -MAPSReporting Disabled -SubmitSamplesConsent NeverSend -DisableRealtimeMonitoring $true
+        # The preference alone does not stick: Defender turned real-time protection back on (acceptance item 9,
+        # 2026-10-01). With Tamper Protection off it honours the policy value.
+        Write-EdrRegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' `
+            -Name 'DisableRealtimeMonitoring' -Value 1
     }
     foreach ($id in $c.WingetPackages) {
         if ($PSCmdlet.ShouldProcess($id, 'winget install')) {
@@ -453,10 +491,12 @@ function Initialize-EdrTestGuest {
         $lines += '', 'KDNET key (save it; the runbook needs it):', "  windbg -k net:port=$($c.KdnetPort),key=$key"
     }
     # Isolate BEFORE the restart: the baseline must capture a kernel that booted with only the internal NIC, so
-    # KDNET binds to it (spec section 4.4).
-    $lines += '', 'Next, on the host, in this order (wait for the sign-in screen before the checkpoint):',
-    '  Set-EdrTestNetwork.ps1 -Mode Isolated', "  Restart-VM -Name $($c.VmName) -Force",
-    "  Checkpoint-VM -Name $($c.VmName) -SnapshotName $($c.BaselineCheckpoint)"
+    # KDNET binds to it (spec section 4.4). KDNET then replaces that NIC, so the address is set again on the
+    # replacement (-NetworkOnly) before the checkpoint.
+    $lines += '', 'Next, in this order:',
+    '  1. Host: Set-EdrTestNetwork.ps1 -Mode Isolated', "  2. Host: Restart-VM -Name $($c.VmName) -Force (wait for the sign-in screen)",
+    "  3. In the VM (administrator): powershell -ExecutionPolicy Bypass -File $($c.GuestDropPath)\Initialize-EdrTestGuest.ps1 -NetworkOnly",
+    "  4. Host: Checkpoint-VM -Name $($c.VmName) -SnapshotName $($c.BaselineCheckpoint)"
     foreach ($line in $lines) {
         Write-Information -MessageData $line -InformationAction Continue
     }

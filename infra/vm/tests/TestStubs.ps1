@@ -38,6 +38,7 @@ $script:EdrTestStubs = [ordered]@{
     'Get-NetFirewallRule'         = @('Name')
     'New-NetFirewallRule'         = @('Name', 'DisplayName', 'Direction', 'Protocol', 'LocalPort', 'InterfaceAlias', 'Action', 'Profile')
     'Get-NetAdapterAdvancedProperty' = @('DisplayName')
+    'Get-NetAdapter'              = @()
     # Guest security
     'Confirm-SecureBootUEFI'      = @()
     'Get-MpComputerStatus'        = @()
