@@ -303,7 +303,9 @@ function Invoke-EdrBcdedit {
 function Invoke-EdrWinget {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Id)
-    & winget.exe install --exact --id $Id --silent --accept-source-agreements --accept-package-agreements
+    # --source winget: on a fresh install the msstore source can fail (e.g. 0x8A15005E, certificate mismatch), and
+    # winget then refuses to choose between sources (-1978335138) instead of using the one that works.
+    & winget.exe install --exact --id $Id --source winget --silent --accept-source-agreements --accept-package-agreements
     # -1978335189 (0x8A15002B): already installed, no applicable upgrade.
     if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
         throw "winget install $Id failed ($LASTEXITCODE)."
@@ -341,6 +343,11 @@ function Test-EdrGuestPrecondition {
     param()
     $c = $script:Config
     $problems = @()
+    # This script turns off Defender real-time protection, HVCI and driver-signature enforcement. Never on a host.
+    $system = Get-CimInstance -ClassName Win32_ComputerSystem
+    if (-not ($system.Manufacturer -eq 'Microsoft Corporation' -and $system.Model -eq 'Virtual Machine')) {
+        $problems += "Not a Hyper-V VM ($($system.Manufacturer) $($system.Model)): run this only inside edr-test, never on a host."
+    }
     if (-not (Test-EdrElevated)) {
         $problems += 'Not elevated: run from an administrator PowerShell.'
     }

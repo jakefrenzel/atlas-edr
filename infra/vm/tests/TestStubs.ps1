@@ -41,6 +41,7 @@ $script:EdrTestStubs = [ordered]@{
     # Guest security
     'Confirm-SecureBootUEFI'      = @()
     'Get-MpComputerStatus'        = @()
+    'Get-CimInstance'             = @('ClassName')
     'Set-MpPreference'            = @('MAPSReporting', 'SubmitSamplesConsent', 'DisableRealtimeMonitoring')
     # Registry writes (Write-EdrRegistryDword)
     'New-ItemProperty'            = @('LiteralPath', 'Name', 'Value', 'PropertyType', '[switch]Force')

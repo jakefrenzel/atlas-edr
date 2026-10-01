@@ -39,21 +39,22 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
    .\infra\vm\Complete-EdrTestVmInstall.ps1
    Start-VM edr-test
    ```
-5. **Turn off Tamper Protection** (guest, manual): Windows Security → Virus & threat protection → Manage settings → Tamper Protection **Off**. This is the one setting a script cannot change.
+5. **Turn off Tamper Protection** (**inside the VM**, manual): Windows Security → Virus & threat protection → Manage settings → Tamper Protection **Off**. This is the one setting a script cannot change.
 6. **Go online** (host):
    ```powershell
    .\infra\vm\Set-EdrTestNetwork.ps1 -Mode Online
    ```
-   If `winget` isn't available in the guest yet, open Microsoft Store in the guest and update "App Installer".
+   If `winget` isn't available **inside the VM** yet, open Microsoft Store in the VM and update "App Installer". (Running `winget` on the host tells you nothing about the VM; the guest script checks for it itself.)
 7. **Copy the guest script in** (host):
    ```powershell
    .\infra\vm\Copy-ToEdrTestVm.ps1 -Path .\infra\vm\EdrTestVm.psm1, .\infra\vm\guest\Initialize-EdrTestGuest.ps1
    ```
-8. **Initialize the guest** (guest, **Administrator** Windows PowerShell):
+8. **Initialize the guest**: **inside the VM, never on the host.** In the VM's Start menu, right-click **Windows PowerShell** → **Run as administrator**, then:
    ```powershell
    powershell -ExecutionPolicy Bypass -File C:\atlas\Initialize-EdrTestGuest.ps1
    ```
-   It checks its preconditions first, lists everything unmet, and changes nothing until all are met.
+   It checks its preconditions first, lists everything unmet, and changes nothing until all are met. The first check refuses to run anywhere except a Hyper-V VM, because the script turns off Defender real-time protection, HVCI and driver-signature enforcement.
+   Packages install from the `winget` source only. On a fresh install the Microsoft Store source (`msstore`) can fail with a certificate error (`0x8A15005E`); that no longer matters.
    **Save the printed `windbg -k net:...` line** in your password manager; it holds the KDNET key. The script is safe to re-run, and a re-run keeps the same key. One exception: if, after the reboot, KDNET has replaced the internal NIC (checklist item 10), a re-run stops at "No NIC named 'edr-internal'".
 9. **Go isolated, then restart** (host). The order matters. The baseline checkpoint includes memory, so every restore resumes the kernel from this boot. That kernel must have booted with only `edr-internal` present, so KDNET binds to that NIC and not to one that is later removed:
    ```powershell

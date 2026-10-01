@@ -57,7 +57,10 @@ Describe 'Find-EdrGuestAdapter' {
 
 Describe 'Initialize-EdrTestGuest' {
     BeforeEach {
-        # A guest that is ready: elevated, Secure Boot off, Tamper Protection off, online, winget present.
+        # A guest that is ready: a Hyper-V VM, elevated, Secure Boot off, Tamper Protection off, online, winget present.
+        Mock -ModuleName EdrTestVm Get-CimInstance {
+            [pscustomobject]@{ Manufacturer = 'Microsoft Corporation'; Model = 'Virtual Machine' }
+        }
         Mock -ModuleName EdrTestVm Test-EdrElevated { $true }
         Mock -ModuleName EdrTestVm Confirm-SecureBootUEFI { $false }
         Mock -ModuleName EdrTestVm Get-MpComputerStatus { [pscustomobject]@{ IsTamperProtected = $false } }
@@ -146,6 +149,12 @@ Describe 'Initialize-EdrTestGuest' {
 
     It 'stops before any change when <Case>' -TestCases @(
         @{ Case = 'not elevated'; MockCmd = 'Test-EdrElevated'; MockBody = { $false }; Message = '*Not elevated*' }
+        @{ Case = 'it runs on a physical host'; MockCmd = 'Get-CimInstance'
+            MockBody = { [pscustomobject]@{ Manufacturer = 'Contoso'; Model = 'Desktop 9000' } }; Message = '*Not a Hyper-V VM*'
+        }
+        @{ Case = 'it runs in another vendor''s VM'; MockCmd = 'Get-CimInstance'
+            MockBody = { [pscustomobject]@{ Manufacturer = 'VMware, Inc.'; Model = 'VMware7,1' } }; Message = '*Not a Hyper-V VM*'
+        }
         @{ Case = 'Secure Boot is on'; MockCmd = 'Confirm-SecureBootUEFI'; MockBody = { $true }; Message = '*Complete-EdrTestVmInstall*' }
         @{ Case = 'Tamper Protection is on'; MockCmd = 'Get-MpComputerStatus'; MockBody = { [pscustomobject]@{ IsTamperProtected = $true } }
             Message = '*Tamper Protection*'
@@ -181,5 +190,25 @@ Describe 'Initialize-EdrTestGuest' {
         Initialize-EdrTestGuest -WhatIf
         foreach ($c in $changes) { Should -Invoke -ModuleName EdrTestVm $c -Times 0 }
         Should -Invoke -ModuleName EdrTestVm Invoke-EdrBcdedit -Times 0 -ParameterFilter { "$ArgumentList" -ne '/dbgsettings' }
+    }
+}
+
+Describe 'Invoke-EdrWinget' {
+    It 'pins the winget source, so a failing msstore source cannot make winget refuse to choose' {
+        Mock -ModuleName EdrTestVm winget.exe { $global:LASTEXITCODE = 0 }
+        InModuleScope EdrTestVm { Invoke-EdrWinget -Id 'Microsoft.WinDbg' }
+        Should -Invoke -ModuleName EdrTestVm winget.exe -Times 1 -Exactly -ParameterFilter {
+            "$args" -eq 'install --exact --id Microsoft.WinDbg --source winget --silent --accept-source-agreements --accept-package-agreements'
+        }
+    }
+
+    It 'treats "already installed" as success' {
+        Mock -ModuleName EdrTestVm winget.exe { $global:LASTEXITCODE = -1978335189 }
+        InModuleScope EdrTestVm { { Invoke-EdrWinget -Id 'Microsoft.WinDbg' } | Should -Not -Throw }
+    }
+
+    It 'throws on any other failure' {
+        Mock -ModuleName EdrTestVm winget.exe { $global:LASTEXITCODE = -1978335138 }
+        InModuleScope EdrTestVm { { Invoke-EdrWinget -Id 'Microsoft.WinDbg' } | Should -Throw '*failed (-1978335138)*' }
     }
 }
