@@ -258,8 +258,11 @@ function Copy-ToEdrTestVm {
     }
     # Validate everything before copying anything.
     $files = foreach ($p in $Path) {
+        if (-not (Test-Path -LiteralPath $p)) {
+            throw "Not found: '$p'."
+        }
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
-            throw "Not a file: '$p'. Copy-ToEdrTestVm copies files, not folders."
+            throw "'$p' is a folder. Copy-ToEdrTestVm copies files, not folders."
         }
         (Resolve-Path -LiteralPath $p).ProviderPath
     }

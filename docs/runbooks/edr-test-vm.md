@@ -70,6 +70,8 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
 
 ## 2. Daily loop
 
+This loop needs a built agent (`cargo build --release -p atlas-agent`, from sub-project 1 onward). Until then, skip it.
+
 ```powershell
 .\infra\vm\Reset-EdrTestVm.ps1                                   # restore baseline and start
 .\infra\vm\Copy-ToEdrTestVm.ps1 -Path .\target\release\atlas-agent.exe
@@ -80,6 +82,8 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
 Attack simulations (e.g. Atomic Red Team) run **only in Isolated mode**. If a test needs the internet, go Online, download what you need, go Isolated again, then run the test.
 
 ## 3. Kernel debugging (KDNET)
+
+WinDbg must be installed **on the host** (one-time): `winget install Microsoft.WinDbg --source winget`.
 
 1. On the host: start WinDbg with the saved line (`windbg -k net:port=50000,key=<key>`) and wait for "Waiting to reconnect...".
 2. Restart the guest. WinDbg connects during boot; press **Break** (Ctrl+Break) to stop in the debugger.
