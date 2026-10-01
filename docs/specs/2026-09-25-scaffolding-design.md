@@ -1,6 +1,6 @@
 # Sub-project 0b — Scaffolding Design (CI + Test VM)
 
-**Status:** Approved (2026-09-25); implementation plan: [2026-09-25-scaffolding-plan](../plans/2026-09-25-scaffolding-plan.md). Brainstorm handoff: [scaffolding-brainstorm-notes](2026-09-25-scaffolding-brainstorm-notes.md).
+**Status:** Done (2026-10-01): CI green, nightly fuzzing clean, `edr-test` built and all 10 acceptance items pass (§8 lists the first-build changes). Approved 2026-09-25; implementation plan: [2026-09-25-scaffolding-plan](../plans/2026-09-25-scaffolding-plan.md). Brainstorm handoff: [scaffolding-brainstorm-notes](2026-09-25-scaffolding-brainstorm-notes.md).
 **Depends on:** 0a (event schema: the crates CI builds, the protos `buf` checks, the fuzz target).
 **Depended on by:** sub-project 1 (runs and verifies the ETW sensor in the VM), sub-project 6 (driver work happens only in the VM), and every later sub-project (CI).
 

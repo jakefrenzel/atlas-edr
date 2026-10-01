@@ -2177,7 +2177,7 @@ Expected: `decode_event` runs about 10 minutes and succeeds.
 - **On a crash:** download the artifact (`gh run download <id> -n fuzz-artifacts-decode_event`) and hand it to the user. This is a 0a bug and needs its own fix cycle, starting with superpowers:systematic-debugging.
 - The DoD item is the first **scheduled** nightly run. Check it the next day with `gh run list --workflow fuzz --event schedule --limit 1`.
 
-- [ ] **Step 4: (user) Build the VM and run the acceptance checklist** (in progress: VM created and Windows Setup started 2026-10-01, after disk space was freed)
+- [x] **Step 4: (user) Build the VM and run the acceptance checklist** (2026-10-01: all 10 items pass after the first-build fixes recorded in spec §8; results in the runbook)
 
 The user follows `docs/runbooks/edr-test-vm.md` §1, runs §6, and fills in the results table. Fix any step that doesn't match reality in the runbook, and in the scripts too if needed (TDD applies). Record the result of acceptance item 6 (KDNET while Online) in the runbook.
 
@@ -2185,7 +2185,7 @@ The user follows `docs/runbooks/edr-test-vm.md` §1, runs §6, and fills in the 
 
 Point the user to runbook §5. Claude does not change repo settings.
 
-- [ ] **Step 6: Close out 0b**
+- [x] **Step 6: Close out 0b** (2026-10-01)
 
 Once Steps 3 (scheduled run) and 4 pass, on a new branch, update `docs/architecture-overview.md`. (The 0a half was done early, on 2026-10-01, once Step 3 passed; only the 0b half and its decision-log entry remain.)
 - **Roadmap:**
