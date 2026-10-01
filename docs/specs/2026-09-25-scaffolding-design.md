@@ -198,7 +198,7 @@ Default rule set plus `PSUseShouldProcessForStateChangingFunctions`, `PSUseCompa
 ### 5.4 Definition of done
 
 1. All five `ci.yml` jobs are green on `main`, and Dependabot is enabled.
-2. The first scheduled nightly fuzz run finishes 600 s clean. The roadmap drops "fuzz run pending" from 0a.
+2. The first scheduled nightly fuzz run finishes 600 s clean. The roadmap drops "fuzz run pending" from 0a. **Met:** clean every night since 2026-09-27; roadmap updated 2026-10-01.
 3. The VM is built by following the runbook from a fresh eval ISO. Any step that differs from the runbook is fixed in the runbook.
 4. The §5.3 acceptance checklist passes.
 5. The decision log and roadmap are updated.

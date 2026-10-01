@@ -29,6 +29,7 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
    .\infra\vm\New-EdrTestVm.ps1 -IsoPath 'D:\ISO\Win11_Enterprise_Eval.iso'
    ```
 3. **Install Windows** (manual): `vmconnect localhost edr-test`, start the VM, press a key to boot from the DVD.
+   - **The "Press any key to boot from CD or DVD" prompt lasts only about 5 seconds.** Click Start, then immediately click inside the VM screen and tap Space until Setup loads. If you miss it, the VM tries the empty disk and then a network boot for about a minute, then shows "No operating system was loaded" (Hyper-V logs event 18603, "failed to boot an operating system"). Nothing is broken: use **Action → Reset** (Ctrl+R) and try again.
    - Choose "I don't have a product key" if asked (the eval needs none).
    - At the Microsoft account screen, pick **Sign-in options → Domain join instead** to create a **local** account.
    - Decline all optional diagnostics and experience settings.
