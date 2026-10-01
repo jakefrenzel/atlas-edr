@@ -162,4 +162,4 @@ If item 9 shows real-time protection back on, Defender reverted the setting. Sin
 
 | Date | Build | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | | | |
+| 2026-10-01 | Win11 Enterprise Eval, kernel 26100.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ connects | ✅ | ✅ | ✅ | ✅ | First build. 9 and 10 **failed** on the first pass (Defender real-time protection came back; KDNET replaced the internal NIC and the static IP was lost). Both were fixed in the scripts (0b spec §8) and passed after re-running setup. Item 6: online, WinDbg reconnects at boot and KDNET still takes the **internal** NIC: `192.168.77.10` stays on "Ethernet (Kernel Debugger)", and `edr-online` is a normal adapter with a Default Switch DHCP address. KDNET's own address is a self-assigned 169.254.x.x, which is harmless. |

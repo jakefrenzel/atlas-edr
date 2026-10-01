@@ -97,7 +97,7 @@ Each row: its own spec → plan → implementation.
 | # | Sub-project | Delivers | Status |
 |---|---|---|---|
 | 0a | **Foundations: event schema** | `atlas-proto` + `atlas-schema` crates, OCSF-modeled, 7 event classes ([spec](specs/2026-09-24-event-schema-design.md)) | Done |
-| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | In build: VM build in progress ([spec](specs/2026-09-25-scaffolding-design.md), [plan](plans/2026-09-25-scaffolding-plan.md), [runbook](runbooks/edr-test-vm.md)) |
+| 0b | **Foundations: scaffolding** | Hyper-V test VM setup, CI (incl. `buf breaking` and the 0a `cargo fuzz` `decode_event` 10-min run) | Done ([spec](specs/2026-09-25-scaffolding-design.md), [runbook](runbooks/edr-test-vm.md)) |
 | 1 | **Agent: ETW sensor** | Process / image-load / network / file / registry telemetry → normalized events; on-disk offline buffer | Planning: plan 1a (spikes) next ([spec](specs/2026-10-01-etw-sensor-design.md), [notes](specs/2026-10-01-etw-sensor-brainstorm-notes.md)) |
 | 2 | **Server: ingest + storage** | Agent enrollment, mTLS gRPC ingest, ClickHouse + Postgres (incl. Docker Compose stack) | — |
 | 3 | **Detection engine** | Sigma → compiled matcher, shared by agent + server; alerts | — |
@@ -160,3 +160,5 @@ Each row: its own spec → plan → implementation.
 | 2026-10-01 | 0a done. The scheduled nightly 10-minute `cargo fuzz` runs of `decode_event` have been clean every night since 2026-09-27, which closes 0a DoD §8.2.2. |
 | 2026-10-01 | 0b: the VM build started after disk space was freed. The runbook now notes the ~5 s "press any key to boot from DVD" prompt; missing it produces Hyper-V event 18603. |
 | 2026-10-01 | Sub-project 1 gets two plans, each reviewed and approved before it runs. Plan 1a covers spikes S1–S10: throwaway code in a git-ignored `spikes/` folder, with results written into spec §15.3. Plan 1b, the build with full code, is written from the spike results. S1/S2 (reboots, clock changes) prefer the VM if it is ready. |
+| 2026-10-01 | 0b done: CI green on main; the first nightly 10-minute fuzz run of `decode_event` was clean (closes 0a DoD §8.2.2); `edr-test` was built from the runbook and all 10 acceptance items pass (KDNET while Online: connects, and KDNET still takes the internal NIC). |
+| 2026-10-01 | First VM build confirmed 0b review findings #3 and #5. **KDNET replaces the internal NIC:** the design keeps the Kernel Debug Network Adapter as the internal NIC, and a `-NetworkOnly` guest run re-applies `192.168.77.10` before the baseline (rejected: serial debugging, which is slower; a second NIC dedicated to KDNET, since we can't choose which NIC it takes). **Defender reverted real-time protection:** the script also sets the policy value. The guest script now refuses to run outside a Hyper-V VM, and winget is pinned to `--source winget`. |
