@@ -39,21 +39,22 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
    .\infra\vm\Complete-EdrTestVmInstall.ps1
    Start-VM edr-test
    ```
-5. **Turn off Tamper Protection** (guest, manual): Windows Security → Virus & threat protection → Manage settings → Tamper Protection **Off**. This is the one setting a script cannot change.
+5. **Turn off Tamper Protection** (**inside the VM**, manual): Windows Security → Virus & threat protection → Manage settings → Tamper Protection **Off**. This is the one setting a script cannot change.
 6. **Go online** (host):
    ```powershell
    .\infra\vm\Set-EdrTestNetwork.ps1 -Mode Online
    ```
-   If `winget` isn't available in the guest yet, open Microsoft Store in the guest and update "App Installer".
+   If `winget` isn't available **inside the VM** yet, open Microsoft Store in the VM and update "App Installer". (Running `winget` on the host tells you nothing about the VM; the guest script checks for it itself.)
 7. **Copy the guest script in** (host):
    ```powershell
    .\infra\vm\Copy-ToEdrTestVm.ps1 -Path .\infra\vm\EdrTestVm.psm1, .\infra\vm\guest\Initialize-EdrTestGuest.ps1
    ```
-8. **Initialize the guest** (guest, **Administrator** Windows PowerShell):
+8. **Initialize the guest**: **inside the VM, never on the host.** In the VM's Start menu, right-click **Windows PowerShell** → **Run as administrator**, then:
    ```powershell
    powershell -ExecutionPolicy Bypass -File C:\atlas\Initialize-EdrTestGuest.ps1
    ```
-   It checks its preconditions first, lists everything unmet, and changes nothing until all are met.
+   It checks its preconditions first, lists everything unmet, and changes nothing until all are met. The first check refuses to run anywhere except a Hyper-V VM, because the script turns off Defender real-time protection, HVCI and driver-signature enforcement.
+   Packages install from the `winget` source only. On a fresh install the Microsoft Store source (`msstore`) can fail with a certificate error (`0x8A15005E`); that no longer matters.
    **Save the printed `windbg -k net:...` line** in your password manager; it holds the KDNET key. The script is safe to re-run, and a re-run keeps the same key. One exception: if, after the reboot, KDNET has replaced the internal NIC (checklist item 10), a re-run stops at "No NIC named 'edr-internal'".
 9. **Go isolated, then restart** (host). The order matters. The baseline checkpoint includes memory, so every restore resumes the kernel from this boot. That kernel must have booted with only `edr-internal` present, so KDNET binds to that NIC and not to one that is later removed:
    ```powershell
@@ -61,13 +62,20 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
    Restart-VM -Name edr-test -Force
    ```
    Wait until the guest reaches the sign-in screen.
-10. **Take the baseline** (host). If a `baseline` already exists, remove it first (`Remove-VMCheckpoint -VMName edr-test -Name baseline`), because two checkpoints with the same name make the restore ambiguous:
+10. **Re-apply the internal address** (**inside the VM**, Administrator Windows PowerShell). KDNET took over the internal NIC during that boot: Windows now shows only "Ethernet (Kernel Debugger)" (Microsoft Kernel Debug Network Adapter), which still carries normal traffic but has lost the static address. Copy the latest guest files in first if they changed (step 7), then:
+    ```powershell
+    powershell -ExecutionPolicy Bypass -File C:\atlas\Initialize-EdrTestGuest.ps1 -NetworkOnly
+    ```
+    It only sets `192.168.77.10` on that adapter, and warns if Defender real-time protection is still on. If it warns, stop and report acceptance item 9 before taking the baseline.
+11. **Take the baseline** (host). If a `baseline` already exists, remove it first (`Remove-VMCheckpoint -VMName edr-test -Name baseline`), because two checkpoints with the same name make the restore ambiguous:
     ```powershell
     Checkpoint-VM -Name edr-test -SnapshotName baseline
     ```
-11. Run the **acceptance checklist** (§6).
+12. Run the **acceptance checklist** (§6).
 
 ## 2. Daily loop
+
+This loop needs a built agent (`cargo build --release -p atlas-agent`, from sub-project 1 onward). Until then, skip it.
 
 ```powershell
 .\infra\vm\Reset-EdrTestVm.ps1                                   # restore baseline and start
@@ -79,6 +87,8 @@ Prerequisite: Hyper-V is enabled on the host (`Get-WindowsOptionalFeature -Onlin
 Attack simulations (e.g. Atomic Red Team) run **only in Isolated mode**. If a test needs the internet, go Online, download what you need, go Isolated again, then run the test.
 
 ## 3. Kernel debugging (KDNET)
+
+WinDbg must be installed **on the host** (one-time): `winget install Microsoft.WinDbg --source winget`.
 
 1. On the host: start WinDbg with the saved line (`windbg -k net:port=50000,key=<key>`) and wait for "Waiting to reconnect...".
 2. Restart the guest. WinDbg connects during boot; press **Break** (Ctrl+Break) to stop in the debugger.
@@ -144,12 +154,12 @@ Run after every build or rebuild. Record the date and results in the table below
 | 7 | Copy while isolated | `Set-EdrTestNetwork.ps1 -Mode Isolated`; `Copy-ToEdrTestVm.ps1 -Path .\README.md` | `C:\atlas\README.md` exists in the guest |
 | 8 | Reset | Guest: `New-Item C:\atlas\canary.txt`; host: `Reset-EdrTestVm.ps1` | After restore, `C:\atlas\canary.txt` is gone |
 | 9 | Protections off | Guest (admin), after a restore: `Get-MpComputerStatus \| Select RealTimeProtectionEnabled, IsTamperProtected`; `(Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard Win32_DeviceGuard).SecurityServicesRunning` | `False`, `False`; and the list has no `2` (HVCI not running) |
-| 10 | Internal NIC after KDNET | Guest: `Get-NetAdapter \| Format-Table Name, InterfaceDescription`; `Get-NetIPAddress -IPAddress 192.168.77.10` | Record which adapter carries `192.168.77.10`. If KDNET replaced the NIC with "Microsoft Kernel Debug Network Adapter" and the address is gone, item 4 fails: stop and report it. The scripts then need a fix (0b review finding #3) |
+| 10 | Internal NIC after KDNET | Guest: `Get-NetAdapter \| Format-Table Name, InterfaceDescription`; `Get-NetIPAddress -IPAddress 192.168.77.10` | `192.168.77.10` is on "Ethernet (Kernel Debugger)" (Microsoft Kernel Debug Network Adapter). If the address is missing, step 10 (`-NetworkOnly`) was skipped |
 
-If item 9 shows real-time protection back on, Defender reverted the setting. Record it; the fix is the `DisableRealtimeMonitoring` policy value, and it goes through a script change, not a manual edit.
+If item 9 shows real-time protection back on, Defender reverted the setting. Since 2026-10-01 the guest script also sets the `DisableRealtimeMonitoring` **policy** value, which Defender honours while Tamper Protection is off. If it still comes back, record it; fixes go through a script change, not a manual edit.
 
 ### Results
 
 | Date | Build | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | | | | |
+| 2026-10-01 | Win11 Enterprise Eval, kernel 26100.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ connects | ✅ | ✅ | ✅ | ✅ | First build. 9 and 10 **failed** on the first pass (Defender real-time protection came back; KDNET replaced the internal NIC and the static IP was lost). Both were fixed in the scripts (0b spec §8) and passed after re-running setup. Item 6: online, WinDbg reconnects at boot and KDNET still takes the **internal** NIC: `192.168.77.10` stays on "Ethernet (Kernel Debugger)", and `edr-online` is a normal adapter with a Default Switch DHCP address. KDNET's own address is a self-assigned 169.254.x.x, which is harmless. |

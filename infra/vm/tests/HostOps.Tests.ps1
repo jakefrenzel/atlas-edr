@@ -163,8 +163,8 @@ Describe 'Copy-ToEdrTestVm' {
     }
 
     It 'copies nothing when any path is a folder or missing' {
-        { Copy-ToEdrTestVm -Path $a, $TestDrive } | Should -Throw '*Not a file*'
-        { Copy-ToEdrTestVm -Path $a, (Join-Path $TestDrive 'nope.txt') } | Should -Throw '*Not a file*'
+        { Copy-ToEdrTestVm -Path $a, $TestDrive } | Should -Throw '*is a folder*copies files*'
+        { Copy-ToEdrTestVm -Path $a, (Join-Path $TestDrive 'nope.txt') } | Should -Throw '*Not found*nope.txt*'
         Should -Invoke -ModuleName EdrTestVm Copy-VMFile -Times 0
     }
 

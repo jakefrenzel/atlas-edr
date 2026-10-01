@@ -20,6 +20,7 @@ Describe 'Wrapper scripts' {
         @{ Script = 'Copy-ToEdrTestVm.ps1'; Function = 'Copy-ToEdrTestVm'; Params = @{ Path = @('C:\a', 'C:\b') } }
         @{ Script = 'Reset-EdrTestVm.ps1'; Function = 'Reset-EdrTestVm'; Params = @{ Checkpoint = 'pre-driver' } }
         @{ Script = 'guest\Initialize-EdrTestGuest.ps1'; Function = 'Initialize-EdrTestGuest'; Params = @{} }
+        @{ Script = 'guest\Initialize-EdrTestGuest.ps1'; Function = 'Initialize-EdrTestGuest'; Params = @{ NetworkOnly = $true } }
     ) {
         Mock Import-Module {}
         Mock $Function {}
