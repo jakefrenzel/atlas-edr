@@ -138,8 +138,10 @@ In an **elevated** `pwsh` at the repo root:
 . .\spikes\env.ps1
 & $Probe trace --provider $KP --process-logger --out $R\smoke.jsonl -- $Probe spawn --count 3
 & $Probe report --events $R\smoke.jsonl --actions $R\smoke.actions.jsonl | Select-Object -First 5
-Select-String -Path $R\smoke.jsonl -Pattern '"provider":"kernel-process","id":1,' | Measure-Object | Select-Object Count
-Select-String -Path $R\smoke.jsonl -Pattern '"session":"B"' | Measure-Object | Select-Object Count
+# The probe writes JSON keys in alphabetical order, so match on parsed fields, not on text.
+$ev = Get-Content $R\smoke.jsonl | ConvertFrom-Json
+@($ev | Where-Object { $_.provider -eq 'kernel-process' -and $_.id -eq 1 }).Count
+@($ev | Where-Object session -eq 'B').Count
 Assert-NoSpikeSession
 ```
 Expected: `wrote N of M events`; at least **3** Kernel-Process ProcessStart events (the spawned children); at least **3** Session B events; no `decode_error` on these; no leftover session.
@@ -647,7 +649,17 @@ Merging is the user's action.
 
 ## Appendix A — `spikes/probe` source
 
-Create these files verbatim. Layout: `spikes/probe/Cargo.toml`, `spikes/probe/src/{main,util,etw,tdh,telemetry,boot,act,enrich,report}.rs`.
+Create these files verbatim. Layout: `spikes/probe/Cargo.toml`, `spikes/probe/.cargo/config.toml`, `spikes/probe/src/{main,util,etw,tdh,telemetry,boot,act,enrich,report}.rs`.
+
+### `.cargo/config.toml`
+
+Added during Task 2 (2026-10-02): without it `probe.exe` imports `VCRUNTIME140.dll`, which the `edr-test` VM does not have, and the probe silently fails to start there.
+
+```toml
+# Link the C runtime statically so probe.exe runs on machines without the VC++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+```
 
 ### `Cargo.toml`
 

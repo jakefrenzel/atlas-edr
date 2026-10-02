@@ -466,7 +466,14 @@ Against the jdu2600/Windows10EtwEvents manifest dump (Windows 11 26H1, build 280
 
 ### 15.3 Results
 
-*(filled in during plan phase 0)*
+Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spikes-plan.md)). Host: Windows 11 build 26200. VM `edr-test`: build 26300 (Windows Update had moved it on from the 26100 recorded at the 0b build). Raw evidence stays in the git-ignored `spikes/results/`.
+
+| # | Answer | Evidence | Design consequence |
+|---|---|---|---|
+| S1 | **Start key = `(BootId << 48) \| ProcessSequenceNumber`**, where BootId is the kernel's value (`KUSER_SHARED_DATA.BootId`). It is not the bare sequence number. | Host: `ProcessStartKey` matched the formula for 313 of 313 readable processes (none matched the bare sequence number). For 21 of 21 traced launches, Kernel-Process ProcessStart v4's `ProcessSequenceNumber` with the formula gave exactly the extended-data start key on that process's own events. VM: the formula held for 170 of 170 processes, then 96 of 96 after a reboot, with the high 16 bits stepping 6 → 7 with BootId. The one unreadable process is PID 0 (Idle). | §5.2 row 2: Launch start key = `(BootId << 48) \| ProcessSequenceNumber`; other events use the extended data, so all paths give the same uid. BootId is read from `KUSER_SHARED_DATA` (offset `0x2c4` on 26200 and 26300). The registry copy can lag (S2), so it is never used. BootId has 16 bits in the key. |
+| S2 | **`boot_time` = creation time of the System process (PID 4)**, from `GetProcessTimes` (needs the SYSTEM or admin rights the agent has). | VM, 100 ns resolution: identical across +2 h and −1 day clock changes (time sync and w32time off), a time-zone change, a save/resume, and repeated separate reads; different after a reboot. Rejected: `SystemTimeOfDayInformation.BootTime`, WMI `LastBootUpTime`, and now − (unbiased) interrupt time all shifted by exactly each clock change (+7199.8 s, −79 200 s). The Registry and `smss.exe` creation times also passed, but need a lookup by name. Kernel-General event 12 `StartTime` also passed, but an attacker can clear the log. | §6.1: `boot_time` = PID 4 creation time (FILETIME, u64 LE in the 0a formula). One fixed-PID call, no event log. |
+
+**S2, the BootId sources disagree.** In the same boot, `KUSER_SHARED_DATA.BootId` = `PROCESS_TELEMETRY_ID_INFORMATION.BootId` = the start key's high 16 bits, but the registry's `PrefetchParameters\BootId` was one lower in the VM (5 vs 6; after the reboot, 6 vs 7). On the host, where a user had signed in, all three matched. The likely reason is that the registry copy is written only once the boot is marked successful (after an interactive sign-in); the VM had none after its baseline. The mechanism was not tested further: `boot_id` includes `boot_time`, so a repeated BootId cannot merge two boots, but the agent reads BootId only from `KUSER_SHARED_DATA`. This refines 0a §4.4, which calls the two "the same counter".
 
 ## 16. Known Limitations
 
