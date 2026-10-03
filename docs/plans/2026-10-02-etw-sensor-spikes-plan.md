@@ -138,8 +138,10 @@ In an **elevated** `pwsh` at the repo root:
 . .\spikes\env.ps1
 & $Probe trace --provider $KP --process-logger --out $R\smoke.jsonl -- $Probe spawn --count 3
 & $Probe report --events $R\smoke.jsonl --actions $R\smoke.actions.jsonl | Select-Object -First 5
-Select-String -Path $R\smoke.jsonl -Pattern '"provider":"kernel-process","id":1,' | Measure-Object | Select-Object Count
-Select-String -Path $R\smoke.jsonl -Pattern '"session":"B"' | Measure-Object | Select-Object Count
+# The probe writes JSON keys in alphabetical order, so match on parsed fields, not on text.
+$ev = Get-Content $R\smoke.jsonl | ConvertFrom-Json
+@($ev | Where-Object { $_.provider -eq 'kernel-process' -and $_.id -eq 1 }).Count
+@($ev | Where-Object session -eq 'B').Count
 Assert-NoSpikeSession
 ```
 Expected: `wrote N of M events`; at least **3** Kernel-Process ProcessStart events (the spawned children); at least **3** Session B events; no `decode_error` on these; no leftover session.
@@ -645,9 +647,19 @@ Merging is the user's action.
 
 ---
 
+## Execution notes (2026-10-02)
+
+All ten spikes ran on 2026-10-02; results are in spec §15.3. How the execution differed from the steps above:
+- **Scripts per step.** Each step ran as one script in `spikes/` (`run-smoke.ps1`, `run-s1-host.ps1`, `run-s1s2-vm.ps1`, `run-s3.ps1` … `run-s10b.ps1`), started from an elevated PowerShell by the user. Each script writes a transcript to `spikes/results/`. This replaced pasting multi-line blocks, which a terminal had joined into one line. The scripts are git-ignored like the rest of `spikes/`. S3 needs no elevation (DNS-Client is a user-mode provider), so Claude ran it directly.
+- **VM steps over PowerShell Direct.** `run-s1s2-vm.ps1` drove S1's reboot test and all of S2 from the host (`Invoke-Command -VMName`, `Copy-Item -FromSession`), so nothing was typed in the VM console. The VM was on build 26300 by then.
+- **S2's BootId offset** was read with `cdb` from the installed WinDbg package and public symbols, not the WinDbg GUI: `0x2c4` on builds 26200 and 26300.
+- **S5 ran on host loopback only.** The VM-side variant was dropped.
+- **Follow-up runs added on the way.** S7b showed `KeyObject` is per handle. S7c and S6b verified seeding the key and file maps from the system handle table (both decisions made by the user during the run). S9b confirmed the UDP gate under real QUIC load, which the 10-minute runs had lacked. S10b added build pairs before the user decided on the slowdown.
+- **Probe changes** (all in Appendix A below, which now matches the final source): the C runtime is linked statically (`.cargo/config.toml`), because `VCRUNTIME140.dll` was missing in the VM and the probe failed silently there. New pieces: the `handles --kind key|file` subcommand (handle-table naming, `SeDebugPrivilege`, a timeout for file names) and the `registry-hold` scenario. Spawn timing now uses CPU cycles, because `GetProcessTimes` ticks every 15.6 ms. And `Session` stops itself on drop.
+- **Fixed during the run:** the Task 1 step 5 check matched on JSON text, but the probe writes keys in alphabetical order; it now parses the JSON. Small script bugs cost a few re-runs: a case-insensitive variable clash, children not followed without the process provider, and a transcript left open by an interrupted run. None changed a result.
 ## Appendix A — `spikes/probe` source
 
-Create these files verbatim. Layout: `spikes/probe/Cargo.toml`, `spikes/probe/src/{main,util,etw,tdh,telemetry,boot,act,enrich,report}.rs`.
+Create these files verbatim. Layout: `spikes/probe/Cargo.toml`, `spikes/probe/.cargo/config.toml`, `spikes/probe/src/{main,util,etw,tdh,telemetry,boot,act,enrich,report,keyhandles}.rs`. This is the final source as of 2026-10-02.
 
 ### `Cargo.toml`
 
@@ -670,6 +682,7 @@ sha2 = "0.10"
 [dependencies.windows]
 version = "0.62"
 features = [
+    "Wdk_System_Registry",
     "Wdk_System_SystemInformation",
     "Wdk_System_Threading",
     "Win32_NetworkManagement_Dns",
@@ -693,6 +706,15 @@ features = [
 ]
 ```
 
+### `.cargo/config.toml`
+
+```toml
+# Link the C runtime statically so probe.exe runs on machines without the VC++ redistributable
+# (the edr-test VM has none: VCRUNTIME140.dll is missing there).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+```
+
 ### `src/main.rs`
 
 ```rust
@@ -703,6 +725,7 @@ mod act;
 mod boot;
 mod enrich;
 mod etw;
+mod keyhandles;
 mod report;
 mod tdh;
 mod telemetry;
@@ -754,6 +777,16 @@ enum Cmd {
     },
     /// Spawn processes (S8 join test, canary-launch cost).
     Spawn(act::SpawnArgs),
+    /// Name key or file handles from the system handle table (S6/S7 follow-ups).
+    Handles {
+        #[arg(long, value_parser = ["key", "file"], default_value = "key")]
+        kind: String,
+        #[arg(long)]
+        pid: Vec<u32>,
+        /// Every process; prints only the summary (count and cost).
+        #[arg(long)]
+        all: bool,
+    },
     /// Exit immediately (the cheapest possible child process).
     Noop,
     /// Exact-size TCP transfer (S5).
@@ -780,6 +813,7 @@ fn main() {
         Cmd::Boot { repeat, interval_ms, kusd_offset } => boot::run(repeat, interval_ms, kusd_offset),
         Cmd::Act { scenario, dir, delay_ms } => act::run(scenario, dir, delay_ms),
         Cmd::Spawn(args) => act::spawn(args),
+        Cmd::Handles { kind, pid, all } => keyhandles::run(&pid, all, kind == "file"),
         Cmd::Noop => Ok(()),
         Cmd::Tcp(args) => act::tcp(args),
         Cmd::Udp(args) => act::udp(args),
@@ -2265,6 +2299,9 @@ pub enum Scenario {
     FileHold,
     /// S4/S7: key and value operations under HKCU and HKLM, incl. RegRenameKey.
     Registry,
+    /// S7: open HKCU\Software, wait --delay-ms (seed the map and start the trace meanwhile), then
+    /// create, set and delete a subkey relative to that old handle.
+    RegistryHold,
     /// S3: DnsQuery_W lookups (fresh, cached, NXDOMAIN, AAAA, CNAME chain).
     Dns,
 }
@@ -2321,6 +2358,7 @@ pub fn run(s: Scenario, dir: Option<PathBuf>, delay_ms: u64) -> Result<()> {
         Scenario::File => file(&work_dir(dir)?),
         Scenario::FileHold => file_hold(&work_dir(dir)?, delay_ms),
         Scenario::Registry => registry(),
+        Scenario::RegistryHold => registry_hold(delay_ms),
         Scenario::Dns => dns(),
     }
 }
@@ -2652,6 +2690,22 @@ fn registry() -> Result<()> {
         .map(|_| json!(d))
     });
     s.step("cleanup_hkcu", || w32(unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide(base).as_ptr())) }));
+    Ok(())
+}
+
+fn registry_hold(delay_ms: u64) -> Result<()> {
+    let mut s = Steps { n: 0 };
+    let (base, _) = create_key(HKEY_CURRENT_USER, "Software", KEY_ALL_ACCESS)?;
+    eprintln!(r"act: pid {} holds HKCU\Software (handle {:?}); writing in {delay_ms} ms", std::process::id(), base.0);
+    std::thread::sleep(Duration::from_millis(delay_ms));
+    s.step("create_relative_to_old_handle", || {
+        create_key(base.0, "AtlasSpikeHold", KEY_ALL_ACCESS).map(|(_, d)| json!(d))
+    });
+    s.step("set_value_under_it", || {
+        let (k, _) = create_key(base.0, "AtlasSpikeHold", KEY_ALL_ACCESS)?;
+        set_value(&k, "v", REG_DWORD, &7u32.to_le_bytes())
+    });
+    s.step("delete_it", || w32(unsafe { RegDeleteKeyW(base.0, PCWSTR(wide("AtlasSpikeHold").as_ptr())) }));
     Ok(())
 }
 
@@ -3312,6 +3366,260 @@ pub fn run(events: &Path, actions: &Path, slack_ms: u64) -> Result<()> {
     for (k, list) in &outside {
         println!("- {k}: {} event(s); first: {}", list.len(), describe(list[0]));
     }
+    Ok(())
+}
+```
+
+### `src/keyhandles.rs`
+
+```rust
+//! S7 follow-up: name every registry key handle from the system handle table
+//! (SystemExtendedHandleInformation), to test whether its object address equals Kernel-Registry's
+//! `KeyObject` and what seeding the agent's map at startup would cost.
+
+use crate::util::{Result, wide};
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::time::Instant;
+use windows::Wdk::System::Registry::{KeyNameInformation, NtQueryKey};
+use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+use windows::Win32::System::Registry::{HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
+use windows::core::PCWSTR;
+
+const SYSTEM_EXTENDED_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(64);
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+
+/// SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX (x64, 40 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Entry {
+    object: usize,
+    pid: usize,
+    handle: usize,
+    granted_access: u32,
+    creator_back_trace_index: u16,
+    object_type_index: u16,
+    handle_attributes: u32,
+    reserved: u32,
+}
+
+fn handle_table() -> Result<Vec<Entry>> {
+    let mut buf = vec![0u64; 1 << 20]; // 8 MiB, grown on demand
+    loop {
+        let mut ret = 0u32;
+        let st = unsafe {
+            NtQuerySystemInformation(
+                SYSTEM_EXTENDED_HANDLE_INFORMATION,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+                &mut ret,
+            )
+        };
+        if st.0 == STATUS_INFO_LENGTH_MISMATCH {
+            buf = vec![0u64; (ret as usize).max(buf.len() * 16).div_ceil(8) + (1 << 18)];
+            continue;
+        }
+        if st.is_err() {
+            return Err(format!("NtQuerySystemInformation(64): NTSTATUS {:#010x}", st.0));
+        }
+        // Header: NumberOfHandles (usize), Reserved (usize); then the entries.
+        let count = buf[0] as usize;
+        let entries = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(2) as *const Entry, count) };
+        return Ok(entries.to_vec());
+    }
+}
+
+fn key_name(h: HANDLE) -> Option<String> {
+    let mut buf = vec![0u64; 512];
+    let mut ret = 0u32;
+    let st =
+        unsafe { NtQueryKey(h, KeyNameInformation, Some(buf.as_mut_ptr().cast()), (buf.len() * 8) as u32, &mut ret) };
+    if st.is_err() {
+        return None;
+    }
+    // KEY_NAME_INFORMATION: NameLength (u32, bytes), Name[...] (UTF-16).
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+    let len = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let units: Vec<u16> = bytes.get(4..4 + len)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// Enables SeDebugPrivilege: newer builds show kernel object addresses in the handle table only
+/// to holders of it, and it lets OpenProcess reach more processes. Returns whether it is enabled.
+fn enable_debug_privilege() -> bool {
+    use windows::Win32::Foundation::LUID;
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let name = wide("SeDebugPrivilege");
+        let mut luid = LUID::default();
+        let mut ok = LookupPrivilegeValueW(PCWSTR::null(), PCWSTR(name.as_ptr()), &mut luid).is_ok();
+        if ok {
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            // AdjustTokenPrivileges succeeds even when the privilege is absent; check the last error.
+            ok = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None).is_ok()
+                && windows::Win32::Foundation::GetLastError().is_ok();
+        }
+        let _ = CloseHandle(token);
+        ok
+    }
+}
+
+/// Names a duplicated file handle on a worker thread, so a handle whose name query blocks (for
+/// example a synchronous pipe) costs a timeout instead of hanging the probe. Only disk files are named.
+struct FileNamer {
+    tx: std::sync::mpsc::Sender<usize>,
+    rx: std::sync::mpsc::Receiver<Option<String>>,
+}
+
+impl FileNamer {
+    fn new() -> FileNamer {
+        let (tx, jobs) = std::sync::mpsc::channel::<usize>();
+        let (done, rx) = std::sync::mpsc::channel::<Option<String>>();
+        std::thread::spawn(move || {
+            use windows::Win32::Storage::FileSystem::{
+                FILE_TYPE_DISK, GetFileType, GetFinalPathNameByHandleW, VOLUME_NAME_NT,
+            };
+            for h in jobs {
+                let h = HANDLE(h as *mut _);
+                let name = unsafe {
+                    if GetFileType(h) != FILE_TYPE_DISK {
+                        None
+                    } else {
+                        let mut buf = vec![0u16; 1024];
+                        let n = GetFinalPathNameByHandleW(h, &mut buf, VOLUME_NAME_NT) as usize;
+                        (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
+                    }
+                };
+                if done.send(name).is_err() {
+                    break;
+                }
+            }
+        });
+        FileNamer { tx, rx }
+    }
+
+    /// `Err(())` = timed out (this namer is then abandoned and replaced).
+    fn name(&self, h: HANDLE) -> std::result::Result<Option<String>, ()> {
+        self.tx.send(h.0 as usize).map_err(|_| ())?;
+        self.rx.recv_timeout(std::time::Duration::from_millis(200)).map_err(|_| ())
+    }
+}
+
+pub fn run(pids: &[u32], all: bool, files: bool) -> Result<()> {
+    let debug_privilege = enable_debug_privilege();
+    // Find the object type index from a handle of our own of that type.
+    let own_file =
+        std::fs::File::open(std::env::current_exe().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let sub = wide("SOFTWARE");
+    let mut own_key = HKEY::default();
+    let st = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(sub.as_ptr()), None, KEY_READ, &mut own_key) };
+    if st.is_err() {
+        return Err(format!("RegOpenKeyExW: {}", st.0));
+    }
+    let own =
+        if files { std::os::windows::io::AsRawHandle::as_raw_handle(&own_file) as usize } else { own_key.0 as usize };
+    let t0 = Instant::now();
+    let table = handle_table()?;
+    let enumerate_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let me = std::process::id() as usize;
+    let key_type = table
+        .iter()
+        .find(|e| e.pid == me && e.handle == own)
+        .map(|e| e.object_type_index)
+        .ok_or("own handle not found in the handle table (not elevated?)")?;
+    unsafe {
+        let _ = RegCloseKey(own_key);
+    }
+    let mut namer = FileNamer::new();
+    let (mut not_disk, mut timeouts) = (0usize, 0usize);
+
+    let t1 = Instant::now();
+    let mut by_pid: BTreeMap<usize, Vec<Entry>> = BTreeMap::new();
+    for e in table.iter().filter(|e| e.object_type_index == key_type && e.pid != me) {
+        if all || pids.contains(&(e.pid as u32)) {
+            by_pid.entry(e.pid).or_default().push(*e);
+        }
+    }
+    let (mut named, mut failed, mut no_open) = (0usize, 0usize, 0usize);
+    for (pid, entries) in &by_pid {
+        let Ok(src) = (unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, *pid as u32) }) else {
+            no_open += entries.len();
+            continue;
+        };
+        for e in entries {
+            let mut dup = HANDLE::default();
+            let ok = unsafe {
+                DuplicateHandle(
+                    src,
+                    HANDLE(e.handle as *mut _),
+                    GetCurrentProcess(),
+                    &mut dup,
+                    0,
+                    false,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            }
+            .is_ok();
+            let name = if !ok {
+                None
+            } else if !files {
+                key_name(dup)
+            } else {
+                match namer.name(dup) {
+                    Ok(Some(n)) => Some(n),
+                    Ok(None) => {
+                        not_disk += 1;
+                        None
+                    }
+                    Err(()) => {
+                        timeouts += 1;
+                        namer = FileNamer::new();
+                        continue; // the stuck worker still owns `dup`; leak it
+                    }
+                }
+            };
+            if ok {
+                unsafe {
+                    let _ = CloseHandle(dup);
+                }
+            }
+            match &name {
+                Some(_) => named += 1,
+                None => failed += 1,
+            }
+            if !all {
+                // Same text form as TDH prints KeyObject/BaseObject.
+                println!(
+                    "{}",
+                    json!({ "pid": pid, "handle": format!("{:#x}", e.handle), "object": format!("0x{:016X}", e.object), "name": name })
+                );
+            }
+        }
+        unsafe {
+            let _ = CloseHandle(src);
+        }
+    }
+    println!(
+        "{}",
+        json!({ "summary": {
+            "kind": if files { "file" } else { "key" }, "debug_privilege": debug_privilege, "handles_in_table": table.len(), "type_index": key_type, "handles_of_kind": named + failed + no_open + timeouts, "not_disk_files": not_disk, "name_timeouts": timeouts,
+            "named": named, "duplicate_or_query_failed": failed, "process_not_openable": no_open,
+            "processes": by_pid.len(), "enumerate_ms": enumerate_ms, "naming_ms": t1.elapsed().as_secs_f64() * 1e3,
+        }})
+    );
     Ok(())
 }
 ```
