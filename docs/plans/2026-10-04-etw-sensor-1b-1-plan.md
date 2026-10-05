@@ -5260,3 +5260,9 @@ Update the roadmap row to "plan 1b-2 next" (if Step 4's wording no longer fits),
   - The `RegType` wording is corrected.
   - A reader skips a segment that fails to open only if it is sealed.
   - The fix for a zero-filled header first broke recovery of a torn header (the file position was left at the old end); the every-byte torn-write test caught it before the plan was regenerated.
+
+## Build Notes (2026-10-04)
+
+- **Correction to the verification note:** the two symlink tests (`a_segment_that_is_a_symlink_is_refused`, `a_buffer_directory_that_is_a_symlink_is_refused`) **skip** on the host. Creating a symlink there fails with OS error 1314: the account lacks the privilege, and Developer Mode is off. The claim that they ran was not checked against the captured test output. The Windows share-mode test does run on the host. CI's elevated `windows-latest` runner is the first to run the symlink tests on Windows, and the Linux job runs the directory one.
+- **Diffs and `git apply`:** the generator trimmed trailing whitespace from each block, so a diff whose last context line is blank (`build.rs` in Task 1) is one line short for `git apply`. Applying by hand is unaffected; with `git apply`, use `--recount`.
+- **Symlink tests fail rather than skip in CI** (added during the build). A passing test's output is hidden, so the first CI run could not show whether they ran. `skip_or_fail` in `tests/concurrent.rs` now panics when `CI` is set, so a green Windows job proves the reparse-point refusal ran.

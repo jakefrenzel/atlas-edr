@@ -86,6 +86,21 @@ fn dns_response(w: &mut wire::Event) -> &mut wire::DnsResponse {
     }
 }
 
+fn event_log(w: &mut wire::Event) -> &mut wire::EventLogActivity {
+    match w.kind.as_mut() {
+        Some(Kind::EventLog(e)) => e,
+        _ => panic!("not event log"),
+    }
+}
+
+fn health_report(w: &mut wire::Event) -> &mut wire::SensorHealthReport {
+    use wire::sensor_health::Activity;
+    match w.kind.as_mut() {
+        Some(Kind::SensorHealth(wire::SensorHealth { activity: Some(Activity::Report(r)), .. })) => r,
+        _ => panic!("not a sensor health report"),
+    }
+}
+
 fn long(n: usize) -> String {
     "a".repeat(n)
 }
@@ -250,6 +265,64 @@ const CASES: &[(&str, Mutation, &str, K)] = &[
     ),
     ("registry_value_set", |w| reg_value_set(w).r#type = Some(12), "reg_value.type", K::UnknownEnum),
     ("registry_value_set", |w| reg_value_set(w).data = vec![0; REG_DATA_MAX + 1], "reg_value.data", K::TooLarge),
+    // registry value: sub-project 1 fields (sensor spec §10.4)
+    ("registry_value_set", |w| reg_value_set(w).raw_type = Some(12), "reg_value.raw_type", K::Malformed),
+    ("registry_value_set_unavailable", |w| reg_value_set(w).raw_type = Some(11), "reg_value.raw_type", K::Malformed),
+    ("registry_value_set", |w| reg_value_set(w).data_unavailable = true, "reg_value.data_unavailable", K::Malformed),
+    (
+        "registry_value_set_unavailable",
+        |w| reg_value_set(w).data_truncated = true,
+        "reg_value.data_unavailable",
+        K::Malformed,
+    ),
+    ("registry_value_set_unavailable", |w| reg_value_set(w).raw_type = None, "reg_value.type", K::Missing),
+    // event log
+    ("event_log_stop", |w| event_log(w).activity = None, "activity", K::Missing),
+    ("event_log_stop", |w| event_log(w).log_name.clear(), "log_name", K::Missing),
+    ("event_log_stop", |w| event_log(w).log_name = long(EVENT_LOG_NAME_MAX + 1), "log_name", K::TooLarge),
+    ("event_log_disable", |w| event_log(w).log_provider.clear(), "log_provider", K::Missing),
+    ("event_log_restart", |w| event_log(w).log_provider = long(EVENT_LOG_NAME_MAX + 1), "log_provider", K::TooLarge),
+    (
+        "event_log_stop",
+        |w| event_log(w).actor = Some(wire::ProcessRef { uid: vec![0; 3], ..Default::default() }),
+        "actor.process.uid",
+        K::Malformed,
+    ),
+    // sensor health
+    (
+        "sensor_health_report",
+        |w| match w.kind.as_mut() {
+            Some(Kind::SensorHealth(h)) => h.activity = None,
+            _ => unreachable!(),
+        },
+        "activity",
+        K::Missing,
+    ),
+    (
+        "sensor_health_report",
+        |w| {
+            let q = health_report(w).quality.as_mut().unwrap();
+            q.actor_unresolved = vec![wire::ClassCount { class_uid: 1001, count: 1 }; CLASS_COUNTS_MAX + 1];
+        },
+        "quality.actor_unresolved",
+        K::TooLarge,
+    ),
+    (
+        "sensor_health_report",
+        |w| {
+            let l = health_report(w).loss.as_mut().unwrap();
+            l.actor_dropped = vec![wire::ClassCount { class_uid: 4001, count: 1 }; CLASS_COUNTS_MAX + 1];
+        },
+        "loss.actor_dropped",
+        K::TooLarge,
+    ),
+    (
+        "sensor_health_report",
+        |w| health_report(w).gap.as_mut().unwrap().first_time = Some(i64::MAX),
+        "gap.last_time",
+        K::Malformed,
+    ),
+    ("sensor_health_report", |w| health_report(w).gap.as_mut().unwrap().last_time = None, "gap", K::Malformed),
     // dns
     ("dns_response", |w| dns_activity(w).hostname = long(DNS_HOSTNAME_MAX + 1), "query.hostname", K::TooLarge),
     ("dns_response", |w| dns_activity(w).query_type = 65_536, "query.type", K::Malformed),
@@ -298,6 +371,16 @@ const AT_LIMIT: &[(&str, Mutation)] = &[
         dns_response(w).answers = vec![a; DNS_ANSWERS_MAX];
     }),
     ("network_open", |w| network(w).src_endpoint.as_mut().unwrap().port = 65_535),
+    ("event_log_disable", |w| {
+        let e = event_log(w);
+        (e.log_name, e.log_provider) = (long(EVENT_LOG_NAME_MAX), long(EVENT_LOG_NAME_MAX));
+    }),
+    ("sensor_health_report", |w| {
+        let q = health_report(w).quality.as_mut().unwrap();
+        q.actor_unresolved = vec![wire::ClassCount { class_uid: 1001, count: 1 }; CLASS_COUNTS_MAX];
+    }),
+    ("registry_value_set_unavailable", |w| reg_value_set(w).raw_type = Some(12)),
+    ("registry_value_set_unavailable", |w| reg_value_set(w).raw_type = Some(u32::MAX)),
 ];
 
 #[test]
@@ -322,6 +405,14 @@ fn optional_fields_may_be_absent() {
     f.hashes = None;
     f.signature = None;
     check(w).expect("optional fields are optional");
+
+    // Event Log Activity: no actor and no status code (the samples already omit both).
+    check(wire_sample("event_log_stop")).expect("actor and status_code are optional");
+
+    // Sensor Health: every group and the gap may be absent.
+    let mut w = wire_sample("sensor_health_report");
+    *health_report(&mut w) = wire::SensorHealthReport::default();
+    check(w).expect("every Sensor Health field is optional");
 }
 
 #[test]
@@ -358,12 +449,13 @@ fn invalid_utf8_in_a_string_is_malformed() {
 
 #[test]
 fn class_from_a_newer_schema_is_rejected_as_missing_kind() {
-    // A newer agent might send oneof field 17 (a class this build does not know).
+    // A newer agent might send oneof field 19 (a class this build does not know;
+    // 17 and 18 are Event Log Activity and Sensor Health since sub-project 1).
     // prost keeps it as an unknown field, so `kind` is absent.
     let mut w = wire_sample("process_launch");
     w.kind = None;
     let mut bytes = w.encode_to_vec();
-    bytes.extend_from_slice(&[0x8a, 0x01, 0x00]); // field 17, wire type 2, length 0
+    bytes.extend(field(19, &[]));
     let err = decode_event(&bytes).unwrap_err();
     assert_eq!((err.field_path.as_str(), err.kind), ("kind", K::Missing));
 }
@@ -394,14 +486,16 @@ fn field(tag: u32, inner: &[u8]) -> Vec<u8> {
 fn unknown_activity_is_reported_before_class_fields() {
     // A newer activity may omit fields today's activities require (e.g. a future
     // Network Listen has no dst_endpoint). Version skew must read as `activity: Missing`,
-    // not as a missing class field. (sample, Event oneof tag, first unused activity tag)
+    // not as a missing class field. (sample, Event oneof tag, first unused field tag)
     let cases: &[(&str, u32, u32)] = &[
         ("module_load", 11, 3),
         ("network_open", 12, 8),
-        ("file_create", 13, 9),
-        ("registry_key_create", 14, 6),
-        ("registry_value_set", 15, 6),
+        ("file_create", 13, 10),
+        ("registry_key_create", 14, 7),
+        ("registry_value_set", 15, 7),
         ("dns_response", 16, 5),
+        ("event_log_stop", 17, 8),
+        ("sensor_health_report", 18, 3),
     ];
     for &(sample, event_tag, unknown_activity_tag) in cases {
         let mut w = wire_sample(sample);
@@ -428,6 +522,15 @@ fn unknown_activity_is_reported_before_class_fields() {
             }
             Kind::Dns(mut c) => {
                 (c.activity, c.actor) = (None, None);
+                c.encode_to_vec()
+            }
+            Kind::EventLog(mut c) => {
+                // `log_name` is required: the unknown activity must still be reported first.
+                (c.activity, c.log_name) = (None, String::new());
+                c.encode_to_vec()
+            }
+            Kind::SensorHealth(mut c) => {
+                c.activity = None;
                 c.encode_to_vec()
             }
             Kind::Process(_) => unreachable!("process has no class-level fields"),

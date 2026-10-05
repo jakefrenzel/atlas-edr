@@ -20,7 +20,7 @@ pub use error::{SchemaError, SchemaErrorKind};
 pub use event::{Device, Event, EventKind, EventMeta, Sensor};
 pub use ids::{BootId, DeviceUid, EventId, ProcessUid, process_uid};
 pub use objects::{File, Hashes, Integrity, NetworkEndpoint, Process, ProcessRef, Signature, SignatureStatus, User};
-pub use ocsf::OcsfIds;
+pub use ocsf::{ATLAS_EXTENSION_UID, OcsfIds, SENSOR_HEALTH_CLASS_UID};
 
 /// Generated wire types, re-exported for transport code.
 pub use atlas_proto::v1 as wire;

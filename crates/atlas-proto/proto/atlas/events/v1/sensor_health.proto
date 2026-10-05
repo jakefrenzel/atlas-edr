@@ -1,0 +1,140 @@
+// Atlas extension class Sensor Health (class_uid 50006001, category 6 Application Activity):
+// the agent's own loss, quality, housekeeping and resource figures.
+//
+// Counters count occurrences during the interval [interval_start, Event.time]. Gauges are
+// sampled at the end of the interval. An absent field was not measured (for example, seeding
+// is off); 0 means measured and none occurred.
+syntax = "proto3";
+
+package atlas.events.v1;
+
+message SensorHealth {
+  // Start of the interval, in nanoseconds since the Unix epoch, UTC.
+  int64 interval_start = 1;
+  oneof activity {
+    SensorHealthReport report = 2; // activity_id 1
+  }
+}
+
+message SensorHealthReport {
+  SensorLoss loss = 1;
+  SensorQuality quality = 2;
+  SensorHousekeeping housekeeping = 3;
+  SensorResources resources = 4;
+  // Set when buffered events were deleted before delivery (overflow).
+  SensorGap gap = 5;
+  SensorBuffer buffer = 6;
+}
+
+// A count for one event class.
+message ClassCount {
+  // OCSF class_uid.
+  uint32 class_uid = 1;
+  uint64 count = 2;
+}
+
+// Events that never reached the buffer.
+message SensorLoss {
+  // ETW events lost, per session (Atlas-Sensor, Atlas-Process).
+  optional uint64 sensor_session_events_lost = 1;
+  optional uint64 process_session_events_lost = 2;
+  // ETW real-time buffers lost, per session.
+  optional uint64 sensor_session_buffers_lost = 3;
+  optional uint64 process_session_buffers_lost = 4;
+  // Events dropped because an internal queue was full.
+  optional uint64 kernel_queue_drops = 5;
+  optional uint64 user_queue_drops = 6;
+  // DNS-Client events over the per-process rate limit.
+  optional uint64 dns_rate_limit_drops = 7;
+  // Events dropped because no process uid could be computed, per class.
+  repeated ClassCount actor_dropped = 8;
+  // Events dropped because the buffer's in-memory backlog was full (disk full or I/O errors).
+  optional uint64 buffer_backlog_drops = 9;
+}
+
+// Events emitted with less than full information, or handled outside the usual path.
+message SensorQuality {
+  optional uint64 late_arrivals = 1;
+  optional uint64 parse_errors = 2;
+  optional uint64 unknown_version = 3;
+  optional uint64 launch_join_miss = 4;
+  // Events emitted with an unresolved actor (empty path and name), per class.
+  repeated ClassCount actor_unresolved = 5;
+  optional uint64 unknown_file_object = 6;
+  optional uint64 registry_unresolved = 7;
+  optional uint64 value_read_failed = 8;
+  optional uint64 early_read_redone = 9;
+  optional uint64 reg_type_unusual = 10;
+  optional uint64 file_op_late_failure = 11;
+  optional uint64 writes_after_cleanup = 12;
+  optional uint64 file_object_replaced = 13;
+  // Invalid records found when the buffer was replayed.
+  optional uint64 buffer_invalid_records = 14;
+  optional uint64 enrichment_misses = 15;
+  optional uint64 enrichment_errors = 16;
+}
+
+// Evictions from bounded structures, and expected drops.
+message SensorHousekeeping {
+  optional uint64 process_cache_evictions = 1;
+  optional uint64 file_map_evictions = 2;
+  optional uint64 key_map_evictions = 3;
+  optional uint64 early_key_map_evictions = 4;
+  optional uint64 flow_table_evictions = 5;
+  optional uint64 hash_cache_evictions = 6;
+  // Whole buffer segments deleted by rolling retention (expected while there is no transport).
+  optional uint64 retention_evictions = 7;
+  // Failed file creates, deletes and renames that were dropped.
+  optional uint64 file_op_failed = 8;
+  optional uint64 pending_overflow = 9;
+  // Handle-table seeding.
+  optional bool seeding_enabled = 10;
+  optional uint64 seeder_handles_named = 11;
+  optional uint64 seeder_handles_failed = 12;
+  optional uint64 seeder_handles_timed_out = 13;
+  optional uint64 seeder_table_reads = 14;
+  optional uint64 seeder_deferred_rereads = 15;
+  // Gauges.
+  optional uint64 seeder_stuck_helpers = 16;
+  optional uint64 seeder_negative_cache_size = 17;
+}
+
+// The agent's own resource use.
+message SensorResources {
+  // Process CPU time (user + kernel) during the interval, in nanoseconds.
+  optional uint64 cpu_time = 1;
+  // Working set at the end of the interval, in bytes (a gauge).
+  optional uint64 working_set = 2;
+}
+
+// The agent's on-disk buffer (sensor spec §8). Records lost from it are counted in
+// `loss.buffer_backlog_drops`, `quality.buffer_invalid_records` and `gap`.
+message SensorBuffer {
+  // Write attempts that failed (disk full, I/O errors), and successful retries after them.
+  optional uint64 write_errors = 1;
+  optional uint64 recoveries = 2;
+  // Gauge: writes were failing at the end of the interval.
+  optional bool failing = 3;
+  // Records refused because they were empty or over 256 KiB (an agent defect).
+  optional uint64 rejected = 4;
+  // Segments that could not be deleted because another process held them open.
+  optional uint64 delete_failures = 5;
+  // Found at startup, reported once in the first report: torn bytes cut from the
+  // newest segment, a damaged cursor file, a newest segment that was not ours.
+  optional uint64 truncated_bytes = 6;
+  optional bool cursor_reset = 7;
+  optional uint64 foreign_segments = 8;
+  // Sealed segments whose remainder a reader skipped as corrupt.
+  optional uint64 corrupt_segments = 9;
+  // Gauge: bytes in all segments.
+  optional uint64 disk_bytes = 10;
+}
+
+// Buffered events deleted before delivery.
+message SensorGap {
+  // Event-time range of the deleted events, in nanoseconds since the Unix epoch, UTC.
+  // Absent when none of the deleted records could be decoded.
+  optional int64 first_time = 1;
+  optional int64 last_time = 2;
+  uint64 events = 3;
+}

@@ -30,11 +30,13 @@ jobs:
           workspaces: |
             . -> target
             crates/atlas-schema/fuzz -> target
+            crates/atlas-buffer/fuzz -> target
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      # The fuzz crate is its own workspace, so the commands above don't build it.
+      # Each fuzz crate is its own workspace, so the commands above don't build them.
       - run: cargo check --manifest-path crates/atlas-schema/fuzz/Cargo.toml
+      - run: cargo check --manifest-path crates/atlas-buffer/fuzz/Cargo.toml
 
   rust-windows:
     runs-on: windows-latest
@@ -98,3 +100,4 @@ jobs:
           tool: cargo-audit
       - run: cargo audit
       - run: cargo audit --file crates/atlas-schema/fuzz/Cargo.lock
+      - run: cargo audit --file crates/atlas-buffer/fuzz/Cargo.lock

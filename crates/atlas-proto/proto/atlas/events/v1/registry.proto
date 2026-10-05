@@ -14,6 +14,8 @@ message RegistryKeyActivity {
     RegistryKeyDelete delete = 4; // activity_id 4
     RegistryKeyRename rename = 5; // activity_id 5
   }
+  // `path` holds only what the sensor saw (a relative name, or empty), not a full path.
+  bool path_unresolved = 6;
 }
 
 message RegistryKeyCreate {}
@@ -34,15 +36,23 @@ message RegistryValueActivity {
     RegistryValueSet set = 4;       // activity_id 2
     RegistryValueDelete delete = 5; // activity_id 4
   }
+  // `key_path` holds only what the sensor saw (a relative name, or empty), not a full path.
+  bool path_unresolved = 6;
 }
 
 message RegistryValueSet {
   // Windows REG_* constant (REG_NONE = 0 .. REG_QWORD = 11). Not an OCSF type_id.
   // `optional` because REG_NONE is 0: without presence an unset type would
-  // silently read as REG_NONE. Absent is rejected as Missing.
+  // silently read as REG_NONE. Absent is rejected as Missing, unless `raw_type` is set.
   optional uint32 type = 1;
   bytes data = 2;
   bool data_truncated = 3;
+  // `data` was read from the registry after the event, not captured with it.
+  bool data_read_after = 4;
+  // No data was obtained: `data` is then empty and `data_truncated` false.
+  bool data_unavailable = 5;
+  // The value's type when it is above REG_QWORD (11); `type` is then absent.
+  optional uint32 raw_type = 6;
 }
 
 message RegistryValueDelete {}

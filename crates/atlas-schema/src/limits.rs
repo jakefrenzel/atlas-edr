@@ -21,6 +21,10 @@ pub const USER_UID_MAX: usize = 256;
 pub const USER_NAME_MAX: usize = 1024;
 /// `file.signature.signer`.
 pub const SIGNER_MAX: usize = 1024;
+/// `log_name` and `log_provider` (Event Log Activity).
+pub const EVENT_LOG_NAME_MAX: usize = 256;
+/// Entries in each per-class counter list of a Sensor Health report.
+pub const CLASS_COUNTS_MAX: usize = 32;
 /// A whole encoded event, checked before protobuf decoding.
 pub const EVENT_MAX: usize = 256 * 1024;
 

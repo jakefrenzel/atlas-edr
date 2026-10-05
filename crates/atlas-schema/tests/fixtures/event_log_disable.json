@@ -1,0 +1,14 @@
+{
+  "eventId": "AZIqblsAcACAAAAAAAAAAQ==",
+  "time": "1790000000123456789",
+  "sensor": "SENSOR_ETW",
+  "device": {
+    "uid": "0NDQ0NDQ0NDQ0NDQ0NDQ0A==",
+    "bootId": "sLCwsLCwsLCwsLCwsLCwsA=="
+  },
+  "eventLog": {
+    "logName": "Atlas-Sensor",
+    "logProvider": "Microsoft-Windows-Kernel-Registry",
+    "disable": {}
+  }
+}
