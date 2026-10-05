@@ -12,6 +12,16 @@ fn seg(dir: &std::path::Path, seq: u64) -> std::path::PathBuf {
     dir.join(format!("{seq:020}.seg"))
 }
 
+/// Creating symlinks needs a privilege (Developer Mode or elevation). Without it the test
+/// skips locally, but fails in CI (`CI` is set on GitHub runners), where a skip would hide
+/// that the reparse-point checks never ran.
+fn skip_or_fail(e: std::io::Error) {
+    if std::env::var_os("CI").is_some() {
+        panic!("cannot create a symlink in CI: {e}");
+    }
+    eprintln!("skipped: cannot create a symlink here ({e})");
+}
+
 fn times(reader: &mut Reader) -> Vec<i64> {
     std::iter::from_fn(|| reader.next_record().unwrap()).map(|r| time_of(&r.payload).unwrap()).collect()
 }
@@ -118,9 +128,8 @@ fn a_segment_that_is_a_symlink_is_refused() {
     drop(w);
     let target = tmp.path().join("elsewhere.bin");
     std::fs::copy(seg(tmp.path(), 1), &target).unwrap();
-    // Creating symlinks needs Developer Mode or elevation; CI runners have it.
     if let Err(e) = std::os::windows::fs::symlink_file(&target, seg(tmp.path(), 2)) {
-        eprintln!("skipped: cannot create a symlink here ({e})");
+        skip_or_fail(e);
         return;
     }
     let err = atlas_buffer::Writer::open(cfg(tmp.path()), time_of).err().expect("newest segment is a symlink");
@@ -173,7 +182,7 @@ fn a_buffer_directory_that_is_a_symlink_is_refused() {
     #[cfg(unix)]
     let made = std::os::unix::fs::symlink(&real, &link);
     if let Err(e) = made {
-        eprintln!("skipped: cannot create a symlink here ({e})");
+        skip_or_fail(e);
         return;
     }
     let err = atlas_buffer::Writer::open(cfg(&link), time_of).err().expect("directory is a symlink");
