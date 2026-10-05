@@ -1,0 +1,52 @@
+{
+  "eventId": "AZIqblsAcACAAAAAAAAAAQ==",
+  "time": "1790000000123456789",
+  "sensor": "SENSOR_ETW",
+  "device": {
+    "uid": "0NDQ0NDQ0NDQ0NDQ0NDQ0A==",
+    "bootId": "sLCwsLCwsLCwsLCwsLCwsA=="
+  },
+  "sensorHealth": {
+    "intervalStart": "1790000000000000000",
+    "report": {
+      "loss": {
+        "sensorSessionEventsLost": "0",
+        "kernelQueueDrops": "0",
+        "actorDropped": [
+          {
+            "classUid": 4001,
+            "count": "2"
+          }
+        ]
+      },
+      "quality": {
+        "lateArrivals": "17",
+        "actorUnresolved": [
+          {
+            "classUid": 1001,
+            "count": "3"
+          }
+        ]
+      },
+      "housekeeping": {
+        "retentionEvictions": "1",
+        "seedingEnabled": true,
+        "seederHandlesNamed": "14139"
+      },
+      "resources": {
+        "cpuTime": "480000000",
+        "workingSet": "41943040"
+      },
+      "gap": {
+        "firstTime": "1789999000000000000",
+        "lastTime": "1789999100000000000",
+        "events": "52000"
+      },
+      "buffer": {
+        "writeErrors": "0",
+        "failing": false,
+        "diskBytes": "734003200"
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+// OCSF Event Log Activity (class_uid 1008): tampering seen on the agent's own ETW sessions.
+syntax = "proto3";
+
+package atlas.events.v1;
+
+import "atlas/events/v1/objects.proto";
+
+message EventLogActivity {
+  // Optional: the watchdog sees the effect, not who caused it.
+  ProcessRef actor = 1;
+  // OCSF `log_name`: the ETW session name. Required.
+  string log_name = 2;
+  // OCSF `log_provider`: the ETW provider name. Required for Disable.
+  string log_provider = 3;
+  // OCSF `status_code`: the Win32 error or NTSTATUS that revealed the change.
+  optional uint32 status_code = 4;
+  oneof activity {
+    EventLogStop stop = 5;       // activity_id 7
+    EventLogRestart restart = 6; // activity_id 8
+    EventLogDisable disable = 7; // activity_id 10
+  }
+}
+
+// The session was found stopped, or replaced by another session with its name.
+message EventLogStop {}
+
+// The agent recreated the session.
+message EventLogRestart {}
+
+// A provider was disabled or changed in the session, or its canary went silent.
+message EventLogDisable {}

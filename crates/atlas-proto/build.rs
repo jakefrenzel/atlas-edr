@@ -9,6 +9,8 @@ const PROTO_FILES: &[&str] = &[
     "atlas/events/v1/file.proto",
     "atlas/events/v1/registry.proto",
     "atlas/events/v1/dns.proto",
+    "atlas/events/v1/event_log.proto",
+    "atlas/events/v1/sensor_health.proto",
     "atlas/events/v1/event.proto",
 ];
 

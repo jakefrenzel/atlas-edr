@@ -1,4 +1,4 @@
-//! File System Activity (OCSF 1001), spec section 5.5.
+//! File System Activity (OCSF 1001), spec section 5.5, plus `Open` (sensor spec §10.1).
 
 use atlas_proto::v1 as wire;
 use atlas_proto::v1::file_system_activity::Activity as W;
@@ -20,8 +20,12 @@ pub enum FileAction {
     Read,
     Update,
     Delete,
-    Rename { file_result: File },
+    Rename {
+        file_result: File,
+    },
     SetAttributes,
+    /// A handle was opened: access intent, not proof of a read.
+    Open,
 }
 
 impl From<FileSystemActivity> for wire::FileSystemActivity {
@@ -33,6 +37,7 @@ impl From<FileSystemActivity> for wire::FileSystemActivity {
             FileAction::Delete => W::Delete(wire::FileDelete {}),
             FileAction::Rename { file_result } => W::Rename(wire::FileRename { file_result: Some(file_result.into()) }),
             FileAction::SetAttributes => W::SetAttributes(wire::FileSetAttributes {}),
+            FileAction::Open => W::Open(wire::FileOpen {}),
         };
         Self { actor: Some(v.actor.into()), file: Some(v.file.into()), activity: Some(activity) }
     }
@@ -52,6 +57,7 @@ impl FileSystemActivity {
                 W::Delete(_) => FileAction::Delete,
                 W::Rename(r) => FileAction::Rename { file_result: File::required(r.file_result, "", "file_result")? },
                 W::SetAttributes(_) => FileAction::SetAttributes,
+                W::Open(_) => FileAction::Open,
             },
         })
     }
@@ -76,6 +82,7 @@ mod tests {
             FileAction::Delete,
             FileAction::Rename { file_result: file("C:\\b.txt") },
             FileAction::SetAttributes,
+            FileAction::Open,
         ];
         for action in actions {
             let a = activity(action);

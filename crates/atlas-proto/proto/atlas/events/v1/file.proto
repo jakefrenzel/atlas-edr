@@ -16,6 +16,7 @@ message FileSystemActivity {
     FileDelete delete = 6;                // activity_id 4
     FileRename rename = 7;                // activity_id 5
     FileSetAttributes set_attributes = 8; // activity_id 6
+    FileOpen open = 9;                    // activity_id 14
   }
 }
 
@@ -30,3 +31,6 @@ message FileRename {
 }
 
 message FileSetAttributes {}
+
+// A file handle was opened (OCSF: "a request to create a file handle"). Access intent, not proof of a read.
+message FileOpen {}

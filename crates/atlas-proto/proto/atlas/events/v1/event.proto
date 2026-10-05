@@ -5,11 +5,13 @@ syntax = "proto3";
 package atlas.events.v1;
 
 import "atlas/events/v1/dns.proto";
+import "atlas/events/v1/event_log.proto";
 import "atlas/events/v1/file.proto";
 import "atlas/events/v1/module.proto";
 import "atlas/events/v1/network.proto";
 import "atlas/events/v1/process.proto";
 import "atlas/events/v1/registry.proto";
+import "atlas/events/v1/sensor_health.proto";
 
 enum Sensor {
   SENSOR_UNSPECIFIED = 0;
@@ -39,5 +41,7 @@ message Event {
     RegistryKeyActivity registry_key = 14;
     RegistryValueActivity registry_value = 15;
     DnsActivity dns = 16;
+    EventLogActivity event_log = 17;
+    SensorHealth sensor_health = 18;
   }
 }

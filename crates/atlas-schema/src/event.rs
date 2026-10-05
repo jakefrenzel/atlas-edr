@@ -5,11 +5,13 @@ use atlas_proto::v1::event::Kind as W;
 use uuid::Uuid;
 
 use crate::classes::dns::DnsActivity;
+use crate::classes::event_log::EventLogActivity;
 use crate::classes::file::FileSystemActivity;
 use crate::classes::module::ModuleActivity;
 use crate::classes::network::NetworkActivity;
 use crate::classes::process::ProcessActivity;
 use crate::classes::registry::{RegistryKeyActivity, RegistryValueActivity};
+use crate::classes::sensor_health::SensorHealthActivity;
 use crate::convert::{Result, err, fixed, require, wire_enum};
 use crate::error::{SchemaError, SchemaErrorKind};
 use crate::ids::{BootId, DeviceUid, EventId};
@@ -51,6 +53,8 @@ pub enum EventKind {
     RegistryKey(RegistryKeyActivity),
     RegistryValue(RegistryValueActivity),
     Dns(DnsActivity),
+    EventLog(EventLogActivity),
+    SensorHealth(SensorHealthActivity),
 }
 
 impl From<Event> for wire::Event {
@@ -67,6 +71,8 @@ impl From<Event> for wire::Event {
             EventKind::RegistryKey(a) => W::RegistryKey(a.into()),
             EventKind::RegistryValue(a) => W::RegistryValue(a.into()),
             EventKind::Dns(a) => W::Dns(a.into()),
+            EventKind::EventLog(a) => W::EventLog(a.into()),
+            EventKind::SensorHealth(a) => W::SensorHealth(a.into()),
         };
         Self {
             event_id: v.meta.event_id.as_bytes().to_vec(),
@@ -112,6 +118,8 @@ impl TryFrom<wire::Event> for Event {
             W::RegistryKey(a) => EventKind::RegistryKey(RegistryKeyActivity::from_wire(a)?),
             W::RegistryValue(a) => EventKind::RegistryValue(RegistryValueActivity::from_wire(a)?),
             W::Dns(a) => EventKind::Dns(DnsActivity::from_wire(a)?),
+            W::EventLog(a) => EventKind::EventLog(EventLogActivity::from_wire(a)?),
+            W::SensorHealth(a) => EventKind::SensorHealth(SensorHealthActivity::from_wire(a)?),
         };
         Ok(Self { meta: EventMeta { event_id, time: w.time, sensor }, device, kind })
     }
