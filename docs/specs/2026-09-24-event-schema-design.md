@@ -1,6 +1,6 @@
 # Sub-project 0a — Event Schema Design
 
-**Status:** Done. Implemented 2026-09-24; DoD §8.2.2 (10-minute fuzz run) closed 2026-10-01 by the clean nightly CI fuzz runs. Reference: docs/schema-reference.md. Sub-project 1 adds three additive schema changes: [ETW sensor spec §10](2026-10-01-etw-sensor-design.md).
+**Status:** Done. Implemented 2026-09-24; DoD §8.2.2 (10-minute fuzz run) closed 2026-10-01 by the clean nightly CI fuzz runs. Reference: docs/schema-reference.md. Sub-project 1 added File System Activity `Open`, registry flags, Event Log Activity and Sensor Health, all additive: [ETW sensor spec §10](2026-10-01-etw-sensor-design.md), implemented in plan 1b-1.
 **Roadmap:** Sub-project 0 was split into **0a — Event schema** (this spec) and **0b — Scaffolding** (monorepo, Docker Compose, Hyper-V VM, CI).
 **Depends on:** nothing. **Depended on by:** every other sub-project.
 
@@ -231,7 +231,7 @@ Only Response is modeled: the Windows DNS-Client ETW provider (event 3008) repor
 
 ### 5.9 Extension namespace
 
-An `atlas` extension namespace is reserved for Atlas-specific fields with no OCSF equivalent. It is **empty in v1**.
+An `atlas` extension namespace is reserved for Atlas-specific fields with no OCSF equivalent. Sub-project 1 put the first fields in it: `path_unresolved`, `data_read_after`, `data_unavailable` and `raw_type` on the registry classes (sensor spec §10.4). Exporters render them as `atlas.*`. Sensor Health is an Atlas extension *class* with extension uid 500 (sensor spec §10.3).
 
 ## 6. Validation & Errors
 

@@ -1,6 +1,6 @@
 # Sub-project 1 — ETW Sensor Design (Agent Core)
 
-**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in four parts, each reviewed and approved before it runs (decision log, 2026-10-02). Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
+**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in four parts, each reviewed and approved before it runs (decision log, 2026-10-02); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04). Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
 **Depends on:** 0a (event schema: domain types, `process_uid`, validating `TryFrom`), 0b (CI, nightly fuzz workflow).
 **Depended on by:** sub-project 2 (adds enrollment + gRPC on top of the buffer's read API), sub-project 3 (fills the agent-side detection hook), sub-project 6 (the driver becomes a second sensor feeding the same pipeline).
 
@@ -394,20 +394,24 @@ The early map is only a cache. Its names are never emitted, and the event's path
 - Directory `C:\ProgramData\Atlas\buffer\` of numbered segment files, ~16 MiB each.
 - Record: `[u32 LE length][u32 LE CRC32C of payload][payload]`. Payload = an encoded `atlas.events.v1.Event`; every record is an Event (gap information travels as Sensor Health events, §9.3).
 - One writer thread. Writes are appended and flushed (`FlushFileBuffers`) in batches every 1 s: a power cut loses at most ~1 s. Rotation flushes and closes the old segment before creating the next.
+- **Segment header (plan 1b-1):** every segment starts with the 8 bytes `ATLSEG01` (magic + format version); records follow. A newest segment whose header is torn (a prefix of the magic followed by nothing or zeros, as NTFS can leave after a power cut) is rewritten empty; one with any other header is kept as foreign, skipped by readers and reported.
+- **Writer API (plan 1b-1):** `append` only queues in memory; `tick(now)` writes and flushes when 1 s has passed (or half the backlog is used), and does no I/O when idle. One thread owns the writer, fed by a bounded channel; `tick` may block on the disk while the channel absorbs events. The backlog is 32 MiB by default.
 
 ### 8.2 Recovery
 
 - At open, the newest segment is scanned; it is truncated at the first record whose length is invalid (0 or > 256 KiB, the 0a encoded-event limit; checked **before** allocating) or whose CRC fails. Older segments were sealed by a clean rotation and are not rescanned.
 - Replay decodes every record through 0a's validating `TryFrom`; an invalid record is skipped and counted, never trusted.
+- **The writer starts a new segment at every open** (plan 1b-1). A reader can see records written but not yet flushed, so an ack can be ahead of what a power cut kept; appending to the recovered segment would put new records behind that ack, where they would be skipped. Segment numbers never wrap (a name or cursor at `u64::MAX` is refused), and segments that are symlinks or junctions are refused at open.
 
 ### 8.3 Disk full and I/O errors
 
-The writer stops appending, keeps events in a bounded in-memory backlog, retries every 10 s, and counts dropped events once the backlog is full. Recovery is reported in Sensor Health. The agent never deletes data it has not been configured to delete to make room.
+The writer stops appending, keeps events in a bounded in-memory backlog, retries every 10 s, and counts dropped events once the backlog is full. On a retry the active segment is first cut back to its last good length, removing any torn write. Recovery is reported in Sensor Health (its `buffer` group, §10.3). The agent never deletes data it has not been configured to delete to make room.
 
 ### 8.4 Retention and overflow
 
 - **Sub-project 1 (no transport, `transport = none`): rolling retention.** Nothing is ever acked, so the buffer is a local history: at the cap (default 1 GiB) the oldest whole segment is deleted, counted in `retention_evictions`. No gap events (this is expected behaviour, not loss).
 - **Once a transport exists (sub-project 2): keep head + tail.** At the cap, the oldest ~25% of *unacked* data is pinned, the oldest segments after it are deleted, and a Sensor Health gap event records the time range and count lost. Drop-oldest lets a flood erase the initial compromise; drop-newest blinds the sensor from the flood onward. `drop_oldest` and `drop_newest` remain config options. This sub-project implements and tests the policy; sub-project 2 switches it on.
+- **Mechanics (plan 1b-1):** room is made when a new segment starts, by deleting whole sealed segments until a full new one fits under the cap. Head + tail pins the oldest segments holding at least 25% of the bytes on disk and deletes the first one after them. Drop-newest deletes nothing and gathers dropped records in an open gap, closed at each Sensor Health report. A gap's time range comes from a function the agent passes in, so the buffer stays opaque. A segment that cannot be deleted (another process holds it without delete sharing) is skipped and counted, the next one goes instead, and if none can go the cap is exceeded rather than stalling writes. One record larger than a segment also exceeds the cap.
 
 ### 8.5 Read API (for sub-project 2)
 
@@ -415,6 +419,7 @@ The writer stops appending, keeps events in a bounded in-memory backlog, retries
 - `ack(cursor)` persists the cursor atomically (`cursor` file: segment, offset, CRC; written to a temp file and renamed) and deletes segments wholly behind it.
 - Delivery is at-least-once; the server de-duplicates on `event_id` (0a §4.1).
 - **Concurrent readers** (`dump --follow`) open segments with `FILE_SHARE_DELETE`, treat an incomplete tail record as "not written yet" (wait, don't flag corruption), and skip ahead when a segment is deleted under them.
+- **Corruption (plan 1b-1):** in the newest segment any record that is not whole and valid means "not written yet", because a concurrent read can see a write in progress. Only in a sealed segment (one with a newer segment after it) is a bad record corruption: the rest of that segment is skipped and counted.
 
 ## 9. Sensor Health and Blinding Detection
 
@@ -460,11 +465,13 @@ OCSF 1.9.0: "A request to create a file handle." Fields: `file`, `actor.process`
 | Restart (8) | The agent recreated it. |
 | Disable (10) | A provider was disabled or changed in our session, or its canary went silent. |
 
-Fields: `log_name` (session name, required, ≤ 256 B), `log_provider` (provider name, required for Disable, ≤ 256 B), `status_code` (`u32`, optional: the Win32 error or status that revealed it). `actor.process` is **optional**: the watchdog sees the effect, not who caused it.
+Fields: `log_name` (session name, required, so non-empty, ≤ 256 B), `log_provider` (provider name, required and so non-empty for Disable, ≤ 256 B), `status_code` (`u32`, optional: the Win32 error or status that revealed it). `actor.process` is **optional**: the watchdog sees the effect, not who caused it.
 
 ### 10.3 Sensor Health (Atlas extension class)
 
-One activity, `Report`, carrying the §9.3 counters (`u64`, all optional), the interval, and for gap reports the lost time range and count. No actor. Category: Application Activity (6). Its `class_uid` follows OCSF's extension rule (`extension_uid × 100000 + category_uid × 1000 + n`, as Windows' `201001`), with an Atlas extension UID the plan picks from outside OCSF's registered extensions.
+One activity, `Report`, carrying the §9.3 counters (`u64`, all optional), the interval, and for gap reports the lost time range and count. No actor. Category: Application Activity (6). Its `class_uid` follows OCSF's extension rule (`extension_uid × 100000 + category_uid × 1000 + n`, as Windows' `201001`), with an Atlas extension UID the plan picks from outside OCSF's registered extensions: **500** (decision log 2026-10-04, D2), so `class_uid` 50006001.
+
+**Counter semantics (D1, plan 1b-1):** typed `optional uint64` fields in five groups (`loss`, `quality`, `housekeeping`, `resources`, `buffer`) plus an optional `gap`. Counters count occurrences during `[interval_start, time]`; gauges are sampled at the end; absent means not measured. Per-class counts are `{class_uid, count}` lists of at most 32 entries.
 
 ### 10.4 Registry fields (additive, from S4 and S7)
 
@@ -483,14 +490,14 @@ These have no OCSF equivalent, so OCSF exports carry them under the reserved `at
 - Exactly one of `type` (0–11) and `raw_type` (> 11) is present. This relaxes 0a's "absent `type` is Missing" rule only when `raw_type` is set; every message 0a accepts stays valid.
 - `path_unresolved` allows any path, including empty.
 
-Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9 note that the `atlas` namespace is empty in v1. It also updates the OCSF exporter (`atlas-schema/src/ocsf.rs`) and `schema-reference.md`.
+Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9 note that the `atlas` namespace is empty in v1. It also updates the derived OCSF ids (`atlas-schema/src/ocsf.rs`) and `schema-reference.md`, which documents how the new fields map into the `atlas` namespace for the OCSF exporter, a later adapter (no exporter exists yet; clarified in plan 1b-1).
 
 ## 11. Configuration, Service, CLI
 
 ### 11.1 Install locations and permissions
 
 - **Binary:** `service install` copies the executable to `C:\Program Files\Atlas\atlas-agent.exe` (writable only by administrators) and registers that path, quoted. It never registers the path it was run from (`target\`, `Downloads\`, …).
-- **Data:** `C:\ProgramData\Atlas\` holds `buffer\`, `canary\`, `agent.toml`, `device.json`, `cursor`, and `logs\`. `C:\ProgramData` lets ordinary users create folders, so a non-admin could pre-create `Atlas\` with their own ACL or plant a junction, turning the agent's deletes and renames into SYSTEM-level primitives. Therefore:
+- **Data:** `C:\ProgramData\Atlas\` holds `buffer\` (segments and the `cursor` file), `canary\`, `agent.toml`, `device.json`, and `logs\`. `C:\ProgramData` lets ordinary users create folders, so a non-admin could pre-create `Atlas\` with their own ACL or plant a junction, turning the agent's deletes and renames into SYSTEM-level primitives. Therefore:
   - `service install` creates the directory with owner Administrators and a **protected** DACL (no inheritance): SYSTEM and Administrators full control, nothing else.
   - **On every start** the agent verifies the owner, the protected DACL, and that neither the directory nor anything it opens inside is a reparse point (files opened with `FILE_FLAG_OPEN_REPARSE_POINT` and checked). On failure it refuses to start and reports to the Windows Event Log (its own log directory is untrusted at that point).
 
@@ -682,3 +689,5 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
   - Value-read flags and checks are defined, and the read is hardened (§7.5).
   - 8.3 expansion runs on a worker (§7.2). Self-filtering moves to emission and covers the canary child (§5.5, §9.2).
   - Per-reason deadlines and the stage protocol are defined (§3.2); counters, fallbacks and limitations are completed.
+
+**Plan 1b-1 clarifications (2026-10-04).** Applied to §8.1–8.5, §10, §10.2, §10.3 and §11.1: the segment header `ATLSEG01`; a new segment at every writer open; the writer's `append` / `tick` API and its ownership by one thread; the overflow mechanics, including segments that cannot be deleted; the reader's corruption rule; the cursor file inside `buffer\`; no OCSF exporter exists yet; non-empty `log_name` / `log_provider`; Sensor Health's extension uid (500) and counter semantics (D1, D2).
