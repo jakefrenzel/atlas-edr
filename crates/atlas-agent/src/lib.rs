@@ -5,6 +5,7 @@ pub mod config;
 pub mod counters;
 pub mod evict;
 pub mod input;
+pub mod intake;
 pub mod keymap;
 pub mod ordering;
 pub mod paths;
