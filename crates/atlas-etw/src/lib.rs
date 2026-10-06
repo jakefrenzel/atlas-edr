@@ -9,6 +9,7 @@
 //!   a safe API.
 
 pub mod layout;
+pub mod parse;
 pub mod providers;
 
 pub use providers::Provider;
