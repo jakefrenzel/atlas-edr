@@ -11,6 +11,7 @@ on:
       - "crates/atlas-schema/**"
       - "crates/atlas-proto/**"
       - "crates/atlas-buffer/**"
+      - "crates/atlas-etw/**"
       - ".github/workflows/fuzz.yml"
 
 permissions:
@@ -38,7 +39,9 @@ jobs:
           # crate: the directory holding fuzz/. watch: path prefixes that trigger the target on a PR.
           targets='[
             {"target": "decode_event", "crate": "crates/atlas-schema", "watch": ["crates/atlas-schema/", "crates/atlas-proto/"]},
-            {"target": "buffer_recover", "crate": "crates/atlas-buffer", "watch": ["crates/atlas-buffer/"]}
+            {"target": "buffer_recover", "crate": "crates/atlas-buffer", "watch": ["crates/atlas-buffer/"]},
+            {"target": "parse_any", "crate": "crates/atlas-etw", "watch": ["crates/atlas-etw/src/", "crates/atlas-etw/fuzz/"]},
+            {"target": "dns_query_results", "crate": "crates/atlas-etw", "watch": ["crates/atlas-etw/src/parse/", "crates/atlas-etw/fuzz/"]}
           ]'
           if [ "$EVENT" = pull_request ]; then
             changed=$(git diff --name-only "$BASE"...HEAD | jq -R . | jq -s .)
