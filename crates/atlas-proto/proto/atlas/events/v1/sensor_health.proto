@@ -50,6 +50,8 @@ message SensorLoss {
   repeated ClassCount actor_dropped = 8;
   // Events dropped because the buffer's in-memory backlog was full (disk full or I/O errors).
   optional uint64 buffer_backlog_drops = 9;
+  // Events skipped because the ETW callback panicked on them (caught, never unwound into ETW).
+  optional uint64 callback_panics = 10;
 }
 
 // Events emitted with less than full information, or handled outside the usual path.
@@ -72,6 +74,8 @@ message SensorQuality {
   optional uint64 buffer_invalid_records = 14;
   optional uint64 enrichment_misses = 15;
   optional uint64 enrichment_errors = 16;
+  // Registry value names that could end in more than one place (embedded NULs); the last fit was used.
+  optional uint64 reg_name_ambiguous = 17;
 }
 
 // Evictions from bounded structures, and expected drops.

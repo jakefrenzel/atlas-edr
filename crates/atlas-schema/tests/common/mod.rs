@@ -364,22 +364,33 @@ fn counter() -> impl Strategy<Value = Option<u64>> {
 }
 
 fn arb_health_report() -> BoxedStrategy<HealthReport> {
-    let loss =
-        (counter(), counter(), counter(), counter(), counter(), counter(), counter(), arb_class_counts(), counter())
-            .prop_map(|f| SensorLoss {
-                sensor_session_events_lost: f.0,
-                process_session_events_lost: f.1,
-                sensor_session_buffers_lost: f.2,
-                process_session_buffers_lost: f.3,
-                kernel_queue_drops: f.4,
-                user_queue_drops: f.5,
-                dns_rate_limit_drops: f.6,
-                actor_dropped: f.7,
-                buffer_backlog_drops: f.8,
-            });
+    let loss = (
+        counter(),
+        counter(),
+        counter(),
+        counter(),
+        counter(),
+        counter(),
+        counter(),
+        arb_class_counts(),
+        counter(),
+        counter(),
+    )
+        .prop_map(|f| SensorLoss {
+            sensor_session_events_lost: f.0,
+            process_session_events_lost: f.1,
+            sensor_session_buffers_lost: f.2,
+            process_session_buffers_lost: f.3,
+            kernel_queue_drops: f.4,
+            user_queue_drops: f.5,
+            dns_rate_limit_drops: f.6,
+            actor_dropped: f.7,
+            buffer_backlog_drops: f.8,
+            callback_panics: f.9,
+        });
     let quality = (
         (counter(), counter(), counter(), counter(), arb_class_counts(), counter(), counter(), counter()),
-        (counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),
+        (counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),
     )
         .prop_map(|(a, b)| SensorQuality {
             late_arrivals: a.0,
@@ -398,6 +409,7 @@ fn arb_health_report() -> BoxedStrategy<HealthReport> {
             buffer_invalid_records: b.5,
             enrichment_misses: b.6,
             enrichment_errors: b.7,
+            reg_name_ambiguous: b.8,
         });
     let housekeeping = (
         (counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),

@@ -140,6 +140,8 @@ counter_group!(
         actor_dropped: Vec<ClassCount>,
         /// Dropped because the buffer's in-memory backlog was full.
         buffer_backlog_drops: Option<u64>,
+        /// Skipped because the ETW callback panicked on them.
+        callback_panics: Option<u64>,
     }
 );
 
@@ -164,6 +166,8 @@ counter_group!(
         buffer_invalid_records: Option<u64>,
         enrichment_misses: Option<u64>,
         enrichment_errors: Option<u64>,
+        /// Registry value names with more than one possible end (embedded NULs).
+        reg_name_ambiguous: Option<u64>,
     }
 );
 

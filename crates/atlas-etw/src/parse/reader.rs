@@ -165,6 +165,14 @@ impl Sid {
     /// `SID_MAX_SUB_AUTHORITIES` in winnt.h.
     pub const MAX_SUB_AUTHORITIES: usize = 15;
 
+    /// A SID from its binary form, checked as the parsers check it; `None`
+    /// unless `bytes` is exactly one valid SID.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Sid> {
+        let mut r = Reader::new(bytes);
+        let sid = r.sid().ok()?;
+        r.rest().is_empty().then_some(sid)
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -292,6 +300,14 @@ mod tests {
         assert_eq!(label.to_string(), "S-1-16-12288");
         assert!(label.is_mandatory_label());
         assert_eq!(label.rid(), Some(12288));
+    }
+
+    #[test]
+    fn sids_from_bytes() {
+        let b = [1, 1, 0, 0, 0, 0, 0, 16, 0, 0x20, 0, 0];
+        assert_eq!(Sid::from_bytes(&b).map(|s| s.to_string()), Some("S-1-16-8192".into()));
+        assert!(Sid::from_bytes(&b[..11]).is_none());
+        assert!(Sid::from_bytes(&[b.as_slice(), &[0]].concat()).is_none());
     }
 
     #[test]
