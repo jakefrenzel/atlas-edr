@@ -1,0 +1,31 @@
+[package]
+name = "atlas-etw-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+atlas-etw = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "parse_any"
+path = "fuzz_targets/parse_any.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_query_results"
+path = "fuzz_targets/dns_query_results.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace: cargo-fuzz needs nightly + sanitizers, so keep it out
+# of the main workspace build.
+[workspace]
+members = ["."]

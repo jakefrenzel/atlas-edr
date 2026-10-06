@@ -1,0 +1,29 @@
+[package]
+name = "atlas-etw"
+version = "0.1.0"
+description = "ETW sessions (Windows) and hand-written, portable event parsers for the Atlas sensor."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = ["Win32_Foundation", "Win32_System_Diagnostics_Etw", "Win32_System_Time"]
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies.windows]
+workspace = true
+features = [
+    "Wdk_Foundation",
+    "Wdk_System_Registry",
+    "Win32_NetworkManagement_Dns",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+]

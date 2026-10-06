@@ -1,6 +1,6 @@
 # Sub-project 1 — ETW Sensor Design (Agent Core)
 
-**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in four parts, each reviewed and approved before it runs (decision log, 2026-10-02); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04). Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
+**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in four parts, each reviewed and approved before it runs (decision log, 2026-10-02); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04); plan 1b-2 (`atlas-etw`) is done (2026-10-05). Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
 **Depends on:** 0a (event schema: domain types, `process_uid`, validating `TryFrom`), 0b (CI, nightly fuzz workflow).
 **Depended on by:** sub-project 2 (adds enrollment + gRPC on top of the buffer's read API), sub-project 3 (fills the agent-side detection hook), sub-project 6 (the driver becomes a second sensor feeding the same pipeline).
 
@@ -53,7 +53,7 @@ Build the **agent core**: a Rust user-mode agent that collects Windows telemetry
 
 | Crate | Platform | Contents |
 |---|---|---|
-| `atlas-etw` | `parse` portable; `session` `#[cfg(windows)]` | **`parse`**: pure functions `&[u8]` (+ provider, event ID, version, per-event pointer size) → typed `RawEvent`. No `unsafe`. **`session`**: start, enable, consume and stop sessions; extended-data extraction (start key). All of the sensor's `unsafe` lives here, behind a safe API. |
+| `atlas-etw` | `parse` portable; `session` `#[cfg(windows)]` | **`parse`**: pure functions `&[u8]` (+ provider, event ID, version, per-event pointer size) → typed `RawEvent`. No `unsafe`. **`layout`**: the manifest layout of every version parsed. **`session`**: start, enable, consume, query and stop sessions; extended-data extraction (start key); the watchdog's primitives (query by name, provider state, stop by name); TDH for the version check and the test oracle. All of the sensor's ETW `unsafe` lives here, behind a safe API. What Session A's callback *does* (queues, rate limit, OperationEnd filter, early key map) is the agent's, passed to the consumer as a closure (plan 1b-2). |
 | `atlas-buffer` | portable | Segment log (§8). No Windows or ETW knowledge; stores opaque records. |
 | `atlas-agent` | binary; Windows functionality behind `#[cfg(windows)]` | Ordering stage, pipeline, process cache, coalescers, flow table, registry key map, enrichment and value reads, completion stage, handle-table seeder, watchdog, config, service wrapper, CLI. Compiles on Linux (all portable modules tested there); on non-Windows `main` exits with "unsupported platform". |
 
@@ -135,7 +135,7 @@ ETW (Session A: manifest providers; Session B: system logger, process events)
 
 **Session B uses the legacy flag on every Windows build.** System-logger sessions with `EnableFlags` work from Windows 8 onward, so one code path covers Windows 10 22H2 (build 19045) and Windows 11, and that path is the one CI tests. The newer System Process Provider route (`EnableTraceEx2`, builds ≥ 20348) is not used. Process events are low-volume, so the lack of event-ID filtering here costs little. At session start the kernel emits process rundown events (`DCStart`) for every running process, including its command line; the cache uses them (§6.2).
 
-At start, a leftover session with our name (from a crash) is stopped and recreated. Session names are fixed so the watchdog and the blinding test can address them. The watchdog records each session's `LoggerId` at creation (§9.1).
+At start, a leftover session with our name (from a crash) is stopped and recreated. Session names are fixed so the watchdog and the blinding test can address them. The watchdog records each session's `LoggerId` at creation (§9.1). The session handle is that LoggerId, which Windows reuses once the session stops, so the agent checks before every control call that the session with our name still has our LoggerId. A handle that fails the check is stale: nothing is done with it, and the session is recreated as a new one (plan 1b-2).
 
 ### 4.2 Providers and filters (Session A)
 
@@ -154,10 +154,11 @@ Each provider is enabled with the listed keywords and an `EVENT_FILTER_TYPE_EVEN
 ### 4.3 Parsers
 
 - One parser per (provider, event ID, version) that we consume. Pointer-sized fields take the pointer size from **each event's** header flags (32-bit processes log 32-bit pointers from user-mode providers). Kernel providers and Session B log with the kernel's pointer size even for WOW64 processes (S8). The field layouts found by the spikes are in §15.3.
-- **Unknown higher versions** of a known event: the first time a (provider, ID, version) is seen, the agent calls `TdhGetEventInformation` once and checks that our newest known layout is a strict prefix of it (same field names and types, in order; ETW manifests append fields). The verdict is cached. A prefix → parse with our layout; otherwise → count `unknown_version` and drop. TDH is never used per event.
+- **Versions parsed** (plan 1b-2): Kernel-Process ProcessStart 3 and 4, ProcessStop 2, ImageLoad 0; Kernel-File 1 (OperationEnd 0); Kernel-Registry 0; Kernel-Network 0; DNS-Client 3008 v0; the classic process class v4 (opcodes 1–4). An older version is counted as `unknown_version` and dropped (ProcessStart before v3 has no sequence number, so no uid). Windows 10's versions are unverified. A test checks every layout against the installed manifests, and the classic one against its MOF class, without elevation.
+- **Unknown higher versions** of a known event: the first time a (provider, ID, version) is seen, the agent asks TDH once for that version's layout **as installed on this machine** (the manifest, or the MOF class for Session B), never the layout carried by the event: a forged user-mode event (§4.4) could otherwise decide the verdict. It checks that our newest known layout is a prefix of it (same field names and types, in order; ETW manifests append fields). The verdict is cached. An equal layout → parse exactly as ours; a strict prefix → parse with our layout, except that a name ending our layout stops at its first NUL (fields may follow it); otherwise → count `unknown_version` and drop. TDH is never used per event.
 - Strings: kept as raw UTF-16 slices until an event is emitted (most `Create` events are only matched and mapped, never emitted). At emit, converted lossily (U+FFFD for unpaired surrogates, 0a §6.1) and truncated to the schema limits with the matching `*_truncated` flag.
 - Parsers never trust lengths in the payload: every read is bounds-checked, and a malformed event yields an error that is counted, never a panic.
-- **TDH as oracle:** a Windows test decodes the `.etl` fixtures with TDH and compares field-by-field with our parsers (§12.2). The same comparison runs locally against live events on the host, so the host's build is checked without committing host recordings.
+- **TDH as oracle:** the fixtures carry TDH's decoding from the machine that recorded them, and replay compares it field by field with our parsers (§12.2). The same comparison runs locally against live events on the host, so the host's build is checked without committing host recordings.
 
 ### 4.4 Trust in user-mode providers
 
@@ -236,7 +237,7 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 
 - **Failed operations are dropped.**
   - Registry: keep only `Status` = 0. This also drops the `STATUS_REPARSE` (`0x104`) first attempt that precedes a `CurrentControlSet` open (S7).
-  - Kernel-File: 30 fires only on success. Create (12), DeletePath (26) and RenamePath (27) fire before the outcome (S6). Session A's callback forwards only failed OperationEnds: 24s whose `Status` is not `NT_SUCCESS` (error-severity codes). Success and informational codes such as `STATUS_REPARSE` (0x104) and `STATUS_OPLOCK_BREAK_IN_PROGRESS` (0x108) are not failures. A failure is the exception, so success is the default.
+  - Kernel-File: 30 fires only on success. Create (12), DeletePath (26) and RenamePath (27) fire before the outcome (S6). Session A's callback forwards only failed OperationEnds: 24s whose `Status` has **error** severity (its top two bits set). Success, informational and warning codes such as `STATUS_REPARSE` (0x104), `STATUS_OPLOCK_BREAK_IN_PROGRESS` (0x108) and `STATUS_BUFFER_OVERFLOW` (0x80000005) are not failures. This is narrower than `!NT_SUCCESS`, which also counts warnings (plan 1b-2). A failure is the exception, so success is the default.
   - [3] holds each 12, 26 and 27 for a **failure-confirm window** of stream time: default 250 ms after its timestamp, configurable. By then its OperationEnd, logged within microseconds of the operation, has almost surely passed the ordering stage too.
   - A failed 24 within the window cancels the event: dropped, `file_op_failed` counted, and for a 12 its map entry removed. It is matched to the most recent pending event with the same `Irp` and an earlier timestamp. Irps are recycled, so the window keeps the match local.
   - No failure by the end of the window means the event stands; it is emitted, or for a 12 its entry stays. A short ring of recent failed 24s (also covering the window) catches a failure that arrives before its event.
@@ -325,6 +326,7 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - **UDP flows:** datagram events (42/43/58/59) feed a flow table keyed by (actor uid, local endpoint, remote endpoint). The first datagram emits Open (direction from send vs. receive); a Close is emitted after 60 s idle (configurable), timestamped at the last datagram. The table is bounded (cap + eviction counter; evicted flows emit Close).
 - **Performance gate (E8):** passed. Under real QUIC streaming (about 2 900 UDP events/s, peaks near 11 000/s) the full provider set cost 0.495% of one core with nothing lost (S9). `network.udp = true` is the default.
 - Ports and addresses are decoded in network byte order (confirmed by fixtures).
+- **Which end is which** (plan 1b-2, F5): `saddr`/`sport` is the local end for TCP connect, TCP accept and UDP send. For **UDP receive** it is the remote sender, and `daddr`/`dport` is the local end. The flow table keys on this.
 
 ### 7.4 Registry key map and handle-table seeding (E13)
 
@@ -333,7 +335,7 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - Otherwise it stores `(BaseObject, RelativeName)` and resolves it through the base's entry. If the base is resolved, the full name is computed at once. If not, the entry joins the base's list of pending children and is resolved, recursively, when the base is.
 - CloseKey (13) removes the entry. A closed base that still has unresolved children stays as a tombstone until they resolve or expire. This keeps the map to live handles; the cap and LRU eviction are only a safety net.
   - **CloseKey events whose actor is the agent are ignored**, in this map and in the early map (§7.5). The seeder closes its own duplicates, and value reads close their keys. If those closes removed entries, seeding would wipe out its own results. If an agent duplicate really was the last handle, the stale entry is harmless: the next CreateKey/OpenKey on that address overwrites it.
-  - The spikes did not examine CloseKey. Plan 1b-2 verifies its event ID, version and layout, and whether it fires on every handle close or only the last. The rules above are correct either way.
+  - CloseKey is event 13, version 0 (`KeyObject`, `Status`, `KeyName`). It fires when the **last** handle to a key object closes: closing a duplicated handle logs nothing (plan 1b-2, F1). The rules above are correct either way.
 - Events 3, 5 and 6 carry only `KeyObject` and take their path from the map.
 
 **Seeding.** Neither Kernel-File nor Kernel-Registry has a rundown (S6, S7). Handles opened before the sessions started (by services and Explorer at boot, by every process after an agent or session restart) are therefore never named by ETW. The seeder [8] names them from the system handle table.
@@ -370,7 +372,7 @@ The early map is only a cache. Its names are never emitted, and the event's path
 **The read.**
 - `NtOpenKeyEx` by the raw NT name as logged (`ControlSet00N`, not the normalized form), with `REG_OPTION_BACKUP_RESTORE` (the agent enables `SeBackupPrivilege`). This defeats a deny-SYSTEM DACL a user can put on their own key.
 - `OBJ_OPENLINK`, so a key swapped for a symbolic link is not followed.
-- `NtQueryValueKey` for the value name as counted in the event, so embedded NULs are kept.
+- `NtQueryValueKey` for the value name as counted in the event, so embedded NULs are kept. The kernel logs counted names whole (plan 1b-2, F4): a value name `a`, NUL, `b` appears as all three units plus a terminator, in SetValueKey, DeleteValueKey and CreateKey/OpenKey. TDH stops at the first NUL; the parser does not. In SetValueKey the name ends at the last NUL after which the remaining fields parse exactly to the payload's end; that choice is unique while the captured buffers are empty (S4), and the parser flags `value_name_ambiguous` if it ever is not.
 - `\REGISTRY\A\…` (application hives) and `\REGISTRY\WC\…` (containers) cannot be opened this way; their reads fail and are flagged.
 
 **Result and flags** (§10.4):
@@ -427,7 +429,9 @@ The writer stops appending, keeps events in a bounded in-memory backlog, retries
 
 - **Session identity:** each session exists and has the `LoggerId` recorded at creation (`ControlTraceW` query). Missing, or an impostor session recreated under our name → Event Log Activity **Stop**, then the agent recreates it → **Restart**.
 - **`ProcessTrace` returning** on either consumer thread also means Stop.
-- **Provider state:** each provider in Session A is still enabled with our keywords, level and filters (`EnumerateTraceGuidsEx` / `TraceGuidQueryInfo`). Missing or changed → **Disable** (with the provider name), then re-enable.
+- **Provider state:** each provider in Session A is still enabled with our keywords and level (`EnumerateTraceGuidsEx` / `TraceGuidQueryInfo`). Missing or changed → **Disable** (with the provider name), then re-enable.
+  - The event-ID filter cannot be read back: `TraceGuidQueryInfo` returns level, keywords, enable property and LoggerId only, and ETW adds bits of its own (property 0x80 reads back as 0xC0). So the check is that our bits are present, not that the values are equal (plan 1b-2, F3).
+  - `Microsoft-Windows-Kernel-EventTracing` logs every enable (event 14) and disable (15) of a provider in our session, a filter change included, with the **caller's** PID and start key in the header (F2). It is the candidate for detecting a narrowed filter and naming who changed it; plan 1b-4 decides.
 - **Counters:** session events-lost and real-time-buffers-lost, plus all pipeline counters, sampled for Sensor Health.
 
 ### 9.2 Canaries
@@ -531,14 +535,16 @@ Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9
 
 ### 12.2 Tier 2 — `.etl` replay, Windows CI
 
-- Fixtures are recorded **on a GitHub Windows runner, not the host**: a `workflow_dispatch` job runs the scripted scenario on a clean, throwaway runner with file-mode sessions and uploads the `.etl` files. The repo is public, and a host recording would leak usernames, paths and DNS history. Fixtures are reviewed, then committed.
-- Replay feeds the real consumer (`OpenTrace` on a file) through the full pipeline and compares against expected domain events.
-- TDH oracle: every fixture event is also decoded with TDH and compared field-by-field with our parser (and locally against live host events, §4.3).
+- Fixtures are recorded **on a GitHub Windows runner, not the host**: CI's `etw-live` job runs the live test (§12.3) on a clean, throwaway runner and uploads its recording. The repo is public, and a host recording would leak usernames, paths and DNS history. Fixtures are reviewed, then committed. (A `workflow_dispatch` job cannot be used: it runs only from the default branch.)
+- **Fixtures are text, filtered at capture** (plan 1b-2, D2): one JSON line per event of the scenario's process tree, holding the header fields, the start key, the payload in hex, and TDH's decoding on the recording machine. Replay parses each payload and compares every field with that decoding. It runs on Linux too, and fails on any unreadable line.
+- Replay through the full pipeline, against expected domain events, comes with plan 1b-3. The real consumer is exercised by the live tests (§12.3).
+- Locally, the same replay runs against host recordings that are never committed (§4.3).
 
 ### 12.3 Tier 3 — live sessions, Windows CI
 
 - Tests start real sessions on `windows-latest` (the runner is admin), run the scripted scenario, and assert the expected normalized events, filtered to the test's own process tree, with timeouts. The scenario: spawn a process with a known command line; create, write, overwrite, rename and delete a file; a failed delete (no event); a delete-on-close file; an undelete (disposition set, then cleared) and a delete-on-close cleared through `FileDispositionInformationEx`, which must produce no Delete (result documented either way); open a watchlisted path, also through its 8.3 name; create, set and delete a registry key and value (with the value data read after); a handle opened **before** the agent starts that is then written to (file) or created under (registry), named by seeding; open a TCP connection; send UDP; resolve a name.
 - Marked `#[ignore]` locally; CI runs them explicitly.
+- **Split by crate** (plan 1b-2): `atlas-etw`'s live test covers the ETW level of this scenario (process, files, failed operations, delete-on-close, registry including embedded NULs and the CloseKey handle test, TCP and UDP over IPv4 and IPv6, DNS), plus the session primitives and the event-ID filters. It runs the scenario in a second process (the actor), so the observer's own TDH lookups are not recorded. The agent-level parts (watchlist and 8.3, undelete, seeding, value reads) come with plans 1b-3 and 1b-4. Test sessions are named `Atlas-Test-*`.
 
 ### 12.4 Known gaps
 
@@ -642,6 +648,17 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
 
 **S2, the BootId sources disagree.** In the same boot, `KUSER_SHARED_DATA.BootId` = `PROCESS_TELEMETRY_ID_INFORMATION.BootId` = the start key's high 16 bits, but the registry's `PrefetchParameters\BootId` was one lower in the VM (5 vs 6; after the reboot, 6 vs 7). On the host, where a user had signed in, all three matched. The likely reason is that the registry copy is written only once the boot is marked successful (after an interactive sign-in); the VM had none after its baseline. The mechanism was not tested further: `boot_id` includes `boot_time`, so a repeated BootId cannot merge two boots, but the agent reads BootId only from `KUSER_SHARED_DATA`. This refines 0a §4.4, which calls the two "the same counter".
 
+**Plan 1b-2 (2026-10-05): the live test on the host** (build 26200, four elevated runs by the user; raw evidence in the git-ignored `spikes/results/1b2*`).
+- **F1, CloseKey** fires only when the last handle closes (§7.4).
+- **F2, Kernel-EventTracing** ({B675EC37-BDB6-4648-BC92-F3FDC74D3CA2}) logs event 14 on every enable of a provider in our session, a re-apply and a filter change included. Event 15 marks a disable, events 8 and 11 a session stop. The header carries the caller's PID and start key. The provider also logs other processes' provider activity (events 8, 9 and 29), so it must be filtered by session name (§9.1).
+- **F3, the event-ID filter cannot be read back,** and ETW reports extra enable bits (§9.1). For Kernel-Process, Kernel-EventTracing showed keywords 0x850, level 255 and property 0x3C1 where we asked for 0x50, 5 and 0x80.
+- **F4, counted registry names** with embedded NULs are logged whole; TDH truncates them and cannot decode such a SetValueKey (§7.5).
+- **F5, address ends** for TCP and UDP (§7.3).
+- **F6, the classic class:** `ExitStatus` is a signed `Int32`. Session B also logs opcode 11 (v2) and v5 opcode 39 events, which are not parsed.
+- **F7, elevation:** an unelevated `StartTraceW` succeeds, but enabling a kernel provider returns error 5.
+- **F8, TDH offline:** it describes manifest and MOF events from a record built by hand, without a session or elevation.
+- **F9:** the two halves of a Launch arrived 14–15 µs apart (§5.2). No event of an unrequested ID reached Session A, so the event-ID filters work (§4.2). DNS-Client had 75 registered instances, each enabled by our session. No events were lost.
+
 ## 16. Known Limitations
 
 - **No boot-time coverage:** events before the agent starts (early boot, or while the service is stopped) are not captured. An AutoLogger session is sub-project 8.
@@ -691,3 +708,16 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
   - Per-reason deadlines and the stage protocol are defined (§3.2); counters, fallbacks and limitations are completed.
 
 **Plan 1b-1 clarifications (2026-10-04).** Applied to §8.1–8.5, §10, §10.2, §10.3 and §11.1: the segment header `ATLSEG01`; a new segment at every writer open; the writer's `append` / `tick` API and its ownership by one thread; the overflow mechanics, including segments that cannot be deleted; the reader's corruption rule; the cursor file inside `buffer\`; no OCSF exporter exists yet; non-empty `log_name` / `log_provider`; Sensor Health's extension uid (500) and counter semantics (D1, D2).
+
+**Plan 1b-2 clarifications (2026-10-05).** Applied to §3.1, §4.1, §4.3, §5.5, §7.3, §7.4, §7.5, §9.1, §12.2, §12.3 and §15.3:
+- the crate boundary (parsing and session primitives in `atlas-etw`; the callback's logic in the agent);
+- the versions parsed, and the layout table checked against the installed manifests and MOF class;
+- the version check reads only the installed description, and accepts a prefix or an equal layout;
+- counted registry names with embedded NULs;
+- CloseKey on the last handle;
+- the address ends;
+- the provider check compares bits as a subset (the filter cannot be read back), with Kernel-EventTracing as the candidate for 1b-4;
+- stale session handles;
+- OperationEnd failures are error severity, not `!NT_SUCCESS`;
+- text replay fixtures recorded by CI's `etw-live` job;
+- tier 3 split by crate, with test sessions named `Atlas-Test-*`.
