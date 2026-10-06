@@ -9,9 +9,12 @@ license = "AGPL-3.0-only"
 publish = false
 
 [workspace.dependencies]
+atlas-etw = { path = "crates/atlas-etw" }
 atlas-proto = { path = "crates/atlas-proto" }
+atlas-schema = { path = "crates/atlas-schema" }
 blake3 = "1.8"
 crc32c = "0.6"
+globset = "0.4"
 criterion = "0.8"
 prost = "0.14"
 prost-build = "0.14"
