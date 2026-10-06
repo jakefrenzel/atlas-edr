@@ -1,6 +1,6 @@
 # Sub-project 1 — ETW Sensor Design (Agent Core)
 
-**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in five parts, each reviewed and approved before it runs (decision log, 2026-10-02; plan 1b-3 was split in two on 2026-10-05); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04); plan 1b-2 (`atlas-etw`) is done (2026-10-05); plan 1b-3a (the `atlas-agent` pipeline core) is done (2026-10-05); plan 1b-3b (the Windows services behind it) is next. Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
+**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in six parts, each reviewed and approved before it runs (decision log, 2026-10-02; plan 1b-3 was split in two on 2026-10-05, and a plan 1b-3c added on 2026-10-06); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04); plan 1b-2 (`atlas-etw`) is done (2026-10-05); plan 1b-3a (the `atlas-agent` pipeline core) is done (2026-10-05); plan 1b-3b (the Windows services behind it) is done (2026-10-06); plan 1b-3c (a minimal driver and the agent-level live test) is next. Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
 **Depends on:** 0a (event schema: domain types, `process_uid`, validating `TryFrom`), 0b (CI, nightly fuzz workflow).
 **Depended on by:** sub-project 2 (adds enrollment + gRPC on top of the buffer's read API), sub-project 3 (fills the agent-side detection hook), sub-project 6 (the driver becomes a second sensor feeding the same pipeline).
 
@@ -82,8 +82,8 @@ ETW (Session A: manifest providers; Session B: system logger, process events)
       → domain Events (some pending: see "Pending events")                  │
    │              ▲ seeder replies         [4] workers (2, below-normal) ◄──┘
    │              │                            SHA-256 + Authenticode (§6.3)
-   │              │                            + 1 reader lane: registry value reads (§7.5),
-   │              │                              8.3 name expansion (§7.2)
+   │              │                            + 1 reader lane: registry value reads (§7.5)
+   │              │                            + 1 expander lane: 8.3 name expansion (§7.2)
    │         [8] seeder (below-normal): names key and file handles from the
    │             system handle table at start and on a miss (§7.4)
 [5] completion stage: emits in order; a pending event holds the line until
@@ -112,6 +112,8 @@ ETW (Session A: manifest providers; Session B: system logger, process events)
 [4] reports its results to [5] by event id. Seeder replies go to [3], which owns the maps; [3] then completes the waiting events in [5] by id. [3] can also cancel a pending event, which [5] then drops: for example a delete whose operation failed. An event is emitted when all its reasons are resolved or past their deadlines, except that a reason marked "drop at deadline" drops the event when it expires unresolved (§7.1). [5] is bounded: if more than 100 000 events are pending, the oldest goes out as is and `pending_overflow` counts it. End-to-end latency is about hold + time to complete: 1–2 s, at worst 3 s when the seeder is involved. Prevention (sub-project 7) uses the driver path, not this one.
 
 **Seeding.** Handles opened before the sessions started are never named by ETW (§7.4). The seeder [8] names them from the system handle table. At start the sessions start first and the seeder runs after, so no handle falls between the snapshot and the first event. Each snapshot is stamped with its QPC time, and [3] applies it in stream-time order (§7.4).
+
+**Service lanes** (plan 1b-3b). The hash workers, the reader lane, the expander lane and the seeder each take at most 8,192 waiting requests. A full lane drops the request and counts `service_queue_drops`: a dropped work request costs its event's deadline, and a dropped invalidation clears the expansion cache. The reader lane does no file I/O, so a stalled directory never delays a value read. The pipeline thread takes no lock to hand work out.
 
 **One thread for [2], [3] and [5]** (plan 1b-3a, D2). The three stages are one loop on the pipeline thread, with the clock passed in: the driver pushes queued events and worker replies, and calls `tick(now)` at least every 50 ms, which returns the events to emit in order. Measured at 0.57 µs per event in steady state, and 0.91 µs at 52,000 events/s of never-repeated addresses.
 - Stream time advances to each released event before that event is processed. Seeder snapshots, confirm windows and Launch halves that fall due by then are applied first.
@@ -211,7 +213,7 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - **`parent_process`** from `ParentProcessID` + `ParentProcessSequenceNumber` (the *claimed* parent), resolved through the cache entry live at the event time; if the parent is unknown, a `ProcessRef` with the computed uid, the PID and empty path/name (E11).
 - **`actor`** from the event header (the creator). It differs from the parent under PPID spoofing (0a §5.2).
 - **`integrity`** from `MandatoryLabel`: S-1-16-0 Untrusted; -4096 Low; -8192 and -8448 Medium; -12288 High; -16384 System; -20480 and -28672 Protected; anything else → absent.
-- **`cmd_line`, `user`** from Session B's classic Process Start v4 (`CommandLine`; `UserSID` → `user.uid`, with `user.name` from `LookupAccountSid`, cached). The SID follows a 16-byte `TOKEN_USER` header (kernel pointer, attributes, padding); offsets in §15.3 (S8). It is parsed from the raw bytes; TDH would render it as an account name.
+- **`cmd_line`, `user`** from Session B's classic Process Start v4 (`CommandLine`; `UserSID` → `user.uid`, with `user.name` from `LookupAccountSid`, cached; plan 1b-3b: on a helper thread, waited for at most 100 ms and not at all while an earlier lookup is overdue, with failures retried after 10 minutes). The SID follows a 16-byte `TOKEN_USER` header (kernel pointer, attributes, padding); offsets in §15.3 (S8). It is parsed from the raw bytes; TDH would render it as an account name.
 - **Join:** the pipeline creates the cache entry from whichever half arrives first and marks the Launch pending. The halves match by PID with timestamps within 200 ms (a PID cannot be reused while its process is alive). S8 paired 201 of 201 launches, 1–56 µs apart. If the partner has not arrived by the completion deadline, the Launch is emitted with what exists and `launch_join_miss` increments. For a missing Session B half, the agent first tries `PROCESS_TELEMETRY_ID_INFORMATION` (its `CommandLineOffset`) while the process may still be running.
 - Hashes and signature for `process.file` per §6.3.
 - **One half only** (plan 1b-3a):
@@ -252,7 +254,7 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
   - The window bounds the table; pending entries expire by stream time.
   - A slow operation that completes after the window is treated as successful. A failure it later reports is counted as `file_op_late_failure`, not reversed (§16). Such a failure is recognised for 40 confirm windows (10 s) after its operation stood (plan 1b-3a).
   - With `file.op_end` off (§11.2, §13), Create, DeletePath and RenamePath are emitted at once, without the window.
-- **File paths:** NT device paths (`\Device\HarddiskVolume3\…`) → drive paths (`C:\…`) via a device map from `QueryDosDeviceW`, built at start and refreshed every 60 s and on a lookup miss (at most once per 5 s). Prefixes match only on a path-component boundary (`HarddiskVolume1` never matches `HarddiskVolume10\…`). Unmappable paths (shadow copies, network redirectors, unmounted volumes) stay as NT paths.
+- **File paths:** NT device paths (`\Device\HarddiskVolume3\…`) → drive paths (`C:\…`) via a device map from `QueryDosDeviceW`, built at start and refreshed every 60 s and on a lookup miss (at most once per 5 s). Prefixes match only on a path-component boundary (`HarddiskVolume1` never matches `HarddiskVolume10\…`). Unmappable paths (shadow copies, network redirectors, unmounted volumes) stay as NT paths. Only `\Device\…` targets are kept: a `subst` drive's target is itself a drive path (plan 1b-3b).
 - **Registry paths:** come from the key map (§7.4); `KeyName` and `BaseName` are always empty (S7). Then: `\REGISTRY\MACHINE\…` → `HKLM\…`; `\REGISTRY\USER\<SID>\…` → `HKU\<SID>\…`; and `HKLM\SYSTEM\ControlSet00N\…` → `HKLM\SYSTEM\CurrentControlSet\…` when N is the current control set (from `HKLM\SYSTEM\Select\Current`, read at start). These are the forms Sigma uses. WOW64 views stay as `…\WOW6432Node\…` (the kernel logs the real path).
 - **Self-filtering** happens at emission, after [3] has updated its maps, joins and canary matching. Otherwise the agent's own CreateKey/OpenKey would be missing from the key map, and the registry canary could not be named.
   - Events whose resolved actor is the agent (by start key) are dropped, including the agent's own buffer and log writes.
@@ -267,7 +269,8 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - `device.uid`: random UUID generated on first run, persisted in `C:\ProgramData\Atlas\device.json`, written once.
 - `device.boot_id`: per 0a §4.4, `BLAKE3("atlas.boot.v1" ‖ BootId ‖ boot_time)[0..16]`.
   - **`BootId`** = `KUSER_SHARED_DATA.BootId` (user-mode address `0x7FFE0000 + 0x2c4`; the offset is from public symbols on builds 26200 and 26300). At start the agent checks it against its own `PROCESS_TELEMETRY_ID_INFORMATION.BootId`, the same kernel value. On a mismatch it uses the telemetry value and logs the disagreement. The registry's `PrefetchParameters\BootId` is never used: it lagged the kernel value by one in the VM (S2).
-  - **`boot_time`** = the creation time of the System process (PID 4), from `GetProcessTimes` (FILETIME, u64 LE). It stayed identical across clock and time-zone changes, sleep and restarts, and changed on reboot (S2).
+  - **`boot_time`** = the creation time of the System process (PID 4) (FILETIME, u64 LE). It stayed identical across clock and time-zone changes, sleep and restarts, and changed on reboot (S2). It is read from `SystemProcessInformation`, the same kernel field `GetProcessTimes` returns, because an unelevated caller cannot open PID 4 (plan 1b-3b, F5).
+- **`device.json`** (plan 1b-3b): `{"device_uid": "<32 lowercase hex>"}`, written once through a temporary file with a random name and a hard link, so no reader sees a partial file and a second writer loses cleanly. A damaged file is an error, never replaced: a new uid would split the device's history.
 
 ### 6.2 Process cache
 
@@ -285,6 +288,13 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - **SHA-256** for files up to the size cap (default 100 MB); larger files skip hashing.
 - **Signature:** `WinVerifyTrust` with `WTD_UI_NONE`, `WTD_REVOKE_NONE`, `WTD_CACHE_ONLY_URL_RETRIEVAL` (no network calls from the sensor), and catalog lookup (`CryptCATAdmin*`) for catalog-signed OS files. `signer` = the leaf certificate's subject CN. Mapping: valid chain → `Valid`; no signature (`TRUST_E_NOSIGNATURE`) → `Unsigned`; a signature that fails verification (bad digest, untrusted root, explicit distrust, revoked per local cache) → `Invalid`; any operational error (file locked, CryptSvc unavailable, timeout) → signature **absent**, counted.
 - **Deadline:** the completion stage's (§3.2), 1 s. A late result is cached for the next event on the same file. S10 measured 38 first launches with no miss (p99 540 ms), so the deadline stays.
+- **Plan 1b-3b:**
+  - The file is opened by `\\?\GLOBALROOT` + its NT path, for reading, with full sharing and backup semantics. One handle gives the key, the hash and the signature.
+  - While some handle can write the file, the cache is neither read nor written: writes through a handle that stays open do not change the USN. An open for reading that refuses write sharing tells, without blocking anyone. A result is also cached only if the USN is the same after the reads.
+  - A USN of zero counts as no USN. Results with an operational error are not cached. The cache (65,536 entries) starts over when full, counting `hash_cache_evictions`.
+  - The signature is checked even above the hash size cap, and that check reads the whole file.
+  - Catalogs are searched by SHA-256, then SHA-1. `signer` is the leaf certificate's subject CN for `Valid` and `Invalid` alike.
+  - `Invalid` covers failures of the signature or its chain: the certificate facility (`0x800B….`), trust errors `0x80096002`–`0x800960FF`, revocation, admin policy, and malformed ASN.1 (`0x80093xxx`). Anything else is an operational error.
 - **Known gaps:** a binary deleted right after launch may be unreadable. Hashing re-opens the file by path, so a binary renamed away and replaced in between is hashed as the replacement (§16).
 
 ## 7. Coalescing, Watchlist, Flows, Handle Maps
@@ -327,7 +337,8 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - Alternate data streams are stripped before matching (`file.txt:stream`, `file::$DATA` match `file.txt` / `file`).
 - **8.3 names.** A Create opened through a short name logs the short form (S6), for example `…\ATLASS~1\…\LONG-F~1.TXT`.
   - A path with any component matching the 8.3 pattern (`^[^.~]{1,6}~[0-9]+(\.[^.]{0,3})?$`, case-insensitive) is expanded by a worker [4]. The Open is pending meanwhile (deadline §3.2).
-  - The expansion is `GetLongPathNameW` on `\\?\GLOBALROOT` + the NT path, which also works for shadow copies, and is cached per directory.
+  - Each short component is looked up in its parent directory, opened by NT path, with `NtQueryDirectoryFile` (`FileBothDirectoryInformation`) and the short name as the filter, about 54 µs each; the answer counts only if its short or long name equals the component exactly. `GetLongPathNameW` cannot do this: it rejects `\\?\GLOBALROOT\Device\…` paths (plan 1b-3b, F1). This works for shadow copies too. Only `\Device\HarddiskVolume…` paths are expanded, on a lane of their own (the expander lane).
+  - Results are cached by (parent directory, short name). Short names are reused after a delete or rename, so the pipeline's `InvalidateHash` for a path drops the entries for that path and everything under it. Short components in that path are resolved from the cache, and one it cannot resolve clears the whole cache. An invalidation dropped because the lane was full also clears it. Entries expire after 60 s (plan 1b-3b, D4).
   - The logged path is matched at once. An Open that matches neither form is dropped only after the expansion.
   - The emitted `file.path` is the expanded form when expansion succeeded, otherwise the logged one.
   - **Every emitted file path is expanded the same way** (plan 1b-3a, D4), not only a watchlist Open's: Create, Update, Delete, SetAttributes, both paths of a Rename, and the images of Launch and Module Load. An event with a short component waits for its expansion (deadline §3.2). The handle map keeps the expanded path, and a Launch's expanded image also updates the cached process; actor references built before the reply keep the short form. On the CI runner 13% of file events had a short component (`C:\Users\RUNNER~1\…`, from `TEMP`).
@@ -357,8 +368,8 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 
 - **Privilege.** Object addresses appear in the table only with `SeDebugPrivilege` enabled. The agent enables it at start (LocalSystem holds it; `atlas-agent run` from an elevated admin shell does too). If it cannot, seeding is off and Sensor Health says so.
 - **Enumerate.** `NtQuerySystemInformation(SystemExtendedHandleInformation)` lists every handle with its owning PID, type index and kernel object address. That address equals Kernel-Registry's `KeyObject`/`BaseObject` and Kernel-File's `FileObject` (verified, S6/S7). The Key and File type indices are learned from one handle of each type that the agent opens itself.
-- **Name.** Each handle is duplicated into the agent with **no access rights** (plan 1b-3 verifies that both name queries work that way; otherwise the minimum, `KEY_QUERY_VALUE` / `FILE_READ_ATTRIBUTES`). It is named and closed at once. Nothing is read or written through it.
-  - Key handles: `NtQueryKey(KeyNameInformation)`.
+- **Name.** Each handle is duplicated into the agent with **no access rights** (plan 1b-3b, D2). Nothing is read or written through it.
+  - Key handles: `NtQueryObject(ObjectNameInformation)`. `NtQueryKey(KeyNameInformation)` is denied on a no-access duplicate, and a duplicate cannot gain a right its source lacks, so the earlier `KEY_QUERY_VALUE` fallback was unworkable. On 1,787 key handles the two queries gave identical names.
   - File handles: only disk files, and never network redirectors (`FileFsDeviceInformation`). Then `GetFinalPathNameByHandleW(VOLUME_NAME_NT)` on a helper thread with a 200 ms timeout.
   - A query that times out is cancelled (`CancelSynchronousIo`), and its (PID, handle) goes into the negative cache. At most 2 helpers may be stuck at a time. Past that, file seeding pauses and Sensor Health reports it.
   - A duplicate can briefly be a file's last handle. The final Cleanup or Close, and any delete-on-close, then happens in the agent's context. That is why actors come from the map entry, not the event header (§7.1).
@@ -367,11 +378,17 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
   - A seeded name for address A answers a pending event at time t only if [3] saw no Create/OpenKey/CloseKey (for files: no Create or Close) for A between t and T_snap. Otherwise the event stays unresolved, because the address may have changed owner in between.
   - A seeded entry never overwrites an entry created by an ETW event newer than T_snap.
 - **When.**
-  - At start, after the sessions are live: keys first (about 140 ms on the host), then files (about 1.2 s).
+  - At start, after the sessions are live: keys first (about 140 ms on the host; 205–363 ms with plan 1b-3b's verification), then files (about 1.2 s; 0.5–1.0 s in plan 1b-3b).
   - Then on a miss: an unknown `KeyObject`/`BaseObject`, or a Write, truncation, rename or attribute change on an unknown `FileObject` (§7.1).
   - Only an address absent from the latest snapshot triggers a re-read. Misses are batched, the table is re-read at most once per second, and the seeder keeps to a CPU budget (default 1% of one core averaged over 60 s; beyond it, re-reads are deferred and counted).
 - **Negative cache.** Addresses that are in the snapshot but cannot be named (protected processes, failed or timed-out queries) go into a negative cache. They stay there until a CreateKey, OpenKey or CloseKey (for files: a Create or Close) for that address is seen, or the owning process exits. Events on them are emitted unresolved at once, without waiting. Without this cache, writes through protected processes' handles would force constant re-reads (S6/S7 saw 955 key and 2 174 file handles in processes the agent cannot open).
 - **Cost** (host, all processes): keys, 15 156 handles, 42 ms to read the table + 98 ms to name, 93% named; files, 10 494 handles, 3 830 disk files named in 1.18 s (3 timeouts).
+- **Plan 1b-3b:**
+  - Each covered address is answered once, `named` if any holder's handle was named, else `unnamable`. Its owner is the holder with the lowest PID, the agent excluded; an address only the agent holds is unnamable, with the agent as owner. The name query is made once per address; a holder that cannot be opened or duplicated is skipped for the next.
+  - **Verification (F2).** A handle can be closed and its value reused for another object between the table read and the duplicate. The table is read a second time after naming, and a name is kept only if its handle still sits at the address. Key duplicates stay open until then and are checked themselves. File duplicates are closed as soon as they are named, so an owner's close still releases its sharing at once, and the check is on the holder's (PID, handle). T_snap is the QPC of that second read.
+  - When file seeding pauses (2 stuck helpers), it stays paused for the rest of that snapshot. A name query blocks when another thread's synchronous operation on the same file object is pending, and `CancelSynchronousIo` does not free it; the device check never blocks (F3).
+  - The CPU budget charges the seeder thread's CPU time, not the start-up pass. Re-reads that wait for it are merged per kind and served oldest first; each counts once in `seeder_deferred_rereads`. A table read that fails gets no reply.
+  - Kernel key names keep their case (`\Registry\Machine\…`); §5.5's root mapping already ignores case (F4).
 - **Refinements** (plan 1b-3a):
   - **Address reuse.** Key objects are per handle, so a successful CreateKey or OpenKey at an address is a new object there. Children waiting on that address belonged to the earlier object: they become orphans, which only the seeder naming the child handle itself can name. The same holds for the children of an unknown base that closes, and of a tombstone whose address the seeder names after the tombstone closed. Otherwise a reused address would give a key the path of an unrelated one.
   - **Coverage.** A snapshot carries the addresses it was asked about; the start-up pass covers the whole table. Every covered handle is in `named` or `unnamable` (non-disk files are unnamable). A covered address in neither was not in the table: it joins the negative cache until the address is used again, and the events waiting on it are answered at once.
@@ -389,7 +406,7 @@ The early map is only a cache. Its names are never emitted, and the event's path
 
 **The ordered path.** When the early map misses, the read happens after [3] has resolved the path, about 1 s after the write, or more if seeding was needed. Misses happen when events arrive out of order across CPU buffers, or when the key was opened before the agent started.
 
-**The read.**
+**The read.** (Plan 1b-3b: one query with room for 4 KiB of data. A larger value answers `STATUS_BUFFER_OVERFLOW` with its type, full size and first bytes, which is all the event keeps, so a value of any size is read without reading it whole. Without `SeBackupPrivilege`, a normal open.)
 - `NtOpenKeyEx` by the raw NT name as logged (`ControlSet00N`, not the normalized form), with `REG_OPTION_BACKUP_RESTORE` (the agent enables `SeBackupPrivilege`). This defeats a deny-SYSTEM DACL a user can put on their own key.
 - `OBJ_OPENLINK`, so a key swapped for a symbolic link is not followed.
 - `NtQueryValueKey` for the value name as counted in the event, so embedded NULs are kept. The kernel logs counted names whole (plan 1b-2, F4): a value name `a`, NUL, `b` appears as all three units plus a terminator, in SetValueKey, DeleteValueKey and CreateKey/OpenKey. TDH stops at the first NUL; the parser does not. In SetValueKey the name ends at the last NUL after which the remaining fields parse exactly to the payload's end; that choice is unique while the captured buffers are empty (S4), and the parser flags `value_name_ambiguous` if it ever is not.
@@ -500,6 +517,8 @@ One activity, `Report`, carrying the §9.3 counters (`u64`, all optional), the i
 
 **Plan 1b-3a additions:** `loss.callback_panics`, for events skipped because the ETW callback panicked on them (caught, never unwound into ETW), and `quality.reg_name_ambiguous`, for value names that could end in more than one place (§7.5).
 
+**Plan 1b-3b addition:** `housekeeping.service_queue_drops`, for requests dropped because a service lane was full (§3.2).
+
 ### 10.4 Registry fields (additive, from S4 and S7)
 
 | Message | Field | Meaning |
@@ -567,7 +586,7 @@ Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9
 
 - Tests start real sessions on `windows-latest` (the runner is admin), run the scripted scenario, and assert the expected normalized events, filtered to the test's own process tree, with timeouts. The scenario: spawn a process with a known command line; create, write, overwrite, rename and delete a file; a failed delete (no event); a delete-on-close file; an undelete (disposition set, then cleared) and a delete-on-close cleared through `FileDispositionInformationEx`, which must produce no Delete (result documented either way); open a watchlisted path, also through its 8.3 name; create, set and delete a registry key and value (with the value data read after); a handle opened **before** the agent starts that is then written to (file) or created under (registry), named by seeding; open a TCP connection; send UDP; resolve a name.
 - Marked `#[ignore]` locally; CI runs them explicitly.
-- **Split by crate** (plan 1b-2): `atlas-etw`'s live test covers the ETW level of this scenario (process, files, failed operations, delete-on-close, registry including embedded NULs and the CloseKey handle test, TCP and UDP over IPv4 and IPv6, DNS), plus the session primitives and the event-ID filters. It runs the scenario in a second process (the actor), so the observer's own TDH lookups are not recorded. The agent-level parts (watchlist and 8.3, undelete, seeding, value reads) come with plans 1b-3 and 1b-4. Test sessions are named `Atlas-Test-*`.
+- **Split by crate** (plan 1b-2): `atlas-etw`'s live test covers the ETW level of this scenario (process, files, failed operations, delete-on-close, registry including embedded NULs and the CloseKey handle test, TCP and UDP over IPv4 and IPv6, DNS), plus the session primitives and the event-ID filters. It runs the scenario in a second process (the actor), so the observer's own TDH lookups are not recorded. The agent-level parts (watchlist and 8.3, undelete, seeding, value reads) come with plan 1b-3c. CI's `agent-live` job runs the service tests that need `SeDebugPrivilege` or `SeBackupPrivilege` (plan 1b-3b) and will run 1b-3c's live test. Test sessions are named `Atlas-Test-*`.
 
 ### 12.4 Known gaps
 
@@ -689,6 +708,16 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
 - **B4, a failure "before its event"** happens only when the operation itself arrives late: an OperationEnd is always logged after its operation.
 - **B5, the CI recording resolves end to end with no seeding:** every registry path through the actor's own absolute opens, every file actor, and the observer (running before the sessions started) through the rundown.
 
+**Plan 1b-3b (2026-10-06): building the Windows services** (verified on the host, unelevated and in four elevated runs):
+- **F1, `GetLongPathNameW` cannot expand NT paths:** it rejects `\\?\GLOBALROOT\Device\…` (`ERROR_INVALID_NAME`) and costs 1.55 ms for a path with 7 short components. Per-component `NtQueryDirectoryFile` takes about 54 µs per short component (§7.2).
+- **F2, a handle can change between the table read and the duplicate;** names are verified by a second read (§7.4).
+- **F3, which name queries block:** `FileFsDeviceInformation` never does; `GetFinalPathNameByHandleW` does behind a pending synchronous operation, and `CancelSynchronousIo` does not free it. The host's start-up pass met one such handle in each of two runs.
+- **F4, kernel key names keep their case;** 96 of the host's key handles were `\Registry\…`.
+- **F5, PID 4 cannot be opened unelevated;** its creation time comes from `SystemProcessInformation` (§6.1).
+- **F6, a dead counter:** the pipeline's `seeder_deferred` was never incremented and is removed.
+- **F7, an upper-case `\DEVICE\`** was not recognised as a device path; fixed.
+- **Elevated, on the host:** the start-up pass named 10,111–10,158 key handles in 205–363 ms and 3,382–3,428 disk files in 0.5–1.0 s. A read of `HKLM\SAM\SAM\Domains\Account` succeeded only with backup semantics.
+
 ## 16. Known Limitations
 
 - **No boot-time coverage:** events before the agent starts (early boot, or while the service is stopped) are not captured. An AutoLogger session is sub-project 8.
@@ -706,6 +735,9 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
 - **Self-deleting binaries** may be unhashable; **a binary swapped on disk** between launch and hashing is hashed as the replacement.
 - **Work done on the agent's behalf** by other processes (CryptSvc catalog lookups) appears as their activity.
 - **Argument spoofing:** a process created suspended whose command line is rewritten before it runs shows the original (fake) command line. The kernel driver (sub-project 6) does not fix this either; detection relies on the behaviour that follows.
+- **8.3 expansion** (plan 1b-3b) happens about 1 s after the event. A directory swapped within that window resolves to the new one's long name. Paths on network redirectors are not expanded. A directory whose listing stalls (a Cloud Files placeholder, a symbolic link to a share) holds the expander lane: events waiting for an expansion go out at their deadline with the logged path, and a watchlist pattern then matches only the logged form.
+- **File reads for hashing have no timeout:** a stalled read holds one of the two hash workers.
+- **64-bit Windows only:** the structure offsets the services read are the x64 layouts.
 - **An admin attacker can blind ETW.** This sub-project detects and reports it (§9); resisting it is sub-project 8, and the driver (sub-project 6) adds an independent sensor.
 
 ## 17. Review Log
@@ -779,3 +811,20 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
 24. the Value Set floor;
 25. request bookkeeping freed when the event leaves;
 26. lossy key names (a known limitation).
+
+**Plan 1b-3b clarifications (2026-10-06).** Applied to §3.2, §5.3, §6.1, §6.3, §7.2, §7.4, §7.5, §10.3, §12.3, §15.3 and §16:
+1. plan 1b is six plans; 1b-3c is the minimal driver and the agent-level live test;
+2. keys are named with `ObjectNameInformation` on no-access duplicates;
+3. 8.3 expansion per short component, on its own lane, with an invalidated cache;
+4. seeding: one answer per address, owners, verification by a second read, pausing, the budget;
+5. boot time from `SystemProcessInformation`;
+6. `device.json`;
+7. hashes and signatures: one handle, no caching while a writer is open, the SHA-1 catalog fallback, the `Invalid` mapping;
+8. account names on a helper thread;
+9. the device map keeps only `\Device\…` targets;
+10. value reads of any size;
+11. service lanes;
+12. `housekeeping.service_queue_drops`;
+13. the `agent-live` CI job;
+14. known limitations of expansion and hashing;
+15. 64-bit Windows only.

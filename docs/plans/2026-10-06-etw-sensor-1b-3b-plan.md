@@ -4441,7 +4441,7 @@ The `#[ignore]`d tests need `SeDebugPrivilege` or `SeBackupPrivilege`. Claude wr
 # Plan 1b-3b, verify-first: atlas-agent's Windows-service tests in an elevated
 # shell, including the #[ignore]d ones that need SeDebugPrivilege/SeBackupPrivilege.
 # Runs on the HOST. Changes nothing lasting: volatile HKCU test keys and temp
-# files (deleted by the tests), a short-lived `cmd /c ping` child, and build
+# files (deleted by the tests), a short-lived `ping.exe` child, and build
 # output in the repo's target directory.
 # Run from an elevated PowerShell (Windows PowerShell 5.1 or pwsh 7):
 #   & C:\Users\jakef\Desktop\atlas-edr\spikes\run-1b3b-elevated.ps1
