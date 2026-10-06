@@ -11,5 +11,7 @@
 pub mod layout;
 pub mod parse;
 pub mod providers;
+#[cfg(windows)]
+pub mod session;
 
 pub use providers::Provider;
