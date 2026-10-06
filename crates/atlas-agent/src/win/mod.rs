@@ -11,10 +11,12 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("atlas-agent's Windows services support 64-bit Windows only");
 
+mod expand;
 mod hash;
 pub mod identity;
 pub mod lookups;
 pub mod privilege;
 mod telemetry;
 mod util;
+mod value;
 
