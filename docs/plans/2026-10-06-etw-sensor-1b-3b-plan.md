@@ -1,6 +1,6 @@
 # Sub-project 1b-3b — Agent Windows Services Implementation Plan
 
-> **Status:** Reviewed (2026-10-06); awaiting approval. **For agentic workers:** steps use checkbox (`- [ ]`) syntax for tracking. Task 7 needs one elevated run on the host, by the user, from a script; nothing in this plan needs the VM or a kernel driver.
+> **Status:** Approved (2026-10-06). **For agentic workers:** steps use checkbox (`- [ ]`) syntax for tracking. Task 7 needs one elevated run on the host, by the user, from a script; nothing in this plan needs the VM or a kernel driver.
 
 **Goal:** Build the Windows side of `atlas-agent` (sensor spec §5.3, §5.5, §6, §7.2, §7.4, §7.5): the implementations behind the `services` interfaces that plan 1b-3a defined and faked.
 - start-up identity: device uid, boot id, the clock anchor, the current control set, the agent's own start key;
