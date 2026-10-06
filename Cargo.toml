@@ -22,6 +22,7 @@ prost-reflect = { version = "0.16", features = ["serde"] }
 proptest = "1.11"
 protox = "0.9"
 serde_json = "1"
+sha2 = "0.11"
 tempfile = "3.27"
 thiserror = "2"
 uuid = { version = "1.26", features = ["v7"] }

@@ -413,7 +413,7 @@ fn arb_health_report() -> BoxedStrategy<HealthReport> {
         });
     let housekeeping = (
         (counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),
-        (any::<Option<bool>>(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),
+        (any::<Option<bool>>(), counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),
     )
         .prop_map(|(a, b)| SensorHousekeeping {
             process_cache_evictions: a.0,
@@ -433,6 +433,7 @@ fn arb_health_report() -> BoxedStrategy<HealthReport> {
             seeder_deferred_rereads: b.5,
             seeder_stuck_helpers: b.6,
             seeder_negative_cache_size: b.7,
+            service_queue_drops: b.8,
         });
     let resources =
         (counter(), counter()).prop_map(|(cpu_time, working_set)| SensorResources { cpu_time, working_set });

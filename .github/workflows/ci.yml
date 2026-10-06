@@ -83,6 +83,24 @@ jobs:
           path: ${{ runner.temp }}/etw/
           if-no-files-found: ignore
 
+  # Tier 3 for atlas-agent's Windows services (plan 1b-3b): the tests that need
+  # SeDebugPrivilege or SeBackupPrivilege (seeding from the handle table, value
+  # reads with backup semantics, the System process's creation time). They are
+  # #[ignore]d locally; the hosted runner's account is an administrator. Plan
+  # 1b-3c adds the agent-level live test here.
+  agent-live:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+      - name: Elevated service tests
+        run: cargo test -p atlas-agent --lib -- --ignored --test-threads=1 --nocapture
+
   proto:
     runs-on: ubuntu-latest
     steps:

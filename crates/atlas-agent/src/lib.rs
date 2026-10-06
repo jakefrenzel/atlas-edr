@@ -16,3 +16,5 @@ pub mod recent;
 pub mod services;
 pub mod time;
 pub mod watchlist;
+#[cfg(windows)]
+pub mod win;
