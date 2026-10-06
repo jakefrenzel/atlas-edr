@@ -12,10 +12,12 @@
 compile_error!("atlas-agent's Windows services support 64-bit Windows only");
 
 mod expand;
+mod handles;
 mod hash;
 pub mod identity;
 pub mod lookups;
 pub mod privilege;
+mod seeder;
 mod telemetry;
 mod util;
 mod value;
