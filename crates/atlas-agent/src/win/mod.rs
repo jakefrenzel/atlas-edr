@@ -18,7 +18,9 @@ pub mod identity;
 pub mod lookups;
 pub mod privilege;
 mod seeder;
+mod services;
 mod telemetry;
 mod util;
 mod value;
 
+pub use services::Services;
