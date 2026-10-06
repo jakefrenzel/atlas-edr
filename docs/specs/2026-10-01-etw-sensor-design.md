@@ -1,6 +1,6 @@
 # Sub-project 1 — ETW Sensor Design (Agent Core)
 
-**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in four parts, each reviewed and approved before it runs (decision log, 2026-10-02); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04); plan 1b-2 (`atlas-etw`) is done (2026-10-05). Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
+**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in five parts, each reviewed and approved before it runs (decision log, 2026-10-02; plan 1b-3 was split in two on 2026-10-05); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04); plan 1b-2 (`atlas-etw`) is done (2026-10-05); plan 1b-3a (the `atlas-agent` pipeline core) is done (2026-10-05); plan 1b-3b (the Windows services behind it) is next. Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
 **Depends on:** 0a (event schema: domain types, `process_uid`, validating `TryFrom`), 0b (CI, nightly fuzz workflow).
 **Depended on by:** sub-project 2 (adds enrollment + gRPC on top of the buffer's read API), sub-project 3 (fills the agent-side detection hook), sub-project 6 (the driver becomes a second sensor feeding the same pipeline).
 
@@ -72,7 +72,7 @@ ETW (Session A: manifest providers; Session B: system logger, process events)
    │                                                                        │
 [2] ordering stage: merges all queues; holds each event until               │
       now − event time ≥ hold (default 750 ms); releases in timestamp order │
-      late arrivals (older than the last released) pass through at once, counted
+      late arrivals (older than stream time) pass through at once, counted
    │                                                                        │
 [3] pipeline thread: owns ALL mutable state, sees events in time order      │
       process cache · FileObject map · KeyObject map · Update coalescer     │
@@ -96,7 +96,7 @@ ETW (Session A: manifest providers; Session B: system logger, process events)
 [7] watchdog thread: session/provider checks, canaries, counters, restart (§9)
 ```
 
-**Order before state.** The stateful pipeline [3] must see events in timestamp order. Otherwise an ImageLoad that arrives before its ProcessStart misses the cache, and a Cleanup that arrives before its Write loses the Update. Stage [2] provides that order. Real-time ETW delivers per-CPU buffers at the session flush timer (250 ms, §4.1), so an event older than flush timer + scheduling slack has almost certainly arrived. The 750 ms hold is three flush periods. A late event (one older than what [2] has already released) is processed immediately, out of order, and counted. It is never dropped.
+**Order before state.** The stateful pipeline [3] must see events in timestamp order. Otherwise an ImageLoad that arrives before its ProcessStart misses the cache, and a Cleanup that arrives before its Write loses the Update. Stage [2] provides that order. Real-time ETW delivers per-CPU buffers at the session flush timer (250 ms, §4.1), so an event older than flush timer + scheduling slack has almost certainly arrived. The 750 ms hold is three flush periods. A late event (one older than stream time, the watermark; plan 1b-3a) is processed immediately, out of order, and counted. It is never dropped.
 
 **Stream time.** [3]'s clock is the ordering watermark: max(timestamp of the last event [2] released, now − hold). It therefore keeps advancing when no events arrive. Every wait that depends on other events (the failure-confirm window, §5.5; when seeder snapshots apply, §7.4) is measured in stream time, so it is unaffected by how late events arrive. Waits for workers and the seeder are measured in wall time from the moment the event enters [5].
 
@@ -112,6 +112,11 @@ ETW (Session A: manifest providers; Session B: system logger, process events)
 [4] reports its results to [5] by event id. Seeder replies go to [3], which owns the maps; [3] then completes the waiting events in [5] by id. [3] can also cancel a pending event, which [5] then drops: for example a delete whose operation failed. An event is emitted when all its reasons are resolved or past their deadlines, except that a reason marked "drop at deadline" drops the event when it expires unresolved (§7.1). [5] is bounded: if more than 100 000 events are pending, the oldest goes out as is and `pending_overflow` counts it. End-to-end latency is about hold + time to complete: 1–2 s, at worst 3 s when the seeder is involved. Prevention (sub-project 7) uses the driver path, not this one.
 
 **Seeding.** Handles opened before the sessions started are never named by ETW (§7.4). The seeder [8] names them from the system handle table. At start the sessions start first and the seeder runs after, so no handle falls between the snapshot and the first event. Each snapshot is stamped with its QPC time, and [3] applies it in stream-time order (§7.4).
+
+**One thread for [2], [3] and [5]** (plan 1b-3a, D2). The three stages are one loop on the pipeline thread, with the clock passed in: the driver pushes queued events and worker replies, and calls `tick(now)` at least every 50 ms, which returns the events to emit in order. Measured at 0.57 µs per event in steady state, and 0.91 µs at 52,000 events/s of never-repeated addresses.
+- Stream time advances to each released event before that event is processed. Seeder snapshots, confirm windows and Launch halves that fall due by then are applied first.
+- Sweeps over whole tables (UDP idle, cache retention) run once per second of stream time.
+- A pending event's request bookkeeping is freed when the event leaves [5], whether or not its reply came; a later reply is ignored. Each request gets at most one reply.
 
 **Backpressure.** The ETW callback must stay fast: a slow consumer makes ETW drop events in the kernel. The callback parses, enqueues and keeps the small early registry map (a hash-map operation per CreateKey, OpenKey or CloseKey). Successful OperationEnds, about half of Kernel-File's volume, are discarded right there: they cost parse time but never reach [2]. Queues never block (kernel queue default 65,536 entries; user-mode queue 8,192); drops are counted per queue. User-mode providers get their own queue so a process flooding forged DNS-Client events (§4.4) cannot push kernel events out.
 
@@ -209,6 +214,9 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - **`cmd_line`, `user`** from Session B's classic Process Start v4 (`CommandLine`; `UserSID` → `user.uid`, with `user.name` from `LookupAccountSid`, cached). The SID follows a 16-byte `TOKEN_USER` header (kernel pointer, attributes, padding); offsets in §15.3 (S8). It is parsed from the raw bytes; TDH would render it as an account name.
 - **Join:** the pipeline creates the cache entry from whichever half arrives first and marks the Launch pending. The halves match by PID with timestamps within 200 ms (a PID cannot be reused while its process is alive). S8 paired 201 of 201 launches, 1–56 µs apart. If the partner has not arrived by the completion deadline, the Launch is emitted with what exists and `launch_join_miss` increments. For a missing Session B half, the agent first tries `PROCESS_TELEMETRY_ID_INFORMATION` (its `CommandLineOffset`) while the process may still be running.
 - Hashes and signature for `process.file` per §6.3.
+- **One half only** (plan 1b-3a):
+  - A Launch seen only through its classic half takes its start key from the live process. Without one it has no uid: dropped, counting `launch_join_miss` and `actor_dropped`.
+  - A classic half that arrives after the join window, for a process whose Kernel-Process half came, adds the command line and user to the cache entry. That Launch stands; no second one is made.
 
 ### 5.3 Actor attribution
 
@@ -222,15 +230,15 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 **Lookup rule:** "the cache entry for this PID that was live **at the event's timestamp**", which includes entries in their 30 s post-exit retention. Because [3] runs in time order, this is a straightforward interval check.
 
 **Unresolvable actors (E11).**
-1. Built-in identities: PID 0 (Idle), PID 4 (System), and the minimal processes (Secure System, Registry, Memory Compression) get synthetic `ProcessRef`s with their well-known names and a fixed empty path, seeded at start.
-2. A miss with a known start key (any synchronous event): live lookup via `ProcessTelemetryIdInformation` (accepted only if its start key matches). If that fails, emit with the computed uid, the PID, and empty `file.path`/`file.name`; count `actor_unresolved` per class. Empty strings are valid under 0a.
+1. Built-in identities: PID 0 (Idle), PID 4 (System), and the minimal processes (Secure System, Registry, Memory Compression) get synthetic `ProcessRef`s with their well-known names and a fixed empty path, seeded at start. Idle has no telemetry: its start key is `(BootId << 48) | 0` (plan 1b-3a). The others come from the rundown.
+2. A miss with a known start key (any synchronous event): live lookup via `ProcessTelemetryIdInformation` (accepted only if its start key matches). The process found is cached as started at that event's time, so a later lookup by payload PID finds it, not an earlier process with the same PID (plan 1b-3a). If that fails, emit with the computed uid, the PID, and empty `file.path`/`file.name`; count `actor_unresolved` per class. Empty strings are valid under 0a.
 3. A miss with no start key (network events for a PID with no live-at-time entry): uid cannot be computed → drop and count `actor_dropped` per class.
 
 ### 5.4 DNS Response
 
 - `query.hostname` = `QueryName`; `query.type` = `QueryType`.
 - `platform_status` = `QueryStatus` (always kept). `rcode` mapped for known codes: 0 and 9501 (no records) → NOERROR (0); 9001 → FORMERR (1); 9002 → SERVFAIL (2); 9003 → NXDOMAIN (3); 9004 → NOTIMP (4); 9005 → REFUSED (5); otherwise absent.
-- `answers[]` parsed from `QueryResults`: `;`-separated entries, addresses in text form (IPv4 and IPv6), CNAMEs as `type: 5 <name>` before the addresses, empty on failure (S3). The parser is fuzzed; at most 64 entries per 0a.
+- `answers[]` parsed from `QueryResults`: `;`-separated entries, addresses in text form (IPv4 and IPv6), CNAMEs as `type: 5 <name>` before the addresses, empty on failure (S3). An entry in neither form is kept with type 0 and its raw text (plan 1b-3a). The parser is fuzzed; at most 64 entries per 0a.
 - **Actor:** the event header PID and start key, which are the requesting process's, including for cache hits, failures and 32-bit callers (S3). The sibling events (3009–3020, logged by the DNS Client service) are not used.
 
 ### 5.5 Failures and normalization
@@ -242,7 +250,8 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
   - A failed 24 within the window cancels the event: dropped, `file_op_failed` counted, and for a 12 its map entry removed. It is matched to the most recent pending event with the same `Irp` and an earlier timestamp. Irps are recycled, so the window keeps the match local.
   - No failure by the end of the window means the event stands; it is emitted, or for a 12 its entry stays. A short ring of recent failed 24s (also covering the window) catches a failure that arrives before its event.
   - The window bounds the table; pending entries expire by stream time.
-  - A slow operation that completes after the window is treated as successful. A failure it later reports is counted as `file_op_late_failure`, not reversed (§16).
+  - A slow operation that completes after the window is treated as successful. A failure it later reports is counted as `file_op_late_failure`, not reversed (§16). Such a failure is recognised for 40 confirm windows (10 s) after its operation stood (plan 1b-3a).
+  - With `file.op_end` off (§11.2, §13), Create, DeletePath and RenamePath are emitted at once, without the window.
 - **File paths:** NT device paths (`\Device\HarddiskVolume3\…`) → drive paths (`C:\…`) via a device map from `QueryDosDeviceW`, built at start and refreshed every 60 s and on a lookup miss (at most once per 5 s). Prefixes match only on a path-component boundary (`HarddiskVolume1` never matches `HarddiskVolume10\…`). Unmappable paths (shadow copies, network redirectors, unmounted volumes) stay as NT paths.
 - **Registry paths:** come from the key map (§7.4); `KeyName` and `BaseName` are always empty (S7). Then: `\REGISTRY\MACHINE\…` → `HKLM\…`; `\REGISTRY\USER\<SID>\…` → `HKU\<SID>\…`; and `HKLM\SYSTEM\ControlSet00N\…` → `HKLM\SYSTEM\CurrentControlSet\…` when N is the current control set (from `HKLM\SYSTEM\Select\Current`, read at start). These are the forms Sigma uses. WOW64 views stay as `…\WOW6432Node\…` (the kernel logs the real path).
 - **Self-filtering** happens at emission, after [3] has updated its maps, joins and canary matching. Otherwise the agent's own CreateKey/OpenKey would be missing from the key map, and the registry canary could not be named.
@@ -266,7 +275,7 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - **Maintained** from Launch and Terminate events.
 - **Keyed by start key**, never by PID; a PID index holds each PID's entries with their live intervals.
 - **Retention:** entries stay 30 s after Terminate (late events still resolve), then are removed.
-- **Bounded:** a hard entry cap with an eviction counter, so lost Terminate events cannot grow memory without limit.
+- **Bounded:** a hard entry cap with an eviction counter, so lost Terminate events cannot grow memory without limit. Past the cap an eighth goes at once: ended processes first, then the least recently looked up, so long-running services stay (plan 1b-3a).
 
 ### 6.3 Hashes and signatures
 
@@ -305,7 +314,12 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
 - Writes that arrive after Cleanup (lazy-writer flushes, memory-mapped paging writes) are absorbed into the Update already emitted and counted as `writes_after_cleanup`.
 - A confirmed rename (§5.5) changes the entry's path to the new name, so a later Update carries the name the file has now.
 
-**Bounds.** The map is bounded (cap + LRU eviction + counter). Seeded entries do not know `delete_on_close`, so a handle opened with that flag before the agent started produces no Delete (§16).
+**Unknown handles, refined** (plan 1b-3a):
+- A SetAttributes on a handle that is never named is dropped and counted (`unknown_file_object`), like Update and Delete.
+- A RenamePath on a handle whose name is unknown is emitted at once, with an empty source. It does not wait for the seeder, because a snapshot read after the rename could only give the new name. The handle takes the new name once the rename stands.
+- With on-miss seeding off (§11.2), such events wait only for the start-up pass, while it is outstanding.
+
+**Bounds.** The map is bounded (cap + counter; past the cap, the least recently used eighth goes at once, plan 1b-3a). Seeded entries do not know `delete_on_close`, so a handle opened with that flag before the agent started produces no Delete (§16).
 
 ### 7.2 Watchlist
 
@@ -316,13 +330,14 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
   - The expansion is `GetLongPathNameW` on `\\?\GLOBALROOT` + the NT path, which also works for shadow copies, and is cached per directory.
   - The logged path is matched at once. An Open that matches neither form is dropped only after the expansion.
   - The emitted `file.path` is the expanded form when expansion succeeded, otherwise the logged one.
+  - **Every emitted file path is expanded the same way** (plan 1b-3a, D4), not only a watchlist Open's: Create, Update, Delete, SetAttributes, both paths of a Rename, and the images of Launch and Module Load. An event with a short component waits for its expansion (deadline §3.2). The handle map keeps the expanded path, and a Launch's expanded image also updates the cached process; actor references built before the reply keep the short form. On the CI runner 13% of file events had a short component (`C:\Users\RUNNER~1\…`, from `TEMP`).
 - Built-in default list (replaceable or extendable in config): Chromium `Login Data`, `Cookies`, `Local State` and Firefox `logins.json`, `key4.db` under `\Users\*\…`; `SAM`, `SECURITY`, `SYSTEM` hives and `*.sav`/`*.bak` copies under `\Windows\System32\config\`; `\Windows\NTDS\ntds.dit`; `\Users\*\.ssh\*`; `\Users\*\.aws\credentials`, `\Users\*\.azure\*`, `\Users\*\AppData\Roaming\gcloud\*`; `*.kdbx`.
 - A successful Create on a matching path emits File System Activity **Open** (§10.1). It waits for the failure-confirm window, because a failed open logs a Create too (§5.5). An open is not proof of a read; rules should treat it as access intent.
-- Repeated opens of the same path by the same process are coalesced to one per 60 s.
+- Repeated opens of the same path by the same process are coalesced to one per 60 s, keyed on (actor uid, logged path lowercased). A failed Create removes its record, so a retry after a sharing violation is still emitted (plan 1b-3a).
 
 ### 7.3 Network
 
-- **TCP:** connect (12/28) → Open outbound; accept (15/31) → Open inbound; disconnect (13/29) → Close. `bytes_in`/`bytes_out` stay absent: the Disconnect `size` field is not a byte total (S5). Per-packet events are never enabled.
+- **TCP:** connect (12/28) → Open outbound; accept (15/31) → Open inbound; disconnect (13/29) → Close. A Close for a connection opened before the agent watched has no known direction: the end with the lower port is taken to be the server (plan 1b-3a). The direction table is a safety cap that clears at once when full; a cleared entry only makes its Close use that rule. `bytes_in`/`bytes_out` stay absent: the Disconnect `size` field is not a byte total (S5). Per-packet events are never enabled.
 - **UDP flows:** datagram events (42/43/58/59) feed a flow table keyed by (actor uid, local endpoint, remote endpoint). The first datagram emits Open (direction from send vs. receive); a Close is emitted after 60 s idle (configurable), timestamped at the last datagram. The table is bounded (cap + eviction counter; evicted flows emit Close).
 - **Performance gate (E8):** passed. Under real QUIC streaming (about 2 900 UDP events/s, peaks near 11 000/s) the full provider set cost 0.495% of one core with nothing lost (S9). `network.udp = true` is the default.
 - Ports and addresses are decoded in network byte order (confirmed by fixtures).
@@ -357,6 +372,11 @@ Querying `ProcessTelemetryIdInformation` for the new PID at Launch is **not** a 
   - Only an address absent from the latest snapshot triggers a re-read. Misses are batched, the table is re-read at most once per second, and the seeder keeps to a CPU budget (default 1% of one core averaged over 60 s; beyond it, re-reads are deferred and counted).
 - **Negative cache.** Addresses that are in the snapshot but cannot be named (protected processes, failed or timed-out queries) go into a negative cache. They stay there until a CreateKey, OpenKey or CloseKey (for files: a Create or Close) for that address is seen, or the owning process exits. Events on them are emitted unresolved at once, without waiting. Without this cache, writes through protected processes' handles would force constant re-reads (S6/S7 saw 955 key and 2 174 file handles in processes the agent cannot open).
 - **Cost** (host, all processes): keys, 15 156 handles, 42 ms to read the table + 98 ms to name, 93% named; files, 10 494 handles, 3 830 disk files named in 1.18 s (3 timeouts).
+- **Refinements** (plan 1b-3a):
+  - **Address reuse.** Key objects are per handle, so a successful CreateKey or OpenKey at an address is a new object there. Children waiting on that address belonged to the earlier object: they become orphans, which only the seeder naming the child handle itself can name. The same holds for the children of an unknown base that closes, and of a tombstone whose address the seeder names after the tombstone closed. Otherwise a reused address would give a key the path of an unrelated one.
+  - **Coverage.** A snapshot carries the addresses it was asked about; the start-up pass covers the whole table. Every covered handle is in `named` or `unnamable` (non-disk files are unnamable). A covered address in neither was not in the table: it joins the negative cache until the address is used again, and the events waiting on it are answered at once.
+  - **The reuse rule is conservative:** a seeded name answers an event only if no Create, Open or Close for the address came after the earlier of the event and the snapshot.
+  - **Bounds.** The address history and the negative cache are capped, and the history expires after four start-up seeder deadlines (20 s).
 - **Floor (E11).** A registry event whose key stays unresolved is emitted, not dropped, with `path_unresolved = true` (§10.4) and the longest name known: the chain of relative names below the first unresolved base, or empty if nothing is known. It counts `registry_unresolved`. Unresolved file entries follow §7.1.
 
 ### 7.5 Registry value reads (E12)
@@ -374,12 +394,13 @@ The early map is only a cache. Its names are never emitted, and the event's path
 - `OBJ_OPENLINK`, so a key swapped for a symbolic link is not followed.
 - `NtQueryValueKey` for the value name as counted in the event, so embedded NULs are kept. The kernel logs counted names whole (plan 1b-2, F4): a value name `a`, NUL, `b` appears as all three units plus a terminator, in SetValueKey, DeleteValueKey and CreateKey/OpenKey. TDH stops at the first NUL; the parser does not. In SetValueKey the name ends at the last NUL after which the remaining fields parse exactly to the payload's end; that choice is unique while the captured buffers are empty (S4), and the parser flags `value_name_ambiguous` if it ever is not.
 - `\REGISTRY\A\…` (application hives) and `\REGISTRY\WC\…` (containers) cannot be opened this way; their reads fail and are flagged.
+- Key paths are kept as UTF-8, converted lossily (plan 1b-3a). A key whose name contains unpaired surrogates therefore cannot be read back, and its reads fail and are counted. Value names are kept as UTF-16.
 
 **Result and flags** (§10.4):
 - `type` always comes from the event.
 - `data` is the value read, up to 4 KiB. It is accepted only if its type equals the event's `Type` **and** its length equals the event's `DataSize`. That catches most stale reads, and a decoy value with an embedded-NUL name.
 - `data_truncated` is set when `DataSize` > 4 KiB.
-- `data_read_after = true` whenever a read was attempted.
+- `data_read_after = true` whenever a read was attempted. An unresolved key means no read was attempted: `data_read_after = false`, `data_unavailable = true`, counted as `value_read_failed` (plan 1b-3a).
 - `data_unavailable = true` whenever no data was obtained: the key is unresolved, the read failed, or a check failed. `data` is then empty and `data_truncated` false. Counted as `value_read_failed`.
 - Value types above `REG_QWORD` (11) are outside 0a's `type` range. Such events are emitted with `type` absent, the raw type in `raw_type` (§10.4), and `data_unavailable`, and counted as `reg_type_unusual`. Dropping them would let an attacker hide a value just by giving it an unusual type.
 
@@ -477,6 +498,8 @@ One activity, `Report`, carrying the §9.3 counters (`u64`, all optional), the i
 
 **Counter semantics (D1, plan 1b-1):** typed `optional uint64` fields in five groups (`loss`, `quality`, `housekeeping`, `resources`, `buffer`) plus an optional `gap`. Counters count occurrences during `[interval_start, time]`; gauges are sampled at the end; absent means not measured. Per-class counts are `{class_uid, count}` lists of at most 32 entries.
 
+**Plan 1b-3a additions:** `loss.callback_panics`, for events skipped because the ETW callback panicked on them (caught, never unwound into ETW), and `quality.reg_name_ambiguous`, for value names that could end in more than one place (§7.5).
+
 ### 10.4 Registry fields (additive, from S4 and S7)
 
 | Message | Field | Meaning |
@@ -507,7 +530,7 @@ Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9
 
 ### 11.2 `agent.toml`
 
-- Keys: buffer cap, retention/overflow policy, `transport` (`none` in this sub-project), ordering hold, completion deadline, enrichment size cap, watchlist (replace or extend the default), per-class enable, `network.udp`, UDP idle timeout, DNS per-PID rate, the failure-confirm window (§5.5), `file.op_end` (on by default), seeding on start and on miss, the seeder CPU budget (§7.4), `registry.value_reads` (on by default), log level.
+- Keys: buffer cap, retention/overflow policy, `transport` (`none` in this sub-project), ordering hold, completion deadline, enrichment size cap, watchlist (replace or extend the default), per-class enable, `network.udp`, UDP idle timeout, DNS per-PID rate, the failure-confirm window (§5.5), `file.op_end` (on by default; off emits Create, Delete and Rename without the window), seeding on start and on miss (two settings, both on; without `SeDebugPrivilege` both are off; with on-miss off, events on unknown handles wait only for the start-up pass), the seeder CPU budget (§7.4), `registry.value_reads` (on by default), log level.
 - Built-in defaults; the file only overrides them. Validated at start: an invalid file stops startup with a clear error in the Windows Event Log (Application, source `Atlas`). No hot reload in v1.
 
 ### 11.3 CLI
@@ -521,7 +544,7 @@ Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9
 ### 11.4 Lifecycle
 
 - **Start:** take the mutex → verify the data directory (§11.1) → load config → load `device.json` → compute `boot_id` → start sessions (recreating stale ones) → seed the process cache from the rundown → start threads → seed the key and file maps from the handle table (§7.4).
-- **Clean stop:** flush both sessions → drain the ordering and completion stages → flush the buffer → stop the sessions. No in-flight event is lost on a clean stop.
+- **Clean stop:** flush both sessions → drain the ordering and completion stages → flush the buffer → stop the sessions. No in-flight event is lost on a clean stop. Pending events go out as at their deadlines, so one marked "drop at deadline" is dropped (plan 1b-3a).
 - **Diagnostic log:** `tracing` with a rolling file in `logs\`; its writes are self-filtered (§5.5).
 
 ## 12. Testing
@@ -537,7 +560,7 @@ Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9
 
 - Fixtures are recorded **on a GitHub Windows runner, not the host**: CI's `etw-live` job runs the live test (§12.3) on a clean, throwaway runner and uploads its recording. The repo is public, and a host recording would leak usernames, paths and DNS history. Fixtures are reviewed, then committed. (A `workflow_dispatch` job cannot be used: it runs only from the default branch.)
 - **Fixtures are text, filtered at capture** (plan 1b-2, D2): one JSON line per event of the scenario's process tree, holding the header fields, the start key, the payload in hex, and TDH's decoding on the recording machine. Replay parses each payload and compares every field with that decoding. It runs on Linux too, and fails on any unreadable line.
-- Replay through the full pipeline, against expected domain events, comes with plan 1b-3. The real consumer is exercised by the live tests (§12.3).
+- **Full-pipeline replay** (plan 1b-3a, D3): the CI recording runs through the parsers, the intake and the pipeline, with fake Windows services. Scenario assertions check each step, and a golden snapshot (protobuf-JSON, one event per line) catches any other change. The real consumer is exercised by the live tests (§12.3).
 - Locally, the same replay runs against host recordings that are never committed (§4.3).
 
 ### 12.3 Tier 3 — live sessions, Windows CI
@@ -659,6 +682,13 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
 - **F8, TDH offline:** it describes manifest and MOF events from a record built by hand, without a session or elevation.
 - **F9:** the two halves of a Launch arrived 14–15 µs apart (§5.2). No event of an unrequested ID reached Session A, so the event-ID filters work (§4.2). DNS-Client had 75 registered instances, each enabled by our session. No events were lost.
 
+**Plan 1b-3a (2026-10-05): building the pipeline core** (portable code; the CI recording replayed through it):
+- **B1, cost:** 0.57 µs per event in steady state, and 0.91 µs at 52,000 events/s on never-repeated addresses (§3.2). A run that rebuilt the pipeline each time measured 5.7 µs, dominated by start-up and idle ticks.
+- **B2, an O(n) trap:** evicting one entry per insert from a full map scans the whole map. Every bounded map evicts an eighth at once instead, and time-bounded sets are queues ordered by time. The independent review found the same trap in the seeder's address history (24–53 µs per event before the fix).
+- **B3, stream time must advance per event:** applied only after a whole released batch, a confirm window let a later Cleanup run before an earlier rename stood, so the Update carried the old name (§3.2).
+- **B4, a failure "before its event"** happens only when the operation itself arrives late: an OperationEnd is always logged after its operation.
+- **B5, the CI recording resolves end to end with no seeding:** every registry path through the actor's own absolute opens, every file actor, and the observer (running before the sessions started) through the rundown.
+
 ## 16. Known Limitations
 
 - **No boot-time coverage:** events before the agent starts (early boot, or while the service is stopped) are not captured. An AutoLogger session is sub-project 8.
@@ -721,3 +751,31 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
 - OperationEnd failures are error severity, not `!NT_SUCCESS`;
 - text replay fixtures recorded by CI's `etw-live` job;
 - tier 3 split by crate, with test sessions named `Atlas-Test-*`.
+
+**Plan 1b-3a clarifications (2026-10-05).** Applied to §3.2, §5.2–§5.5, §6.2, §7.1–§7.5, §10.3, §11.2, §11.4, §12.2 and §15.3 (numbers as in the plan):
+1. plan 1b-3 is split into 1b-3a (portable pipeline) and 1b-3b (Windows services);
+2. one pipeline thread, with stream time advancing per released event;
+3. the Windows boundary: `Lookups`, and `Request`/`Reply`;
+4. 8.3 expansion in every emitted file path;
+5. the full-pipeline replay;
+6. bounds: batch eviction, time-ordered sets, two safety caps that clear at once, sweeps once a second;
+7. unknown file handles: SetAttributes dropped, a Rename's unknown source left empty;
+8. the lower port as the server for a TCP Close of unknown direction;
+9. DNS answers in neither form kept with type 0;
+10. Idle's synthetic start key;
+11. strings cut to the schema's limits;
+12. two Sensor Health counters;
+13. a Launch seen only through its classic half;
+14. `file.op_end` off;
+15. watchlist coalescing, and the late-failure window;
+16. key address reuse orphans old children;
+17. snapshot coverage and absent addresses;
+18. the conservative reuse rule;
+19. seeding on start and on miss;
+20. late arrivals measured against stream time;
+21. a clean stop drops what a deadline would;
+22. a process found live is cached from that event's time;
+23. a classic half after the join window;
+24. the Value Set floor;
+25. request bookkeeping freed when the event leaves;
+26. lossy key names (a known limitation).

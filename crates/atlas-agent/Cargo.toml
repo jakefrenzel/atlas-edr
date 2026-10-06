@@ -1,0 +1,21 @@
+[package]
+name = "atlas-agent"
+version = "0.1.0"
+description = "The Atlas endpoint agent: ETW intake, the event pipeline, enrichment and the buffer writer."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+atlas-etw.workspace = true
+atlas-schema.workspace = true
+globset.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+atlas-proto.workspace = true
+prost.workspace = true
+prost-reflect.workspace = true
+proptest.workspace = true
+serde_json.workspace = true
