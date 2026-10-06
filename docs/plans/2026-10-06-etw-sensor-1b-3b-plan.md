@@ -1,6 +1,6 @@
 # Sub-project 1b-3b — Agent Windows Services Implementation Plan
 
-> **Status:** Draft (2026-10-06); independent review next. **For agentic workers:** steps use checkbox (`- [ ]`) syntax for tracking. Task 7 needs one elevated run on the host, by the user, from a script; nothing in this plan needs the VM or a kernel driver.
+> **Status:** Reviewed (2026-10-06); awaiting approval. **For agentic workers:** steps use checkbox (`- [ ]`) syntax for tracking. Task 7 needs one elevated run on the host, by the user, from a script; nothing in this plan needs the VM or a kernel driver.
 
 **Goal:** Build the Windows side of `atlas-agent` (sensor spec §5.3, §5.5, §6, §7.2, §7.4, §7.5): the implementations behind the `services` interfaces that plan 1b-3a defined and faked.
 - start-up identity: device uid, boot id, the clock anchor, the current control set, the agent's own start key;
@@ -15,10 +15,11 @@ Each part is tested on its own, against the real system. Wiring the threads to t
   - the device map from `QueryDosDeviceW`, rebuilt every 60 s and on a miss (at most every 5 s);
   - `live_process` from `PROCESS_TELEMETRY_ID_INFORMATION`, never cached;
   - `account_name` from `LookupAccountSidW`, cached, on a helper thread with a 100 ms timeout so a slow domain lookup never stalls the pipeline thread (D5).
-- **`Services`** owns the threads and routes each `Request` to its lane. Lanes are bounded and never block; a full lane drops the request (counted), and its event waits out its deadline.
-  - **2 hash workers** (below normal): `hash`. One handle per file gives the cache key (volume, file id, USN), the bytes hashed and the signature checked.
-  - **The reader lane** (1 thread): `value` reads, on the ordered path and the fast path (`FastRead`), and `expand`, the 8.3 expander with its cache (D4). Invalidations go through the same queue, so they keep their order with expansions.
-  - **The seeder** (below normal, when `SeDebugPrivilege` is available): `handles` reads the system handle table and names handles through no-access duplicates (D2); `seeder` plans, names, verifies with a second table read (F2), keeps the CPU budget, and answers with a `Snapshot`.
+- **`Services`** owns the threads and routes each `Request` to its lane. Lanes are bounded and never block; a full lane drops the request (counted), and its event waits out its deadline. The pipeline thread takes no lock.
+  - **2 hash workers** (below normal): `hash`. One handle per file gives the cache key (volume, file id, USN), the bytes hashed and the signature checked. Nothing is cached, or served from the cache, while some handle can write the file (R-M1). The hash cache's invalidations go through the same queue.
+  - **The reader lane** (1 thread): `value` reads, on the ordered path and the fast path (`FastRead`). It does no file I/O, so a stalled directory never delays a value read (R-M2).
+  - **The expander lane** (1 thread): `expand`, the 8.3 expander with its cache (D4). Invalidations go through the same queue, so they keep their order with expansions; one that a full queue drops clears the whole cache (R-M3).
+  - **The seeder** (below normal, when `SeDebugPrivilege` is available): `handles` reads the system handle table and names handles through no-access duplicates (D2); `seeder` plans, names, verifies with a second table read (F2; file duplicates are closed as soon as they are named, R-M5), keeps the CPU budget, serving waiting kinds oldest first (R-M6), and answers with a `Snapshot`.
 - **Portable additions:** `config::ServiceConfig` (the services' settings) and `counters::ServiceCounters` (their Sensor Health counters).
 - **Schema:** one additive Sensor Health counter, `housekeeping.service_queue_drops`.
 - **CI:** a new `agent-live` job runs the tests that need `SeDebugPrivilege` or `SeBackupPrivilege`, which are `#[ignore]`d locally. Plan 1b-3c adds the agent-level live test to it.
@@ -32,14 +33,16 @@ Each part is tested on its own, against the real system. Wiring the threads to t
 
 **Verification note (2026-10-06, host, Windows 11 build 26200):** every code block below was compiled and run in a scratch worktree of `main` (5f9bb44).
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean. `atlas-agent` and `atlas-etw` are also clippy-clean for `x86_64-unknown-linux-gnu`, checked from Windows.
-- **Unelevated:** `cargo test --workspace` passes 322 tests and ignores 6 (1b-2's live test and this plan's 5 elevated tests). `atlas-agent` has 139 unit tests (1b-3a had 93).
-- **Elevated** (the user ran Task 7's script, the third run after two test fixes): `cargo test -p atlas-agent --lib -- --include-ignored` passed all 144, none ignored.
-  - D2: on all 1,787 key handles compared, `ObjectNameInformation` on a no-access duplicate gave exactly the name `NtQueryKey(KeyNameInformation)` gives on a full-access one.
-  - Start-up pass, keys: 10,158 named, 902 unnamable, in 205 ms.
-  - Start-up pass, files: 3,428 named, 4,188 unnamable (mostly pipes and other non-disk handles), in 538 ms; spike S6 took 1.18 s for a similar count. One name query on the host blocked, `CancelSynchronousIo` did not free it, and its helper was set aside as stuck (F3), within the limit of 2.
-  - A key and a file held by another process were named, with that process as owner; an address not in the table appeared in neither list.
+- **Unelevated:** `cargo test --workspace` passes 332 tests and ignores 6 (1b-2's live test and this plan's 5 elevated tests). `atlas-agent` has 149 unit tests (1b-3a had 93).
+- **Elevated** (the user ran Task 7's script four times: two runs found test mistakes, the third passed, and the fourth re-ran everything after the review's fixes): the last run passed all 154, none ignored.
+  - D2: on all 1,786 key handles compared, `ObjectNameInformation` on a no-access duplicate gave exactly the name `NtQueryKey(KeyNameInformation)` gives on a full-access one (1,787 in the third run).
+  - Start-up pass, keys: 10,111 named, 907 unnamable, in 363 ms (205 ms in the third run; the key code did not change in between, so this is run-to-run variance in a debug build).
+  - Start-up pass, files: 3,382 named, 4,537 unnamable (mostly pipes and other non-disk handles), in 1.0 s (538 ms in the third run), with one helper stuck in both runs. Spike S6 took 1.18 s for a similar count. In the third run one name query on the host blocked, `CancelSynchronousIo` did not free it, and its helper was set aside as stuck (F3), within the limit of 2.
+  - A key and a file held by another process were named, with that process as owner; an address not in the table appeared in neither list; once the other process was gone, the address was unnamable with the agent as owner.
   - A read of `HKLM\SAM\SAM\Domains\Account` (allowed to SYSTEM only) was denied without backup semantics and succeeded with them.
   - The boot time read without a handle equals `GetProcessTimes(PID 4)`.
+- **Review fixes:** each fix from the independent review (Review Log) with a pinned test was checked by reverting it: all 11 reverts make their test fail. R-M2 (a separate lane) is shown by its test rather than a revert. R-m2 (the SHA-1 catalog fallback) was checked once on a host file listed only in a SHA-1 catalog: `Unsigned` before, `Valid` ("Microsoft Windows Hardware Compatibility Publisher") after; neither the host nor the runner has such a file in a fixed place, so no test pins it.
+- **Round trip:** the code was rebuilt from this document alone (every diff applied, every file written) in a fresh worktree of `main`: all changed files are identical to the verified ones, and the result builds and passes.
 - `buf lint` and `buf breaking` (against `main`) pass. Regenerating the golden fixtures changed none (line endings only). `actionlint` passes on `ci.yml`.
 - Tasks 2–5 leave modules that only Task 6 calls, so their clippy checks allow `dead_code`; Task 6 runs the full check. Test counts per task were measured by building each intermediate state.
 - **Not run yet:** the Linux build of `atlas-schema`'s tests (its `criterion` benchmark needs a Linux C compiler; CI has one), `cargo audit` (CI runs it), and the CI runner (build 26100), which Task 9's PR runs for the first time.
@@ -50,7 +53,7 @@ Each part is tested on its own, against the real system. Wiring the threads to t
 - **Windows code only in `win`.** It is `#[cfg(windows)]`; the rest of `atlas-agent` stays portable and Linux CI keeps building it.
 - **Every `unsafe` block has a `// SAFETY:` comment** saying why it is sound. Buffers the kernel fills are 8-aligned (`util::aligned`), and every field is read bounds-checked.
 - **Least privilege:** handles from other processes are duplicated with no access rights (D2). Files are opened for reading with full sharing. Nothing in this plan writes to another process's object.
-- **Never block the caller:** `Services::submit` and `FastRead` use `try_send`; `Lookups` wait at most 100 ms (`account_name`) and are otherwise cached or a single system call.
+- **Never block the caller:** `Services::submit` and `FastRead` use `try_send` and take no lock. `Lookups` are cached or a single system call, except `account_name`, which waits at most 100 ms, and not at all while an earlier lookup is overdue (R-M4).
 - **Elevation:** Claude never runs elevated on the host (plan 1a, D2). Tests that need privileges are `#[ignore]`d; CI's `agent-live` job runs them, and so does Task 7's script, which the user runs.
 - **Additive schema only:** `buf breaking` must pass, and the existing golden fixtures must stay byte-identical.
 - **Formatting and lint:** the repo's `rustfmt.toml`; clippy with `-D warnings` at the end of every task (allowing `dead_code` in Tasks 2–5).
@@ -98,7 +101,7 @@ Verified on the host:
 Accepted together:
 - the Windows code as a `cfg(windows)` module of `atlas-agent` (as `atlas-etw`'s `session`);
 - `account_name` on a helper thread with a 100 ms timeout; a slow answer serves later events;
-- one `Services` object owning the lanes, so plan 1b-3c's driver only wires channels;
+- one `Services` object owning the lanes, so plan 1b-3c's driver only wires channels (the review added a fourth lane, R-M2);
 - bounded lanes (8,192 requests each); a dropped request costs only its event's deadline (1b-3a, clarification 25), and is counted;
 - `sha2` for SHA-256;
 - value reads fall back to a normal open without `SeBackupPrivilege` (unelevated runs);
@@ -120,34 +123,41 @@ Accepted together:
 2. **Key naming** (D2; §7.4): no-access duplicates for keys and files; keys are named with `ObjectNameInformation`. The `KEY_QUERY_VALUE` / `FILE_READ_ATTRIBUTES` fallback is removed.
 3. **8.3 expansion** (D4, F1; §7.2):
    - each short component (the §7.2 pattern) is looked up in its parent directory, opened by NT path, with `NtQueryDirectoryFile` (`FileBothDirectoryInformation`) and the short name as the filter; the answer is accepted only if its short or long name equals the component exactly;
-   - only `\Device\HarddiskVolume…` paths (volumes and shadow copies) are expanded; a network redirector could stall the reader lane;
-   - the cache is keyed by (parent directory, short name). `InvalidateHash(path)` drops the entry for the path and everything under it, resolving short components from the cache only; entries expire after 60 s.
+   - only `\Device\HarddiskVolume…` paths (volumes and shadow copies) are expanded;
+   - expansion has a lane of its own, the expander lane, apart from value reads (R-M2);
+   - the cache is keyed by (parent directory, short name). `InvalidateHash(path)` drops the entry for the path and everything under it; short components in the path are resolved from the cache only, and one it cannot resolve clears the whole cache. An invalidation dropped because the lane was full also clears it (R-M3). Entries expire after 60 s.
 4. **Seeding** (§7.4):
    - each covered address is answered once: `named` if any holder's handle was named, else `unnamable`;
    - its owner is the holder with the lowest PID, the agent excluded; an address only the agent holds is unnamable, with the agent as owner;
    - the name query is made once per address; a holder that cannot be opened or duplicated is skipped for the next;
-   - verification by a second table read, and `taken` = its QPC (F2);
-   - when file seeding pauses (2 stuck helpers), the remaining file addresses of that snapshot are answered unnamable;
-   - the CPU budget charges the seeder thread's CPU time (not its helpers'), and not the start-up pass. Re-reads that wait for the budget are merged per kind and counted once each (`seeder_deferred_rereads`);
+   - verification by a second table read (F2). Key duplicates stay open until then and are checked themselves. File duplicates are closed as soon as they are named, as §7.4 says, and the check is on the holder's (PID, handle) (R-M5); it misses only a handle value reused twice in between with the second object at the old address;
+   - `taken` is the QPC of the second read: every kept name was valid then. `unnamable` entries and absent addresses were seen at the first read, slightly earlier; that only makes the pipeline's reuse rule (1b-3a, clarification 18) favour names from ETW (R-m8);
+   - when file seeding pauses (2 stuck helpers), it stays paused for the rest of that snapshot: the remaining file addresses are answered unnamable;
+   - the CPU budget charges the seeder thread's CPU time (not its helpers'), and not the start-up pass. Re-reads that wait for it are merged per kind and served oldest first (R-M6); each re-read that had to wait counts once in `seeder_deferred_rereads`;
    - a table read that fails gets no reply: the waiting events run to their deadlines.
 5. **Boot time** (F5; §6.1) is read from `SystemProcessInformation`.
-6. **`device.json`** (§6.1): `{"device_uid": "<32 lowercase hex>"}`, written once through a temporary file and a hard link, so no reader sees a partial file and a second writer loses cleanly. A damaged file is an error, never replaced: a new uid would split the device's history. Its location and permissions are plan 1b-4's (§11.1).
+6. **`device.json`** (§6.1): `{"device_uid": "<32 lowercase hex>"}`, written once through a temporary file with a random name and a hard link, so no reader sees a partial file, a second writer loses cleanly, and a stale temporary file never gets in the way. A damaged file is an error, never replaced: a new uid would split the device's history. Its location and permissions are plan 1b-4's (§11.1).
 7. **Hashes and signatures** (§6.3):
    - the file is opened by `\\?\GLOBALROOT` + its NT path, for reading, with full sharing and backup semantics; one handle gives the key, the hash and the signature;
+   - while some handle can write the file, the cache is neither read nor written: writes through a handle that stays open do not change the USN (R-M1). An open for reading that refuses write sharing tells, without blocking anyone. A result is also cached only if the USN is the same after the reads;
    - a USN of zero (the journal has not recorded the file) counts as no USN: not cached;
    - results with an operational error are not cached; the cache (65,536 entries) starts over when full, counting `hash_cache_evictions`;
-   - the signature is checked even above the hash size cap;
+   - the signature is checked even above the hash size cap; that check reads the whole file (R-m3);
+   - catalogs are searched by SHA-256, then SHA-1, for files older catalogs list only by SHA-1 (R-m2);
    - `signer` is the leaf certificate's subject CN for both `Valid` and `Invalid`;
    - the `WinVerifyTrust` result maps to `Invalid` for failures of the signature or its chain (certificate facility `0x800B….`, trust errors `0x80096002`–`0x800960FF`, revocation, admin policy, malformed ASN.1 `0x80093xxx`), and to an operational error otherwise.
-8. **Account names** (D5; §5.3): cached, failures included (4,096 entries, cleared when full); a lookup waits at most 100 ms, and one still running is not waited for again.
+8. **Account names** (D5; §5.3): cached; a failure is retried after 10 minutes (R-m4); the cache holds 4,096 entries and is cleared when full. A lookup waits at most 100 ms. While one is overdue, new lookups are queued without waiting, so the pipeline thread waits at most 100 ms until the helper answers again (R-M4).
 9. **The device map** (§5.5) keeps only `\Device\…` targets: a `subst` drive's target is itself a drive path.
-10. **Value reads** (§7.5): without `SeBackupPrivilege`, a normal open. Values larger than 16 MiB are not read (the read fails).
-11. **Service lanes** (§3.2): the hash workers, the reader lane and the seeder each take at most 8,192 waiting requests (`ServiceConfig::lane_cap`). A full lane drops the request and counts `service_queue_drops`; its event waits out its deadline. An `InvalidateHash` also goes to the reader lane, in order with expansions.
+10. **Value reads** (§7.5): without `SeBackupPrivilege`, a normal open. One query with room for 4 KiB of data: a larger value answers `STATUS_BUFFER_OVERFLOW` with its type, full size and first bytes, which is all the event keeps, so a value of any size is read without reading it whole (R-M7).
+11. **Service lanes** (§3.2): the hash workers, the reader lane, the expander lane and the seeder each take at most 8,192 waiting requests (`ServiceConfig::lane_cap`). A full lane drops the request and counts `service_queue_drops`: a dropped work request costs its event's deadline, a dropped invalidation clears the expansion cache. The pipeline thread takes no lock. `ServiceConfig::check` refuses settings of zero (R-m14).
 12. **Sensor Health** (§9.3, §10.3): `housekeeping.service_queue_drops` is added; the pipeline's unused `seeder_deferred` is removed (F6).
 13. **Tests** (§12.3): CI's `agent-live` job runs the service tests that need privileges; the agent-level live test comes with plan 1b-3c.
 14. **Known limitations** (§16):
     - 8.3 expansion happens about 1 s after the event (the ordering hold). A directory swapped within that window resolves to the new one's long name.
     - Paths on network redirectors are not expanded.
+    - A directory whose listing stalls (a Cloud Files placeholder, a directory symbolic link to a share) holds the expander lane. Events waiting for an expansion go out at their 1 s deadline with the logged path, so a watchlist pattern then matches only the logged form (R-M2).
+    - File reads for hashing have no timeout: a stalled read holds one of the two hash workers.
+15. **64-bit Windows only** (R-m9): the structure offsets are the x64 layouts, and `win` refuses to build for anything else.
 
 ## Review Focus
 
@@ -164,6 +174,7 @@ These would slip past a plain unit test, so each has a pinned check:
 10. **Never block the pipeline thread:** a slow account lookup returns within the timeout and is not waited for twice (`accounts_are_cached_and_never_wait_long`); a full lane drops and counts, and each request is answered or counted, never both (`full_lanes_drop_and_count`).
 11. **Identity:** the boot id formula, the start key's BootId, `device.json` written once and never replaced (`boot_id_formula`, `start_reads_this_machine`, `device_uid_is_created_once_and_kept`; elevated: `boot_time_matches_get_process_times`).
 12. **Every request kind is answered** through `Services` (`every_request_kind_is_answered`).
+13. **The review's fixes,** each with its test: writers never cached (`files_open_for_writing_are_never_served_from_the_cache`), value reads apart from directory I/O (`value_reads_never_wait_behind_directory_lookups`), a lost invalidation clears the cache (`a_lost_invalidation_clears_the_expansion_cache`), no stacked account waits (`one_stuck_lookup_does_not_make_every_new_sid_wait`), oldest re-read first (`waiting_rereads_are_served_oldest_first`), values of any size (`huge_values_are_read_without_reading_them_whole`), subtree invalidation through a short path (`invalidation_by_short_path_covers_the_subtree`, `an_unresolvable_short_component_clears_the_cache`), failures retried (`failures_are_retried_after_their_ttl`), settings checked (`service_settings_are_checked`).
 
 ## File Structure
 
@@ -189,7 +200,7 @@ crates/atlas-agent/
   src/win/expand.rs    Expander, NtDir (8.3)
   src/win/handles.rs   the handle table, no-access duplicates, FileNamer
   src/win/seeder.rs    plan, verified, Budget, Seeder, the seeder thread
-  src/win/services.rs  Services: lanes, routing, FastRead
+  src/win/services.rs  Services: four lanes, routing, FastRead
 spikes/run-1b3b-elevated.ps1                   git-ignored; Task 7
 docs/…                 Task 8
 ```
@@ -199,15 +210,15 @@ docs/…                 Task 8
 - **Plan 1b-3c (the driver and the agent-level live test):**
   - `win::identity::start(device_file)` gives `Started`: `identity`, `ticks`, `anchor`, `current_control_set`, `self_key` (for `Setup::self_keys`) and `started`. Log `boot_id_disagreement` if set. Call `win::identity::anchor()` every 60 s for `Pipeline::set_anchor`.
   - `win::lookups::WinLookups::new()` is the `Lookups` for `Pipeline::new`.
-  - `win::Services::start(&ServiceConfig::default())`:
+  - `win::Services::start(&cfg)`, with `cfg` a `ServiceConfig` that passed `check()`:
     - if `seeding()` is false, set `Config::seed_on_start` and `seed_on_miss` to false before building the pipeline;
     - `fast_read()` gives Session A's `Intake` its `FastRead` (call once per `Intake`);
     - pass every request from `Pipeline::take_requests()` to `submit()`, and every reply from `replies()` to `Pipeline::reply()`.
-  - Dropping `Services` closes the lanes; the threads exit when their queue is empty. A stuck seeder helper exits when its query returns.
+  - **Shutdown** (R-m11): no thread is joined. Dropping `Services` closes its lanes; the hash workers and the expander exit once their queue is empty; the reader lane also lives while a `FastRead` exists, so drop the `Intake`s first; the seeder exits at once, discarding re-reads waiting for the budget. A stuck seeder helper exits when its query returns.
 - **Plan 1b-4 (Sensor Health and the service):**
-  - `Services::counters()` gives `ServiceCounters`. Its fields are `housekeeping` fields of the same names; `seeder_stuck_helpers` is a gauge. `housekeeping.seeding_enabled` is `Services::seeding()`.
+  - `Services::counters()` gives `ServiceCounters`. Its fields are `housekeeping` fields of the same names; `seeder_stuck_helpers` is a gauge, updated at the end of each snapshot (so it can be stale while no seeding runs). `housekeeping.seeding_enabled` is `Services::seeding()`.
   - `device.json` lives in `C:\ProgramData\Atlas\` with the §11.1 permissions; `identity::start` takes its path.
-  - `ServiceConfig` is read from `agent.toml` with the pipeline's `Config`.
+  - `ServiceConfig` is read from `agent.toml` with the pipeline's `Config`, and refused unless `check()` passes.
 
 ---
 
@@ -226,8 +237,8 @@ docs/…                 Task 8
    // Gauges.
    optional uint64 seeder_stuck_helpers = 16;
    optional uint64 seeder_negative_cache_size = 17;
-+  // Requests to the hash workers, reader lane or seeder dropped because the lane was full;
-+  // each one's event waited out its deadline.
++  // Requests to the agent's service threads dropped because their queue was full. A dropped
++  // work request costs its event's deadline; a dropped invalidation clears the 8.3 name cache.
 +  optional uint64 service_queue_drops = 18;
  }
  
@@ -377,7 +388,7 @@ git commit -m "feat(schema): Sensor Health service_queue_drops"
 ```diff
 --- a/crates/atlas-agent/src/config.rs
 +++ b/crates/atlas-agent/src/config.rs
-@@ -91,6 +91,43 @@ impl Default for Config {
+@@ -91,6 +91,64 @@ impl Default for Config {
      }
  }
  
@@ -398,9 +409,30 @@ git commit -m "feat(schema): Sensor Health service_queue_drops"
 +    pub name_timeout: Duration,
 +    /// Past this many stuck name queries, file seeding pauses (§7.4).
 +    pub max_stuck_helpers: usize,
-+    /// Requests waiting per lane (hash workers, reader lane, seeder). A full
++    /// Requests waiting per lane (hash workers, reader, expander, seeder). A full
 +    /// lane drops the request; its event waits out its deadline.
 +    pub lane_cap: usize,
++}
++
++impl ServiceConfig {
++    /// Refuses settings under which a service cannot work: no hash worker, a
++    /// lane that holds nothing, no CPU budget or window (the seeder would wake
++    /// every 10 ms forever), no name timeout, no stuck helper allowed.
++    pub fn check(&self) -> Result<(), String> {
++        let zero = [
++            ("hash_workers", self.hash_workers == 0),
++            ("hash_cache_cap", self.hash_cache_cap == 0),
++            ("lane_cap", self.lane_cap == 0),
++            ("seeder_cpu", self.seeder_cpu.is_zero()),
++            ("seeder_cpu_window", self.seeder_cpu_window.is_zero()),
++            ("name_timeout", self.name_timeout.is_zero()),
++            ("max_stuck_helpers", self.max_stuck_helpers == 0),
++        ];
++        match zero.iter().find(|(_, z)| *z) {
++            Some((name, _)) => Err(format!("{name} must be greater than zero")),
++            None => Ok(()),
++        }
++    }
 +}
 +
 +impl Default for ServiceConfig {
@@ -421,6 +453,22 @@ git commit -m "feat(schema): Sensor Health service_queue_drops"
  /// Converts durations to QPC ticks (the pipeline's only clock, §3.3).
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
  pub struct Ticks {
+@@ -128,6 +186,15 @@ mod tests {
+         assert_eq!(t.of(Duration::MAX), i64::MAX);
+     }
+ 
++    #[test]
++    fn service_settings_are_checked() {
++        assert_eq!(ServiceConfig::default().check(), Ok(()));
++        let bad = ServiceConfig { lane_cap: 0, ..ServiceConfig::default() };
++        assert_eq!(bad.check(), Err("lane_cap must be greater than zero".into()));
++        let bad = ServiceConfig { seeder_cpu: Duration::ZERO, ..ServiceConfig::default() };
++        assert!(bad.check().is_err());
++    }
++
+     #[test]
+     fn defaults_follow_the_spec() {
+         let c = Config::default();
 ```
 
 `src/counters.rs` (`seeder_deferred` was never incremented, F6):
@@ -435,7 +483,7 @@ git commit -m "feat(schema): Sensor Health service_queue_drops"
      /// Events dropped at emission because their actor is the agent (§5.5).
      pub self_filtered: u64,
  }
-@@ -96,3 +95,23 @@ impl IntakeCounters {
+@@ -96,3 +95,26 @@ impl IntakeCounters {
          c.load(Ordering::Relaxed)
      }
  }
@@ -446,7 +494,8 @@ git commit -m "feat(schema): Sensor Health service_queue_drops"
 +#[derive(Debug, Default)]
 +pub struct ServiceCounters {
 +    /// Requests dropped because their lane was full (`housekeeping.service_queue_drops`).
-+    /// The event waits out its deadline.
++    /// A dropped `Enrich`, `ReadValue`, `Expand` or `Seed` costs its event's
++    /// deadline; a dropped invalidation clears the expansion cache (R-M3).
 +    pub service_queue_drops: AtomicU64,
 +    /// Hash results dropped when the cache started over (`housekeeping.hash_cache_evictions`).
 +    pub hash_cache_evictions: AtomicU64,
@@ -454,9 +503,11 @@ git commit -m "feat(schema): Sensor Health service_queue_drops"
 +    /// Covered addresses answered as unnamable, including timed-out ones.
 +    pub seeder_handles_failed: AtomicU64,
 +    pub seeder_handles_timed_out: AtomicU64,
++    /// Two per snapshot: the read, and the verifying read (F2).
 +    pub seeder_table_reads: AtomicU64,
-+    /// Re-reads that waited for the CPU budget (§7.4).
++    /// Re-reads that had to wait for the CPU budget, once each (§7.4).
 +    pub seeder_deferred_rereads: AtomicU64,
++    /// Gauge, updated at the end of each snapshot.
 +    pub seeder_stuck_helpers: AtomicU64,
 +}
 ```
@@ -470,8 +521,13 @@ git commit -m "feat(schema): Sensor Health service_queue_drops"
 //!
 //! - [`identity`]: device and boot identity, the anchor, and `Setup`'s facts.
 //! - [`lookups::WinLookups`]: the [`crate::services::Lookups`] the pipeline thread calls.
-//! - [`Services`]: the hash workers, the reader lane and the seeder, answering
+//! - [`Services`]: the hash workers, the reader and expander lanes and the seeder, answering
 //!   [`crate::services::Request`]s.
+
+// The structure offsets used here (handle table, telemetry, process list,
+// directory entries) are the x64 layouts.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("atlas-agent's Windows services support 64-bit Windows only");
 
 mod expand;
 mod handles;
@@ -911,7 +967,8 @@ pub fn device_uid(path: &Path) -> Result<DeviceUid, IdentityError> {
         let uid = DeviceUid::from_bytes(*uuid::Uuid::new_v4().as_bytes());
         // Write a temporary file, then link it into place: the link fails if
         // another process created the file first, and nobody reads a partial file.
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        // A fresh name: a stale temporary from an earlier run, or another caller's, is never ours.
+        let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
         let written = (|| {
             let mut f = std::fs::File::create_new(&tmp)?;
             f.write_all(serde_json::json!({ "device_uid": uid.to_string() }).to_string().as_bytes())?;
@@ -1106,6 +1163,9 @@ pub const DEVICE_REFRESH: Duration = Duration::from_secs(60);
 pub const DEVICE_MISS_REFRESH: Duration = Duration::from_secs(5);
 /// How long the pipeline thread waits for an account name (plan 1b-3b, D5).
 pub const ACCOUNT_TIMEOUT: Duration = Duration::from_millis(100);
+/// A failed account lookup is retried after this long (a domain controller
+/// may have been unreachable).
+pub const ACCOUNT_FAILURE_TTL: Duration = Duration::from_secs(600);
 /// Account cache bound; it is cleared when full (SIDs seen are few).
 const ACCOUNT_CAP: usize = 4096;
 
@@ -1182,16 +1242,25 @@ pub fn query_drives() -> Vec<(String, String)> {
 
 /// `DOMAIN\name` per SID string, resolved on a helper thread.
 pub struct Accounts {
-    cache: HashMap<String, Option<String>>,
+    /// Names and failures, with when they were learned.
+    cache: HashMap<String, (Option<String>, Instant)>,
     asked: HashSet<String>,
     tx: Sender<String>,
     rx: Receiver<(String, Option<String>)>,
     timeout: Duration,
+    failure_ttl: Duration,
+    /// A wait timed out and no answer has come since: the helper is stuck on
+    /// a slow lookup, so new SIDs are queued without waiting (R-M4).
+    stalled: bool,
 }
 
 impl Accounts {
-    /// `resolve` runs on the helper thread.
-    pub fn new(resolve: impl Fn(&str) -> Option<String> + Send + 'static, timeout: Duration) -> Self {
+    /// `resolve` runs on the helper thread. A failure is retried after `failure_ttl`.
+    pub fn new(
+        resolve: impl Fn(&str) -> Option<String> + Send + 'static,
+        timeout: Duration,
+        failure_ttl: Duration,
+    ) -> Self {
         let (tx, jobs) = channel::<String>();
         let (done, rx) = channel();
         std::thread::Builder::new()
@@ -1205,20 +1274,27 @@ impl Accounts {
                 }
             })
             .expect("spawn the account lookup thread");
-        Accounts { cache: HashMap::new(), asked: HashSet::new(), tx, rx, timeout }
+        Accounts { cache: HashMap::new(), asked: HashSet::new(), tx, rx, timeout, failure_ttl, stalled: false }
     }
 
     /// The cached name, or a lookup waited for up to the timeout. A slow
-    /// lookup finishes in the background and serves later calls.
+    /// lookup finishes in the background and serves later calls. While one is
+    /// overdue, new lookups are not waited for: the pipeline thread waits at
+    /// most one timeout until the helper answers again.
     pub fn name(&mut self, sid: &str) -> Option<String> {
         while let Ok((s, n)) = self.rx.try_recv() {
             self.store(s, n);
         }
-        if let Some(n) = self.cache.get(sid) {
-            return n.clone();
+        match self.cache.get(sid) {
+            Some((n @ Some(_), _)) => return n.clone(),
+            Some((None, at)) if at.elapsed() < self.failure_ttl => return None,
+            Some((None, _)) => {
+                self.cache.remove(sid);
+            }
+            None => {}
         }
         // Already asked and still running: don't wait a second time.
-        if !self.asked.insert(sid.to_string()) || self.tx.send(sid.to_string()).is_err() {
+        if !self.asked.insert(sid.to_string()) || self.tx.send(sid.to_string()).is_err() || self.stalled {
             return None;
         }
         let until = Instant::now() + self.timeout;
@@ -1232,17 +1308,21 @@ impl Accounts {
                         return n;
                     }
                 }
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                    self.stalled = true;
+                    return None;
+                }
             }
         }
     }
 
     fn store(&mut self, sid: String, name: Option<String>) {
+        self.stalled = false;
         if self.cache.len() >= ACCOUNT_CAP {
             self.cache.clear();
         }
         self.asked.remove(&sid);
-        self.cache.insert(sid, name);
+        self.cache.insert(sid, (name, Instant::now()));
     }
 }
 
@@ -1292,7 +1372,7 @@ impl WinLookups {
     pub fn new() -> Self {
         WinLookups {
             devices: DeviceMap::new(query_drives as Drives, Instant::now()),
-            accounts: Accounts::new(lookup_account, ACCOUNT_TIMEOUT),
+            accounts: Accounts::new(lookup_account, ACCOUNT_TIMEOUT, ACCOUNT_FAILURE_TTL),
         }
     }
 }
@@ -1403,6 +1483,7 @@ mod tests {
                 (sid != "none").then(|| format!("D\\{sid}"))
             },
             Duration::from_millis(100),
+            Duration::from_secs(600),
         );
         assert_eq!(a.name("S-1").as_deref(), Some(r"D\S-1"));
         assert_eq!(a.name("S-1").as_deref(), Some(r"D\S-1"));
@@ -1417,6 +1498,51 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(a.name("slow").as_deref(), Some(r"D\slow"), "finished in the background");
         assert_eq!(*calls.lock().unwrap(), ["S-1", "none", "slow"]);
+    }
+
+    /// R-M4: behind one stuck lookup, new SIDs are not waited for one by one.
+    #[test]
+    fn one_stuck_lookup_does_not_make_every_new_sid_wait() {
+        let mut a = Accounts::new(
+            |sid| {
+                if sid == "stuck" {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Some(format!("D\\{sid}"))
+            },
+            Duration::from_millis(100),
+            Duration::from_secs(600),
+        );
+        assert_eq!(a.name("stuck"), None);
+        let t = Instant::now();
+        for i in 0..10 {
+            assert_eq!(a.name(&format!("S-{i}")), None);
+        }
+        assert!(t.elapsed() < Duration::from_millis(50), "{:?} for ten new SIDs", t.elapsed());
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(a.name("S-9").as_deref(), Some(r"D\S-9"), "answered in the background");
+        assert_eq!(a.name("S-10").as_deref(), Some(r"D\S-10"), "waited for again once the helper answers");
+    }
+
+    /// R-m4: a failure is retried after its TTL.
+    #[test]
+    fn failures_are_retried_after_their_ttl() {
+        let calls = Arc::new(Mutex::new(0));
+        let c = calls.clone();
+        let mut a = Accounts::new(
+            move |_| {
+                *c.lock().unwrap() += 1;
+                None
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        );
+        assert_eq!(a.name("S-1"), None);
+        assert_eq!(a.name("S-1"), None);
+        assert_eq!(*calls.lock().unwrap(), 1, "cached");
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(a.name("S-1"), None);
+        assert_eq!(*calls.lock().unwrap(), 2, "asked again");
     }
 
     #[test]
@@ -1444,7 +1570,7 @@ cargo test -p atlas-agent --lib
 cargo clippy -p atlas-agent --all-targets -- -D warnings -A dead-code
 cargo clippy -p atlas-agent --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 ```
-Expected: 110 tests pass and 1 is ignored (`boot_time_matches_get_process_times`, elevated); both clippy runs are clean. (`dead_code` is allowed until Task 6 calls the new modules.)
+Expected: 113 tests pass and 1 is ignored (`boot_time_matches_get_process_times`, elevated); both clippy runs are clean. (`dead_code` is allowed until Task 6 calls the new modules.)
 ```powershell
 git add Cargo.toml Cargo.lock crates/atlas-agent
 git commit -m "feat(agent): Windows identity and lookups: boot id, device uid, device map, telemetry, accounts"
@@ -1471,7 +1597,7 @@ use std::sync::Mutex;
 
 use atlas_schema::{Hashes, Signature, SignatureStatus};
 use sha2::{Digest, Sha256};
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{ERROR_SHARING_VIOLATION, HANDLE, HWND};
 use windows::Win32::Security::Cryptography::Catalog::{
     CATALOG_INFO, CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2, CryptCATAdminEnumCatalogFromHash,
     CryptCATAdminReleaseCatalogContext, CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext,
@@ -1485,8 +1611,8 @@ use windows::Win32::Security::WinTrust::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_BEGIN, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ, FILE_ID_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, GetFileSizeEx,
-    OPEN_EXISTING, ReadFile, SetFilePointerEx,
+    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+    GetFileSizeEx, OPEN_EXISTING, ReadFile, SetFilePointerEx,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{FSCTL_READ_FILE_USN_DATA, READ_FILE_USN_DATA};
@@ -1599,20 +1725,27 @@ fn classify(hr: i32) -> Verdict {
     }
 }
 
-/// Hashes and checks files; one per worker thread (the catalog context is per thread).
+/// Hashes and checks files; one per worker thread (catalog contexts are per thread).
 pub(crate) struct Enricher {
-    cat_admin: Option<isize>,
+    /// Catalog contexts, SHA-256 first, then SHA-1 for files that older
+    /// catalogs list only by SHA-1 (R-m2).
+    cat_admins: Vec<isize>,
     size_cap: u64,
 }
 
 impl Enricher {
     pub(crate) fn new(size_cap: u64) -> Self {
-        let mut admin = 0isize;
-        // SAFETY: writes the context handle; released in Drop.
-        let ok =
-            unsafe { CryptCATAdminAcquireContext2(&mut admin, Some(&DRIVER_ACTION_VERIFY), w!("SHA256"), None, None) }
-                .is_ok();
-        Enricher { cat_admin: ok.then_some(admin), size_cap }
+        let cat_admins = [w!("SHA256"), w!("SHA1")]
+            .into_iter()
+            .filter_map(|alg| {
+                let mut admin = 0isize;
+                // SAFETY: writes the context handle; released in Drop.
+                unsafe { CryptCATAdminAcquireContext2(&mut admin, Some(&DRIVER_ACTION_VERIFY), alg, None, None) }
+                    .is_ok()
+                    .then_some(admin)
+            })
+            .collect();
+        Enricher { cat_admins, size_cap }
     }
 
     /// Hash and signature of the file at `nt_path`, from the cache when this
@@ -1620,7 +1753,9 @@ impl Enricher {
     pub(crate) fn enrich(&self, nt_path: &str, cache: &Mutex<HashCache>) -> Enriched {
         let path = format!(r"\\?\GLOBALROOT{nt_path}");
         let Some(file) = open(&path) else { return Enriched::failed() };
-        let key = file_key(file.raw());
+        // A handle with write access can change the file without changing its
+        // USN (R-M1): then the cache is neither read nor written.
+        let key = if writer_open(&path) { None } else { file_key(file.raw()) };
         if let Some(hit) = key.and_then(|k| cache.lock().expect("hash cache").get(&k)) {
             return hit;
         }
@@ -1638,8 +1773,10 @@ impl Enricher {
             None => (None, true),
         };
         let out = Enriched { hashes, signature, error };
+        // Cache only a version that stayed the same while it was read.
         if let Some(k) = key
             && !error
+            && file_key(file.raw()) == Some(k)
         {
             cache.lock().expect("hash cache").insert(nt_path, k, out.clone());
         }
@@ -1667,64 +1804,82 @@ impl Enricher {
         }
     }
 
+    /// The catalogs, by each hash algorithm in turn: `Unsigned` when none
+    /// lists the file, `None` on an operational error.
     fn catalog(&self, path_w: &[u16], file: HANDLE) -> Option<Signature> {
-        let unsigned = Some(Signature { signer: None, status: SignatureStatus::Unsigned });
-        let admin = self.cat_admin?;
-        rewind(file)?;
-        let mut len = 0u32;
-        // SAFETY: a size query (no buffer); fails with a size when the buffer is too small.
-        let _ = unsafe { CryptCATAdminCalcHashFromFileHandle2(admin, file, &mut len, None, None) };
-        if len == 0 || len > 64 {
+        if self.cat_admins.is_empty() {
             return None;
         }
-        let mut hash = vec![0u8; len as usize];
-        // SAFETY: `hash` is writable for `len` bytes.
-        unsafe { CryptCATAdminCalcHashFromFileHandle2(admin, file, &mut len, Some(hash.as_mut_ptr()), None) }.ok()?;
-        // SAFETY: `hash` is valid; the returned context is released below.
-        let cat = unsafe { CryptCATAdminEnumCatalogFromHash(admin, &hash, None, None) };
-        if cat == 0 {
-            return unsigned;
-        }
-        let mut ci = CATALOG_INFO { cbStruct: size_of::<CATALOG_INFO>() as u32, ..Default::default() };
-        // SAFETY: `cat` is a live catalog context.
-        let out = match unsafe { CryptCATCatalogInfoFromContext(cat, &mut ci, 0) } {
-            Err(_) => None,
-            Ok(()) => {
-                let tag = wide(&hash.iter().map(|b| format!("{b:02X}")).collect::<String>());
-                let mut member = WINTRUST_CATALOG_INFO {
-                    cbStruct: size_of::<WINTRUST_CATALOG_INFO>() as u32,
-                    pcwszCatalogFilePath: PCWSTR(ci.wszCatalogFile.as_ptr()),
-                    pcwszMemberTag: PCWSTR(tag.as_ptr()),
-                    pcwszMemberFilePath: PCWSTR(path_w.as_ptr()),
-                    hMemberFile: file,
-                    pbCalculatedFileHash: hash.as_mut_ptr(),
-                    cbCalculatedFileHash: len,
-                    hCatAdmin: admin,
-                    ..Default::default()
-                };
-                let mut data = trust_data();
-                data.dwUnionChoice = WTD_CHOICE_CATALOG;
-                data.Anonymous.pCatalog = &mut member;
-                let (hr, signer) = verify(&mut data);
-                match classify(hr) {
-                    Verdict::Valid => Some(Signature { signer, status: SignatureStatus::Valid }),
-                    Verdict::Invalid => Some(Signature { signer, status: SignatureStatus::Invalid }),
-                    Verdict::NotEmbedded => unsigned,
-                    Verdict::Error => None,
-                }
+        for &admin in &self.cat_admins {
+            if let Some(found) = catalog_with(admin, path_w, file) {
+                return found;
             }
-        };
-        // SAFETY: releases the context enumerated above.
-        unsafe {
-            let _ = CryptCATAdminReleaseCatalogContext(admin, cat, 0);
         }
-        out
+        Some(Signature { signer: None, status: SignatureStatus::Unsigned })
     }
+}
+
+/// `None` when no catalog of this context's algorithm lists the file;
+/// otherwise the verdict (itself `None` on an operational error).
+fn catalog_with(admin: isize, path_w: &[u16], file: HANDLE) -> Option<Option<Signature>> {
+    if rewind(file).is_none() {
+        return Some(None);
+    }
+    let mut len = 0u32;
+    // SAFETY: a size query (no buffer); fails with a size when the buffer is too small.
+    let _ = unsafe { CryptCATAdminCalcHashFromFileHandle2(admin, file, &mut len, None, None) };
+    if len == 0 || len > 64 {
+        return Some(None);
+    }
+    let mut hash = vec![0u8; len as usize];
+    // SAFETY: `hash` is writable for `len` bytes.
+    if unsafe { CryptCATAdminCalcHashFromFileHandle2(admin, file, &mut len, Some(hash.as_mut_ptr()), None) }.is_err() {
+        return Some(None);
+    }
+    // SAFETY: `hash` is valid; the returned context is released below.
+    let cat = unsafe { CryptCATAdminEnumCatalogFromHash(admin, &hash, None, None) };
+    if cat == 0 {
+        return None;
+    }
+    let mut ci = CATALOG_INFO { cbStruct: size_of::<CATALOG_INFO>() as u32, ..Default::default() };
+    // SAFETY: `cat` is a live catalog context.
+    let out = match unsafe { CryptCATCatalogInfoFromContext(cat, &mut ci, 0) } {
+        Err(_) => None,
+        Ok(()) => {
+            let tag = wide(&hash.iter().map(|b| format!("{b:02X}")).collect::<String>());
+            let mut member = WINTRUST_CATALOG_INFO {
+                cbStruct: size_of::<WINTRUST_CATALOG_INFO>() as u32,
+                pcwszCatalogFilePath: PCWSTR(ci.wszCatalogFile.as_ptr()),
+                pcwszMemberTag: PCWSTR(tag.as_ptr()),
+                pcwszMemberFilePath: PCWSTR(path_w.as_ptr()),
+                hMemberFile: file,
+                pbCalculatedFileHash: hash.as_mut_ptr(),
+                cbCalculatedFileHash: len,
+                hCatAdmin: admin,
+                ..Default::default()
+            };
+            let mut data = trust_data();
+            data.dwUnionChoice = WTD_CHOICE_CATALOG;
+            data.Anonymous.pCatalog = &mut member;
+            let (hr, signer) = verify(&mut data);
+            match classify(hr) {
+                Verdict::Valid => Some(Signature { signer, status: SignatureStatus::Valid }),
+                Verdict::Invalid => Some(Signature { signer, status: SignatureStatus::Invalid }),
+                Verdict::NotEmbedded => Some(Signature { signer: None, status: SignatureStatus::Unsigned }),
+                Verdict::Error => None,
+            }
+        }
+    };
+    // SAFETY: releases the context enumerated above.
+    unsafe {
+        let _ = CryptCATAdminReleaseCatalogContext(admin, cat, 0);
+    }
+    Some(out)
 }
 
 impl Drop for Enricher {
     fn drop(&mut self) {
-        if let Some(admin) = self.cat_admin {
+        for &admin in &self.cat_admins {
             // SAFETY: acquired in `new`.
             unsafe {
                 let _ = CryptCATAdminReleaseContext(admin, 0);
@@ -1802,6 +1957,32 @@ fn open(path: &str) -> Option<Owned> {
         )
     };
     h.ok().map(Owned)
+}
+
+/// Whether some handle to the file has write access: an open for reading
+/// that refuses write sharing then fails with a sharing violation. Our own
+/// handle has no write access, so it never counts.
+fn writer_open(path: &str) -> bool {
+    let p = wide(path);
+    // SAFETY: `p` is NUL-terminated; the handle, if any, is closed at once.
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(p.as_ptr()),
+            FILE_READ_DATA.0,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    };
+    match h {
+        Ok(h) => {
+            drop(Owned(h));
+            false
+        }
+        Err(e) => e.code() == ERROR_SHARING_VIOLATION.to_hresult(),
+    }
 }
 
 /// The cache key, or `None` when the volume keeps no USNs (not cached, §6.3).
@@ -1889,10 +2070,34 @@ mod tests {
         format!("{dev}{}", &dos[drive.len()..])
     }
 
-    fn temp(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("atlas-hash-{}", std::process::id()));
+    /// A file path in a directory of its own, removed with the directory on drop.
+    struct Temp(std::path::PathBuf);
+
+    impl std::ops::Deref for Temp {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for Temp {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn temp(name: &str) -> Temp {
+        let dir = std::env::temp_dir().join(format!("atlas-hash-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+        Temp(dir.join(name))
     }
 
     #[test]
@@ -1932,6 +2137,31 @@ mod tests {
         assert_eq!(cache.lock().unwrap().len(), 2);
         cache.lock().unwrap().invalidate(&path.to_uppercase());
         assert_eq!(cache.lock().unwrap().len(), 0, "invalidation ignores case");
+    }
+
+    /// R-M1: writes through a handle that stays open keep the USN, so while a
+    /// writer is open nothing is cached and every request hashes the bytes.
+    #[test]
+    fn files_open_for_writing_are_never_served_from_the_cache() {
+        use std::io::{Seek, SeekFrom, Write};
+        let p = temp("writer.bin");
+        let mut w = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&p).unwrap();
+        w.write_all(b"benign").unwrap();
+        w.flush().unwrap();
+        let path = nt(&p.to_string_lossy());
+        let cache = Mutex::new(HashCache::new(100));
+        let e = Enricher::new(1 << 20);
+        let first = e.enrich(&path, &cache).hashes.unwrap().sha256.unwrap();
+        assert_eq!(first, <[u8; 32]>::from(Sha256::digest(b"benign")));
+        assert_eq!(cache.lock().unwrap().len(), 0, "a writer is open: not cached");
+        w.seek(SeekFrom::Start(0)).unwrap();
+        w.write_all(b"malice").unwrap();
+        w.flush().unwrap();
+        let second = e.enrich(&path, &cache).hashes.unwrap().sha256.unwrap();
+        assert_eq!(second, <[u8; 32]>::from(Sha256::digest(b"malice")), "the new bytes, not a cached hash");
+        drop(w);
+        e.enrich(&path, &cache);
+        assert_eq!(cache.lock().unwrap().len(), 1, "cached once the writer closed");
     }
 
     #[test]
@@ -2002,13 +2232,13 @@ mod tests {
 cargo test -p atlas-agent --lib
 cargo clippy -p atlas-agent --all-targets -- -D warnings -A dead-code
 ```
-Expected: 116 tests pass, 1 ignored, clippy clean. `embedded_signature_and_tampering` needs one of the embedded-signed binaries it lists (Defender's `MpCmdRun.exe` on the host and the runner); it fails, never skips, when none is present.
+Expected: 120 tests pass, 1 ignored, clippy clean. `embedded_signature_and_tampering` needs one of the embedded-signed binaries it lists (Defender's `MpCmdRun.exe` on the host and the runner); it fails, never skips, when none is present.
 ```powershell
 git add crates/atlas-agent
 git commit -m "feat(agent): SHA-256 and Authenticode, cached by file version"
 ```
 
-### Task 4: The reader lane's work: value reads and 8.3 expansion
+### Task 4: Value reads and 8.3 expansion
 
 **Files:**
 - Modify: `crates/atlas-agent/src/win/mod.rs` (`mod expand;`, `mod value;`)
@@ -2035,39 +2265,34 @@ use crate::services::{ValueData, ValueRead};
 
 /// At most this much data is kept (§7.5).
 pub(crate) const DATA_MAX: usize = 4096;
-/// Values larger than this are not read (registry values are rarely over 1 MB).
-const READ_MAX: u32 = 16 << 20;
 
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005_u32 as i32;
-const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023_u32 as i32;
 
 /// Reads the value; `None` if the key or value cannot be read.
+///
+/// One query, with room for the header and 4 KiB of data. A larger value
+/// returns `STATUS_BUFFER_OVERFLOW` with the header and the first bytes of
+/// data filled in: that is all the event keeps, so the value is never read
+/// whole, however large it is (R-M7).
 pub(crate) fn read(r: &ValueRead, backup: bool) -> Option<ValueData> {
     let key = open_key(&r.key_path, backup)?;
     let mut name = r.value_name.clone();
     let name = counted(&mut name)?;
     // KEY_VALUE_PARTIAL_INFORMATION: TitleIndex @0, Type @4, DataLength @8, Data @12.
     let mut buf = aligned(12 + DATA_MAX);
-    for _ in 0..2 {
-        let mut ret = 0u32;
-        let len = (buf.len() * 8) as u32;
-        // SAFETY: `buf` is writable for `len` bytes; `name` points into a live Vec.
-        let st = unsafe {
-            NtQueryValueKey(key.raw(), &name, KeyValuePartialInformation, Some(buf.as_mut_ptr().cast()), len, &mut ret)
-        };
-        if st.is_ok() {
-            let b = as_bytes(&buf);
-            let size = u32_at(b, 8)?;
-            let kept = (size as usize).min(DATA_MAX);
-            return Some(ValueData { value_type: u32_at(b, 4)?, size, data: b.get(12..12 + kept)?.to_vec() });
-        }
-        if (st.0 == STATUS_BUFFER_OVERFLOW || st.0 == STATUS_BUFFER_TOO_SMALL) && ret > len && ret <= READ_MAX {
-            buf = aligned(ret as usize);
-            continue;
-        }
+    let mut ret = 0u32;
+    let len = (buf.len() * 8) as u32;
+    // SAFETY: `buf` is writable for `len` bytes; `name` points into a live Vec.
+    let st = unsafe {
+        NtQueryValueKey(key.raw(), &name, KeyValuePartialInformation, Some(buf.as_mut_ptr().cast()), len, &mut ret)
+    };
+    if st.is_err() && st.0 != STATUS_BUFFER_OVERFLOW {
         return None;
     }
-    None
+    let b = as_bytes(&buf);
+    let size = u32_at(b, 8)?;
+    let kept = (size as usize).min(DATA_MAX);
+    Some(ValueData { value_type: u32_at(b, 4)?, size, data: b.get(12..12 + kept)?.to_vec() })
 }
 
 fn open_key(nt_path: &str, backup: bool) -> Option<Owned> {
@@ -2206,6 +2431,18 @@ pub(crate) mod tests {
         assert_eq!(read(&read_of(k.path().to_uppercase(), &[]), false).map(|v| v.size), Some(4));
     }
 
+    /// R-M7: a value of any size gives its type, full size and first 4 KiB.
+    #[test]
+    fn huge_values_are_read_without_reading_them_whole() {
+        let k = TestKey::new("huge");
+        let mut big = vec![0u8; 17 << 20];
+        big[..9].copy_from_slice(b"evil.exe\0");
+        k.set(k.hkey, &units("run"), REG_BINARY.0, &big);
+        let v = read(&read_of(k.path(), &units("run")), false).expect("read");
+        assert_eq!((v.value_type, v.size, v.data.len()), (REG_BINARY.0, 17 << 20, DATA_MAX));
+        assert_eq!(&v.data[..9], b"evil.exe\0");
+    }
+
     #[test]
     fn embedded_nuls_in_value_names_are_kept() {
         let k = TestKey::new("nul");
@@ -2328,7 +2565,7 @@ impl<D: Dir> Expander<D> {
 
     /// The long form of `nt_path`, or `None` if a short component cannot be
     /// expanded. Only `\Device\HarddiskVolume…` paths (volumes and shadow
-    /// copies) are expanded: a network redirector could stall the reader lane.
+    /// copies) are expanded: a network redirector could stall the expander lane.
     pub(crate) fn expand(&mut self, nt_path: &str, now: Instant) -> Option<String> {
         let (device, rest) = split_device(nt_path)?;
         if !device.to_ascii_lowercase().starts_with(r"\device\harddiskvolume") {
@@ -2370,30 +2607,31 @@ impl<D: Dir> Expander<D> {
         }
     }
 
+    /// Forgets everything (a lost invalidation, R-M3).
+    pub(crate) fn clear(&mut self) {
+        self.cache.clear();
+        self.by_long.clear();
+    }
+
     /// Something at `nt_path` changed (deleted, renamed away, written): forget
-    /// what the cache knows about it and below it. `nt_path` may itself hold
-    /// short components; they are resolved from the cache only.
+    /// what the cache knows about it and below it. Short components in
+    /// `nt_path` are resolved from the cache only; one the cache cannot
+    /// resolve could stand for any directory, so the whole cache is cleared.
     pub(crate) fn invalidate(&mut self, nt_path: &str) {
         let Some((device, rest)) = split_device(nt_path) else { return };
         let mut long = device.to_lowercase();
-        let mut whole = true;
-        let comps: Vec<&str> = rest.split('\\').filter(|c| !c.is_empty()).collect();
-        for (i, comp) in comps.iter().enumerate() {
-            let key = (long.clone(), comp.to_uppercase());
-            if i + 1 == comps.len() && is_short_component(comp) {
-                self.remove(&key);
+        for comp in rest.split('\\').filter(|c| !c.is_empty()) {
+            if !is_short_component(comp) {
+                long = format!(r"{long}\{}", comp.to_lowercase());
+                continue;
             }
-            match self.cache.get(&key) {
-                Some((l, _)) if is_short_component(comp) => long = format!(r"{long}\{}", l.to_lowercase()),
-                _ if is_short_component(comp) => {
-                    whole = false;
-                    break;
+            match self.cache.get(&(long.clone(), comp.to_uppercase())) {
+                Some((l, _)) => long = format!(r"{long}\{}", l.to_lowercase()),
+                None => {
+                    self.clear();
+                    return;
                 }
-                _ => long = format!(r"{long}\{}", comp.to_lowercase()),
             }
-        }
-        if !whole {
-            return;
         }
         if let Some(key) = self.by_long.get(&long).cloned() {
             self.remove(&key);
@@ -2618,6 +2856,33 @@ mod tests {
         assert_eq!(e.len(), 0);
     }
 
+    /// R-m1: a directory invalidated through its short name takes its subtree with it.
+    #[test]
+    fn invalidation_by_short_path_covers_the_subtree() {
+        let d = tree();
+        d.put(V, "SIBLIN~1", "Sibling Directory");
+        let mut e = Expander::new(d.clone());
+        let t = Instant::now();
+        e.expand(&format!(r"{V}\SECRET~1\LONGFI~1.TXT"), t);
+        e.expand(&format!(r"{V}\SIBLIN~1"), t);
+        assert_eq!(e.len(), 3);
+        e.invalidate(&format!(r"{V}\SECRET~1"));
+        assert_eq!(e.len(), 1, "the directory and the file below it; the sibling stays");
+    }
+
+    /// A short component the cache cannot resolve could be any directory.
+    #[test]
+    fn an_unresolvable_short_component_clears_the_cache() {
+        let d = tree();
+        let mut e = Expander::new(d.clone());
+        let t = Instant::now();
+        e.expand(&format!(r"{V}\SECRET~1\LONGFI~1.TXT"), t);
+        e.invalidate(&format!(r"{V}\SecretStuffAAA\x.txt"));
+        assert_eq!(e.len(), 2, "a long path resolves without the cache: nothing else is touched");
+        e.invalidate(&format!(r"{V}\UNSEEN~1\x"));
+        assert_eq!(e.len(), 0);
+    }
+
     #[test]
     fn invalidation_leaves_siblings_and_lookalikes() {
         let d = tree();
@@ -2644,7 +2909,11 @@ mod tests {
         let long = deep.to_string_lossy().to_string();
         let (dev, drive) = devices.iter().find(|(_, d)| long[..2].eq_ignore_ascii_case(d)).unwrap();
         let short = short_path(&long);
-        assert!(short.contains('~'), "8.3 names are on for this volume: {short}");
+        // On the runner TEMP is already `RUNNER~1`: check the new directory's own short name.
+        assert!(
+            short.split('\\').any(|c| c.to_ascii_uppercase().starts_with("LONGDI~")),
+            "8.3 names are made on this volume: {short}"
+        );
         let mut e = Expander::new(NtDir);
         let got = e.expand(&format!("{dev}{}", &short[drive.len()..]), Instant::now());
         // The temp directory itself may be spelled short in TEMP; compare the long forms.
@@ -2678,7 +2947,7 @@ mod tests {
 cargo test -p atlas-agent --lib
 cargo clippy -p atlas-agent --all-targets -- -D warnings -A dead-code
 ```
-Expected: 128 tests pass, 2 ignored, clippy clean.
+Expected: 135 tests pass, 2 ignored, clippy clean.
 ```powershell
 git add crates/atlas-agent
 git commit -m "feat(agent): registry value reads and 8.3 expansion with an invalidated cache"
@@ -2715,7 +2984,10 @@ use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_I
 use windows::Win32::Foundation::{DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE, UNICODE_STRING};
 use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_NT};
 use windows::Win32::System::IO::{CancelSynchronousIo, IO_STATUS_BLOCK};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, OpenProcess, PROCESS_DUP_HANDLE, SetThreadPriority,
+    THREAD_PRIORITY_BELOW_NORMAL,
+};
 
 use super::util::{Owned, aligned, as_bytes};
 
@@ -2917,6 +3189,10 @@ impl Helper {
         let thread = std::thread::Builder::new()
             .name("atlas-seeder-namer".into())
             .spawn(move || {
+                // SAFETY: lowers this thread's priority, as the seeder's.
+                unsafe {
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
                 for h in jobs {
                     let name = disk_file_name(&h);
                     // A failed send means the seeder gave up on this query; `h` closes here.
@@ -3110,11 +3386,23 @@ mod tests {
 //!   A name query is made once per address: every handle reaches the same object.
 //! - **Verification** (plan 1b-3b, finding F2): a handle can be closed and its
 //!   value reused for another object between the table read and the duplicate.
-//!   The duplicates are kept open while the table is read a second time, and a
-//!   name is kept only if the agent's duplicate sits at the address asked
-//!   about. `taken` is the QPC of that second read: every name was valid then.
+//!   After naming, the table is read a second time, and a name is kept only if
+//!   its handle still sits at the address asked about. `taken` is the QPC of
+//!   that second read.
+//!   - Keys: the agent's duplicates stay open until then, and the check is on
+//!     the duplicate itself: exact.
+//!   - Files: each duplicate is closed as soon as it is named, as §7.4 says, so
+//!     the agent never holds another process's file open for the whole pass
+//!     (R-M5): an owner's close then still releases its sharing and runs its
+//!     cleanup at once. The check is on the holder's (PID, handle). It misses
+//!     only a handle value reused twice in between with the second object at
+//!     the old address.
 //! - The start-up pass covers the whole table and is not charged to the CPU
-//!   budget; re-reads on a miss are, and wait while it is spent (counted).
+//!   budget. Re-reads on a miss are; while it is spent they wait, merged per
+//!   kind and served oldest first (R-M6). A re-read that had to wait counts
+//!   once in `seeder_deferred_rereads`.
+//! - When file seeding pauses (too many stuck name queries), it stays paused
+//!   for the rest of that snapshot: the remaining file addresses are unnamable.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -3159,11 +3447,36 @@ pub(crate) fn plan(table: &[Entry], type_index: u16, me: u32, asked: &[u64]) -> 
     (holders, own_only)
 }
 
-/// The addresses whose duplicate (agent handle value) still refers to them in
-/// the second read of the table.
-pub(crate) fn verified(after: &[Entry], me: u32, dups: impl Iterator<Item = (u64, u64)>) -> HashSet<u64> {
-    let mine: HashMap<u64, u64> = after.iter().filter(|e| e.pid == me).map(|e| (e.handle, e.object)).collect();
-    dups.filter(|(address, handle)| mine.get(handle) == Some(address)).map(|(a, _)| a).collect()
+/// The addresses whose handle, given as (address, PID, handle value), still
+/// refers to them in the second read of the table.
+pub(crate) fn verified(after: &[Entry], handles: impl Iterator<Item = (u64, u32, u64)>) -> HashSet<u64> {
+    let by_handle: HashMap<(u32, u64), u64> = after.iter().map(|e| ((e.pid, e.handle), e.object)).collect();
+    handles.filter(|(address, pid, handle)| by_handle.get(&(*pid, *handle)) == Some(address)).map(|(a, ..)| a).collect()
+}
+
+/// Re-reads waiting for the CPU budget: one entry per kind, with the
+/// addresses merged, served oldest first so neither kind starves (R-M6).
+#[derive(Debug, Default)]
+pub(crate) struct Waiting(VecDeque<(HandleKind, BTreeSet<u64>)>);
+
+impl Waiting {
+    /// Adds the addresses; true if `kind` was not waiting already.
+    pub(crate) fn add(&mut self, kind: HandleKind, addresses: Vec<u64>) -> bool {
+        if let Some((_, set)) = self.0.iter_mut().find(|(k, _)| *k == kind) {
+            set.extend(addresses);
+            return false;
+        }
+        self.0.push_back((kind, addresses.into_iter().collect()));
+        true
+    }
+
+    pub(crate) fn next(&mut self) -> Option<(HandleKind, Vec<u64>)> {
+        self.0.pop_front().map(|(k, set)| (k, set.into_iter().collect()))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// CPU spent per sliding window (§7.4).
@@ -3266,11 +3579,14 @@ impl Seeder {
         };
         let (holders, own_only) = plan(&before, type_index, self.me, &asked);
         let mut processes: HashMap<u32, Option<Owned>> = HashMap::new();
-        let mut held: Vec<(Named, Owned)> = Vec::new();
+        // A name, the (PID, handle) to verify it by, and for keys the duplicate kept open until then.
+        let mut held: Vec<(Named, (u32, u64), Option<Owned>)> = Vec::new();
         let mut unnamable: Vec<(u64, u32)> = own_only.into_iter().map(|a| (a, self.me)).collect();
+        let mut paused = false;
         for (address, hs) in holders {
             let owner = hs[0].pid;
-            if kind == HandleKind::File && self.namer.paused() {
+            if kind == HandleKind::File && (paused || self.namer.paused()) {
+                paused = true;
                 unnamable.push((address, owner));
                 continue;
             }
@@ -3281,9 +3597,10 @@ impl Seeder {
                 };
                 let Some(dup) = duplicate(p, e.handle) else { continue };
                 answer = match kind {
-                    HandleKind::Key => object_name(&dup).map(|n| (n, dup)),
+                    HandleKind::Key => object_name(&dup).map(|n| (n, (self.me, dup.raw().0 as u64), Some(dup))),
                     HandleKind::File => match self.namer.name(dup) {
-                        FileName::Named(n, dup) => Some((n, dup)),
+                        // The duplicate closes here: verified by the holder's handle.
+                        FileName::Named(n, _dup) => Some((n, (e.pid, e.handle), None)),
                         FileName::Unnamable => None,
                         FileName::TimedOut => {
                             c.seeder_handles_timed_out.fetch_add(1, Ordering::Relaxed);
@@ -3294,7 +3611,7 @@ impl Seeder {
                 break;
             }
             match answer {
-                Some((name, dup)) => held.push((Named { address, owner_pid: owner, name }, dup)),
+                Some((name, by, dup)) => held.push((Named { address, owner_pid: owner, name }, by, dup)),
                 None => unnamable.push((address, owner)),
             }
         }
@@ -3302,9 +3619,9 @@ impl Seeder {
         let taken = qpc_now();
         let after = table()?;
         c.seeder_table_reads.fetch_add(1, Ordering::Relaxed);
-        let ok = verified(&after, self.me, held.iter().map(|(n, d)| (n.address, d.raw().0 as u64)));
+        let ok = verified(&after, held.iter().map(|(n, (pid, h), _)| (n.address, *pid, *h)));
         let mut named = Vec::with_capacity(held.len());
-        for (n, _dup) in held {
+        for (n, _, _dup) in held {
             if ok.contains(&n.address) {
                 named.push(n);
             } else {
@@ -3330,9 +3647,7 @@ pub(crate) fn run(
     }
     let counters = seeder.counters.clone();
     let mut budget = Budget::new(cfg.seeder_cpu, cfg.seeder_cpu_window);
-    // Re-reads waiting for the budget, merged per kind.
-    let mut waiting: BTreeMap<u8, BTreeSet<u64>> = BTreeMap::new();
-    let kind_of = |k: u8| if k == 0 { HandleKind::Key } else { HandleKind::File };
+    let mut waiting = Waiting::default();
     loop {
         let job = if waiting.is_empty() {
             jobs.recv().map_err(|_| RecvTimeoutError::Disconnected)
@@ -3349,22 +3664,18 @@ pub(crate) fn run(
                 }
             }
             Ok((kind, addresses)) => {
-                let k = u8::from(kind == HandleKind::File);
-                if !budget.allows(Instant::now()) {
+                let new = waiting.add(kind, addresses);
+                if new && !budget.allows(Instant::now()) {
                     counters.seeder_deferred_rereads.fetch_add(1, Ordering::Relaxed);
                 }
-                waiting.entry(k).or_default().extend(addresses);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        while let Some(k) = waiting.keys().next().copied() {
-            if !budget.allows(Instant::now()) {
-                break;
-            }
-            let addresses: Vec<u64> = waiting.remove(&k).unwrap_or_default().into_iter().collect();
+        while !waiting.is_empty() && budget.allows(Instant::now()) {
+            let Some((kind, addresses)) = waiting.next() else { break };
             let cpu = thread_cpu();
-            let snapshot = seeder.snapshot(kind_of(k), addresses);
+            let snapshot = seeder.snapshot(kind, addresses);
             budget.charge(Instant::now(), thread_cpu().saturating_sub(cpu));
             if let Some(s) = snapshot
                 && replies.send(Reply::Snapshot(s)).is_err()
@@ -3407,10 +3718,27 @@ mod tests {
     }
 
     #[test]
-    fn verification_needs_our_duplicate_at_the_address() {
-        let after = [e(0xA, ME, 0x40, 1), e(0xB, ME, 0x44, 1), e(0xC, 7, 0x48, 1)];
-        let ok = verified(&after, ME, [(0xA, 0x40), (0xB, 0x48), (0xC, 0x48), (0xD, 0x4c)].into_iter());
-        assert_eq!(ok, HashSet::from([0xA]));
+    fn verification_needs_the_handle_still_at_the_address() {
+        let after = [e(0xA, ME, 0x40, 1), e(0xB, ME, 0x44, 1), e(0xC, 7, 0x48, 1), e(0xD, 9, 0x50, 1)];
+        // Keys: the agent's duplicate. Files: the holder's handle. The PID counts:
+        // 0xD is at handle 0x50 of process 9, not of process 7.
+        let asked = [(0xA, ME, 0x40), (0xB, ME, 0x48), (0xC, 7, 0x48), (0xD, 7, 0x50), (0xE, 7, 0x4c)];
+        assert_eq!(verified(&after, asked.into_iter()), HashSet::from([0xA, 0xC]));
+    }
+
+    /// R-M6: waiting re-reads are served oldest first, so a stream of key
+    /// misses cannot starve file re-reads.
+    #[test]
+    fn waiting_rereads_are_served_oldest_first() {
+        let mut w = Waiting::default();
+        assert!(w.add(HandleKind::File, vec![1]));
+        assert!(w.add(HandleKind::Key, vec![2]));
+        assert!(!w.add(HandleKind::File, vec![3]), "merged into the waiting file re-read");
+        assert_eq!(w.next(), Some((HandleKind::File, vec![1, 3])));
+        assert!(w.add(HandleKind::File, vec![4]), "a new wait, behind the key re-read");
+        assert_eq!(w.next(), Some((HandleKind::Key, vec![2])));
+        assert_eq!(w.next(), Some((HandleKind::File, vec![4])));
+        assert!(w.is_empty() && w.next().is_none());
     }
 
     #[test]
@@ -3482,6 +3810,13 @@ mod tests {
         fn names_a_key_and_a_file_another_process_holds() {
             let k = TestKey::new("seeder");
             let path = std::env::temp_dir().join(format!("atlas-seeded-{}.txt", std::process::id()));
+            struct Remove(std::path::PathBuf);
+            impl Drop for Remove {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let _cleanup = Remove(path.clone()); // dropped after `f`, on success or failure
             let f = std::fs::File::create(&path).unwrap();
             let (kh, fh) = (HANDLE(k.hkey.0), HANDLE(f.as_raw_handle()));
             let holder = Holder::new(&[kh, fh]);
@@ -3508,7 +3843,6 @@ mod tests {
             assert!(snap.named.is_empty());
             assert_eq!(snap.unnamable, [(ka, std::process::id())]);
             drop(f);
-            std::fs::remove_file(&path).unwrap();
         }
 
         #[test]
@@ -3617,7 +3951,7 @@ mod tests {
 cargo test -p atlas-agent --lib
 cargo clippy -p atlas-agent --all-targets -- -D warnings -A dead-code
 ```
-Expected: 136 tests pass, 5 ignored, clippy clean.
+Expected: 144 tests pass, 5 ignored, clippy clean.
 ```powershell
 git add crates/atlas-agent
 git commit -m "feat(agent): the seeder: no-access duplicates, verified snapshots, CPU budget"
@@ -3636,48 +3970,60 @@ git commit -m "feat(agent): the seeder: no-access duplicates, verified snapshots
 //! The services' threads and the routing of [`Request`]s to them (sensor spec
 //! §3.2 [4] and [8]; plan 1b-3b, D5).
 //!
-//! - **Hash workers** (2, below normal): `Enrich`.
-//! - **Reader lane** (1): value reads on both paths, 8.3 expansion, and the
-//!   expansion cache's invalidations, in arrival order (D4).
+//! - **Hash workers** (2, below normal): `Enrich`, and the hash cache's
+//!   invalidations, so the pipeline thread never takes the cache's lock.
+//! - **Reader lane** (1): value reads, on the ordered path and the fast path.
+//!   It does no file I/O, so a slow directory never delays a value read (R-M2).
+//! - **Expander lane** (1): 8.3 expansion, and the expansion cache's
+//!   invalidations in arrival order (D4).
 //! - **Seeder** (1, below normal): `Seed`, when `SeDebugPrivilege` is available.
 //!
-//! Lanes are bounded and never block the caller: a full lane drops the
-//! request (counted), and its event waits out its deadline (clarification 25).
+//! Lanes are bounded and never block the caller. A full lane drops the request
+//! and counts it: a dropped `Enrich`, `ReadValue`, `Expand` or `Seed` costs its
+//! event's deadline (clarification 25). A dropped invalidation of the
+//! expansion cache sets a flag, and the expander clears its whole cache before
+//! its next job (R-M3). The hash cache needs no such care: its key holds the USN.
 //! Replies come back on one channel, which the driver (plan 1b-3c) feeds to
 //! `Pipeline::reply`.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
 
-use super::expand::{Expander, NtDir};
+use super::expand::{Dir, Expander, NtDir};
 use super::hash::{Enricher, HashCache};
 use super::seeder::{self, Seeder};
 use super::{privilege, value};
+use crate::completion::PendingId;
 use crate::config::ServiceConfig;
 use crate::counters::ServiceCounters;
 use crate::intake::FastRead;
 use crate::services::{EarlyKey, HandleKind, Reply, Request, ValueRead};
 
-enum ReaderJob {
-    Read(crate::completion::PendingId, ValueRead),
-    Early(EarlyKey, ValueRead),
-    Expand(crate::completion::PendingId, u8, String),
+enum HashJob {
+    Enrich(PendingId, String),
     Invalidate(String),
 }
 
-struct HashJob {
-    id: crate::completion::PendingId,
-    nt_path: String,
+enum ReaderJob {
+    Read(PendingId, ValueRead),
+    Early(EarlyKey, ValueRead),
+}
+
+enum ExpandJob {
+    Expand(PendingId, u8, String),
+    Invalidate(String),
 }
 
 pub struct Services {
     hash: SyncSender<HashJob>,
-    cache: Arc<Mutex<HashCache>>,
     reader: SyncSender<ReaderJob>,
+    expander: SyncSender<ExpandJob>,
+    /// Set when an expansion-cache invalidation was dropped (R-M3).
+    invalidation_lost: Arc<AtomicBool>,
     seeder: Option<SyncSender<(HandleKind, Vec<u64>)>>,
     replies: Receiver<Reply>,
     counters: Arc<ServiceCounters>,
@@ -3688,10 +4034,15 @@ impl Services {
     /// `SeDebugPrivilege` for the seeder; without them reads use a normal open
     /// and seeding is off ([`Services::seeding`]).
     pub fn start(cfg: &ServiceConfig) -> Services {
+        Self::start_with(cfg, NtDir)
+    }
+
+    /// As [`Services::start`], with the expander's directory lookups given (tests).
+    pub(crate) fn start_with<D: Dir + Send + 'static>(cfg: &ServiceConfig, dir: D) -> Services {
         let counters = Arc::new(ServiceCounters::default());
         let (reply_tx, replies) = channel();
-        let cache = Arc::new(Mutex::new(HashCache::new(cfg.hash_cache_cap)));
 
+        let cache = Arc::new(Mutex::new(HashCache::new(cfg.hash_cache_cap)));
         let (hash, hash_rx) = sync_channel::<HashJob>(cfg.lane_cap);
         let hash_rx = Arc::new(Mutex::new(hash_rx));
         for i in 0..cfg.hash_workers.max(1) {
@@ -3711,6 +4062,14 @@ impl Services {
             .spawn(move || reader_lane(reader_rx, &tx, backup))
             .expect("spawn the reader lane");
 
+        let invalidation_lost = Arc::new(AtomicBool::new(false));
+        let (expander, expand_rx) = sync_channel::<ExpandJob>(cfg.lane_cap);
+        let (tx, lost) = (reply_tx.clone(), invalidation_lost.clone());
+        std::thread::Builder::new()
+            .name("atlas-expander".into())
+            .spawn(move || expander_lane(expand_rx, &tx, Expander::new(dir), &lost))
+            .expect("spawn the expander lane");
+
         let seeder = Seeder::new(cfg, counters.clone()).map(|s| {
             let (seed_tx, seed_rx) = sync_channel(cfg.lane_cap);
             let (tx, cfg) = (reply_tx.clone(), cfg.clone());
@@ -3721,7 +4080,7 @@ impl Services {
             seed_tx
         });
 
-        Services { hash, cache, reader, seeder, replies, counters }
+        Services { hash, reader, expander, invalidation_lost, seeder, replies, counters }
     }
 
     /// Whether the seeder runs. If not, the driver sets `Config::seed_on_start`
@@ -3739,22 +4098,31 @@ impl Services {
         self.replies.try_iter()
     }
 
-    /// Hands a request to its lane. Never blocks.
+    /// Hands a request to its lane. Never blocks, and takes no lock.
     pub fn submit(&self, r: Request) {
-        let sent = match r {
-            Request::Enrich { id, nt_path, .. } => ok(self.hash.try_send(HashJob { id, nt_path })),
+        match r {
+            Request::Enrich { id, nt_path, .. } => self.count(self.hash.try_send(HashJob::Enrich(id, nt_path))),
             Request::InvalidateHash { nt_path } => {
-                self.cache.lock().expect("hash cache").invalidate(&nt_path);
-                ok(self.reader.try_send(ReaderJob::Invalidate(nt_path)))
+                self.count(self.hash.try_send(HashJob::Invalidate(nt_path.clone())));
+                if self.expander.try_send(ExpandJob::Invalidate(nt_path)).is_err() {
+                    self.invalidation_lost.store(true, Ordering::Release);
+                    self.counters.service_queue_drops.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Request::ReadValue { id, read } => ok(self.reader.try_send(ReaderJob::Read(id, read))),
-            Request::Expand { id, slot, nt_path } => ok(self.reader.try_send(ReaderJob::Expand(id, slot, nt_path))),
-            Request::Seed { kind, addresses } => match &self.seeder {
-                Some(s) => ok(s.try_send((kind, addresses))),
-                None => true,
-            },
-        };
-        if !sent {
+            Request::ReadValue { id, read } => self.count(self.reader.try_send(ReaderJob::Read(id, read))),
+            Request::Expand { id, slot, nt_path } => {
+                self.count(self.expander.try_send(ExpandJob::Expand(id, slot, nt_path)))
+            }
+            Request::Seed { kind, addresses } => {
+                if let Some(s) = &self.seeder {
+                    self.count(s.try_send((kind, addresses)));
+                }
+            }
+        }
+    }
+
+    fn count<T>(&self, sent: Result<(), TrySendError<T>>) {
+        if sent.is_err() {
             self.counters.service_queue_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -3764,15 +4132,11 @@ impl Services {
     pub fn fast_read(&self) -> FastRead {
         let (tx, counters) = (self.reader.clone(), self.counters.clone());
         Box::new(move |key, read| {
-            if !ok(tx.try_send(ReaderJob::Early(key, read))) {
+            if tx.try_send(ReaderJob::Early(key, read)).is_err() {
                 counters.service_queue_drops.fetch_add(1, Ordering::Relaxed);
             }
         })
     }
-}
-
-fn ok<T>(r: Result<(), TrySendError<T>>) -> bool {
-    r.is_ok()
 }
 
 fn hash_worker(
@@ -3792,9 +4156,16 @@ fn hash_worker(
             Ok(j) => j,
             Err(_) => return,
         };
-        let r = enricher.enrich(&job.nt_path, cache);
+        let (id, nt_path) = match job {
+            HashJob::Enrich(id, p) => (id, p),
+            HashJob::Invalidate(p) => {
+                cache.lock().expect("hash cache").invalidate(&p);
+                continue;
+            }
+        };
+        let r = enricher.enrich(&nt_path, cache);
         counters.hash_cache_evictions.store(cache.lock().expect("hash cache").evictions, Ordering::Relaxed);
-        let reply = Reply::Enriched { id: job.id, hashes: r.hashes, signature: r.signature, error: r.error };
+        let reply = Reply::Enriched { id, hashes: r.hashes, signature: r.signature, error: r.error };
         if replies.send(reply).is_err() {
             return;
         }
@@ -3802,20 +4173,12 @@ fn hash_worker(
 }
 
 fn reader_lane(jobs: Receiver<ReaderJob>, replies: &Sender<Reply>, backup: bool) {
-    let mut expander = Expander::new(NtDir);
     for job in jobs {
         let reply = match job {
             ReaderJob::Read(id, read) => Reply::ValueRead { id, result: value::read(&read, backup) },
             ReaderJob::Early(event, read) => {
                 let result = value::read(&read, backup);
                 Reply::EarlyRead { event, read, result }
-            }
-            ReaderJob::Expand(id, slot, nt) => {
-                Reply::Expanded { id, slot, long_path: expander.expand(&nt, Instant::now()) }
-            }
-            ReaderJob::Invalidate(nt) => {
-                expander.invalidate(&nt);
-                continue;
             }
         };
         if replies.send(reply).is_err() {
@@ -3824,10 +4187,34 @@ fn reader_lane(jobs: Receiver<ReaderJob>, replies: &Sender<Reply>, backup: bool)
     }
 }
 
+fn expander_lane<D: Dir>(
+    jobs: Receiver<ExpandJob>,
+    replies: &Sender<Reply>,
+    mut expander: Expander<D>,
+    lost: &AtomicBool,
+) {
+    for job in jobs {
+        if lost.swap(false, Ordering::Acquire) {
+            expander.clear();
+        }
+        match job {
+            ExpandJob::Expand(id, slot, nt) => {
+                let reply = Reply::Expanded { id, slot, long_path: expander.expand(&nt, Instant::now()) };
+                if replies.send(reply).is_err() {
+                    return;
+                }
+            }
+            ExpandJob::Invalidate(nt) => expander.invalidate(&nt),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::EnrichTarget;
+    use std::collections::HashMap;
+    use std::sync::Condvar;
     use std::time::Duration;
     use windows::Win32::System::Registry::REG_DWORD;
 
@@ -3912,6 +4299,86 @@ mod tests {
             assert_eq!(s.counters().service_queue_drops.load(Ordering::Relaxed), 0);
         }
     }
+
+    /// Directory lookups from a table, which wait while the gate is closed:
+    /// a stand-in for a directory whose query stalls (a Cloud Files
+    /// placeholder, a redirector).
+    /// (closed, short → long), and the gate's condition.
+    type Gate = (Mutex<(bool, HashMap<String, String>)>, Condvar);
+
+    #[derive(Clone, Default)]
+    struct GateDir(Arc<Gate>);
+
+    impl GateDir {
+        fn set(&self, short: &str, long: &str) {
+            self.0.0.lock().unwrap().1.insert(short.to_uppercase(), long.into());
+        }
+        fn close(&self) {
+            self.0.0.lock().unwrap().0 = true;
+        }
+        fn open(&self) {
+            self.0.0.lock().unwrap().0 = false;
+            self.0.1.notify_all();
+        }
+    }
+
+    impl Dir for GateDir {
+        fn long_name(&mut self, _dir: &str, component: &str) -> Option<String> {
+            let (lock, cv) = &*self.0;
+            let g = cv.wait_while(lock.lock().unwrap(), |s| s.0).unwrap();
+            g.1.get(&component.to_uppercase()).cloned()
+        }
+    }
+
+    const V: &str = r"\Device\HarddiskVolume3";
+
+    fn expanded(replies: &[Reply], want: u64) -> Option<Option<String>> {
+        replies.iter().find_map(|r| match r {
+            Reply::Expanded { id, long_path, .. } if *id == want => Some(long_path.clone()),
+            _ => None,
+        })
+    }
+
+    /// R-M2: a value read is answered while a directory lookup is stalled.
+    #[test]
+    fn value_reads_never_wait_behind_directory_lookups() {
+        let dir = GateDir::default();
+        dir.close();
+        let s = Services::start_with(&ServiceConfig::default(), dir.clone());
+        let k = TestKey::new("lanes");
+        k.set(k.hkey, &units("v"), REG_DWORD.0, &1u32.to_le_bytes());
+        s.submit(Request::Expand { id: 1, slot: 0, nt_path: format!(r"{V}\STALLE~1\x") });
+        std::thread::sleep(Duration::from_millis(50));
+        s.submit(Request::ReadValue { id: 2, read: ValueRead { key_path: k.path(), value_name: units("v") } });
+        let got = wait(&s, 1);
+        assert!(matches!(got.as_slice(), [Reply::ValueRead { id: 2, result: Some(_) }]), "{got:?}");
+        dir.open();
+        assert!(expanded(&wait(&s, 1), 1).is_some(), "the expansion still completes");
+    }
+
+    /// R-M3: when the expander lane is full, a dropped invalidation clears the
+    /// expansion cache before the next job, so a reused short name is not
+    /// answered from the cache.
+    #[test]
+    fn a_lost_invalidation_clears_the_expansion_cache() {
+        let dir = GateDir::default();
+        dir.set("SECRET~1", "SecretStuffAAA");
+        let cfg = ServiceConfig { lane_cap: 1, ..ServiceConfig::default() };
+        let s = Services::start_with(&cfg, dir.clone());
+        s.submit(Request::Expand { id: 1, slot: 0, nt_path: format!(r"{V}\SECRET~1") });
+        assert_eq!(expanded(&wait(&s, 1), 1), Some(Some(format!(r"{V}\SecretStuffAAA"))));
+
+        dir.close();
+        s.submit(Request::Expand { id: 2, slot: 0, nt_path: format!(r"{V}\OTHER~1") }); // the lane blocks on it
+        std::thread::sleep(Duration::from_millis(100));
+        s.submit(Request::Expand { id: 3, slot: 0, nt_path: format!(r"{V}\SECRET~1") }); // fills the queue
+        s.submit(Request::InvalidateHash { nt_path: format!(r"{V}\SecretStuffAAA") }); // dropped
+        assert!(s.counters().service_queue_drops.load(Ordering::Relaxed) >= 1);
+        dir.set("SECRET~1", "SecretStuffBBB"); // the short name now belongs to another directory
+        dir.open();
+        let got = wait(&s, 2);
+        assert_eq!(expanded(&got, 3), Some(Some(format!(r"{V}\SecretStuffBBB"))), "{got:?}");
+    }
 }
 ```
 
@@ -3957,10 +4424,10 @@ cargo clippy -p atlas-agent -p atlas-etw --all-targets --target x86_64-unknown-l
 cargo test --workspace
 actionlint .github/workflows/ci.yml
 ```
-Expected: clean, with no `dead_code` allowance; 322 tests pass and 6 are ignored (139 and 5 in `atlas-agent`).
+Expected: clean, with no `dead_code` allowance; 332 tests pass and 6 are ignored (149 and 5 in `atlas-agent`).
 ```powershell
 git add crates/atlas-agent .github
-git commit -m "feat(agent): Services: hash workers, reader lane and seeder behind bounded lanes; agent-live CI job"
+git commit -m "feat(agent): Services: hash workers, reader and expander lanes, seeder; agent-live CI job"
 ```
 
 ### Task 7: The elevated run on the host (the user)
@@ -4025,7 +4492,7 @@ Check that it parses in both `powershell.exe` and `pwsh` before handing it over.
 
 - [ ] **Step 2: The user runs it** from an elevated PowerShell: `& C:\Users\jakef\Desktop\atlas-edr\spikes\run-1b3b-elevated.ps1`.
 
-Expected: `PASS: test result: ok. 144 passed; 0 failed; 0 ignored`, and in the log the start-up pass counts for keys and files and `compared N key handles` (N > 100, no differences). Claude reads the log from `spikes\results\1b3b-elevated\` and records the numbers in the PR.
+Expected: `PASS: test result: ok. 154 passed; 0 failed; 0 ignored`, and in the log the start-up pass counts for keys and files and `compared N key handles` (N > 100, no differences). Claude reads the log from `spikes\results\1b3b-elevated\` and records the numbers in the PR.
 
 ### Task 8: Documentation
 
@@ -4059,4 +4526,44 @@ git commit -m "docs(1): plan 1b-3b clarifications, findings and schema reference
 
 ## Review Log
 
-(Filled in after the independent review.)
+**Independent review, 2026-10-06.** A separate agent read the plan, the spec, 1b-3a's interfaces and pipeline, and all of `win/`. It confirmed findings with 8 probes, run unelevated in a copy of the worktree. It found no blocking defect. Every finding below was fixed in the code embedded above unless noted. Each fix with a pinned test was checked by reverting it: its test fails (verification note).
+
+**Major**
+- **R-M1, a writer that keeps its handle open defeats the hash cache.** NTFS writes a new USN record only when a new reason appears for an open file. So writes through a handle that stays open (Herpaderping-style) left the USN, and the cache key, unchanged, and a Module Load or Launch got the earlier content's hash. Probe: overwrite, hash, overwrite again through the same handle, hash: the stale hash came from the cache. Fixed (clarification 7): no cache lookup or insert while any handle can write the file; also, cache only if the USN is unchanged after the reads. Test: `files_open_for_writing_are_never_served_from_the_cache`.
+- **R-M2, directory I/O shared the reader lane with value reads.** `NtDir` has no timeout, and a Cloud Files placeholder (any user can register a sync root) or a directory symbolic link to a share can stall a listing for up to about 60 s. Every Run-key value read queued behind it would then miss its deadline. Fixed: expansion has its own lane (clarification 3). The residual stall of expansions is a known limitation (clarification 14). Test: `value_reads_never_wait_behind_directory_lookups`, with a directory lookup held open.
+- **R-M3, a full lane dropped invalidations silently.** A flood of fast-path reads (any process can write HKCU) could fill the shared lane, and a dropped invalidation left a reused short name cached for up to 60 s: the case D4 rejected. Fixed: invalidations go through the expander lane, and one that is dropped sets a flag that clears the cache before the next job (clarification 3). The counter's description was corrected. Test: `a_lost_invalidation_clears_the_expansion_cache`.
+- **R-M4, account lookups stacked up.** Behind one stuck lookup, each new SID still waited the full 100 ms: 10 cost the pipeline thread 1.1 s (probe). Fixed: while a lookup is overdue, new ones are queued without waiting (clarification 8). Test: `one_stuck_lookup_does_not_make_every_new_sid_wait`.
+- **R-M5, F2 held other processes' file objects open for the whole pass** (about 0.5 s on the host). While a duplicate is open, an owner's close does not release its sharing or run its cleanup, and §7.4 says duplicates are closed at once. Fixed: file duplicates close as soon as they are named, and the second read checks the holder's (PID, handle) instead (clarification 4). Keys keep the exact check. Test: `verification_needs_the_handle_still_at_the_address` (and the elevated seeding tests, re-run).
+- **R-M6, key re-reads could starve file re-reads** under the CPU budget: the waiting map always served keys first. Fixed: oldest first (clarification 4). Test: `waiting_rereads_are_served_oldest_first`.
+- **R-M7, values over 16 MiB were not read.** Padding a Run value past 16 MiB made it unavailable, and large values forced large allocations. The probe showed `STATUS_BUFFER_OVERFLOW` already returns the type, full size and first 4 KiB. Fixed: one query, accepting the partial result (clarification 10). Test: `huge_values_are_read_without_reading_them_whole` (17 MiB).
+
+**Minor**
+- Fixed:
+  - R-m1: invalidating a directory through its short name left its subtree cached; an unresolvable short component now clears the cache. Tests: `invalidation_by_short_path_covers_the_subtree`, `an_unresolvable_short_component_clears_the_cache`.
+  - R-m2: catalogs were searched by SHA-256 only. The probe found 18 files listed only in SHA-1 catalogs, one reported `Unsigned`. Now SHA-256, then SHA-1; checked on the host (verification note).
+  - R-m4: account failures were cached until the cache filled; now retried after 10 minutes. Test: `failures_are_retried_after_their_ttl`.
+  - R-m5: the pipeline thread took the hash cache's lock for invalidations; they now go through the hash lane.
+  - R-m6: a pause in file seeding now holds for the rest of the snapshot, as clarification 4 says.
+  - R-m7: `seeder_deferred_rereads` counts each waiting re-read once.
+  - R-m9: a compile-time guard for 64-bit Windows.
+  - R-m10: `device.json`'s temporary file has a random name, so a stale one never conflicts.
+  - R-m12: tests left files in `%TEMP%` (26 directories and a seeded file on the host, now removed); each test now removes what it creates, on failure too.
+  - R-m13: the 8.3 test checks the new directory's own short name; on the runner `TEMP` alone was already short.
+  - R-m14: `ServiceConfig::check` refuses zero settings. Test: `service_settings_are_checked`.
+  - R-m15: the seeder's helper threads run below normal priority, as the seeder does.
+- Documented instead of changed:
+  - R-m3: a signature check above the hash size cap reads the whole file (clarification 7).
+  - R-m8: what `taken` covers (clarification 4).
+  - R-m11: shutdown and the stuck-helper gauge (Interfaces for later plans).
+
+**Sound, per the review:**
+- **Structure offsets:** telemetry, `SYSTEM_PROCESS_INFORMATION`, `KUSER_SHARED_DATA.BootId`, USN records V2/V3, `FILE_BOTH_DIR_INFORMATION`, handle entries.
+- **Expander:** wildcards in a component never yield a wrong long name; the range and look-alike logic of invalidation.
+- **Seeder:** the coverage contract and owner rules.
+- **`FileNamer`:** no stale replies, and duplicates closed on every path.
+- **Signatures:** `WinVerifyTrust` state and catalog contexts are always released.
+- **Value reads:** `OBJ_OPENLINK`; counted names with embedded NULs.
+- **Requests:** at most one reply per request, or a counted drop.
+- **Lifetimes:** buffers passed to the system outlive their calls.
+- **`device.json`:** the cross-process write is atomic.
+
