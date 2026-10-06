@@ -61,7 +61,6 @@ pub struct Counters {
     pub flow_table_evictions: u64,
     pub file_op_failed: u64,
     pub pending_overflow: u64,
-    pub seeder_deferred: u64,
     /// Events dropped at emission because their actor is the agent (§5.5).
     pub self_filtered: u64,
 }
@@ -95,4 +94,27 @@ impl IntakeCounters {
     pub fn get(c: &AtomicU64) -> u64 {
         c.load(Ordering::Relaxed)
     }
+}
+
+/// Counters kept by the Windows services (plan 1b-3b), shared with their
+/// threads. Each one is a Sensor Health field; `seeder_stuck_helpers` is a
+/// gauge, the rest count occurrences.
+#[derive(Debug, Default)]
+pub struct ServiceCounters {
+    /// Requests dropped because their lane was full (`housekeeping.service_queue_drops`).
+    /// A dropped `Enrich`, `ReadValue`, `Expand` or `Seed` costs its event's
+    /// deadline; a dropped invalidation clears the expansion cache (R-M3).
+    pub service_queue_drops: AtomicU64,
+    /// Hash results dropped when the cache started over (`housekeeping.hash_cache_evictions`).
+    pub hash_cache_evictions: AtomicU64,
+    pub seeder_handles_named: AtomicU64,
+    /// Covered addresses answered as unnamable, including timed-out ones.
+    pub seeder_handles_failed: AtomicU64,
+    pub seeder_handles_timed_out: AtomicU64,
+    /// Two per snapshot: the read, and the verifying read (F2).
+    pub seeder_table_reads: AtomicU64,
+    /// Re-reads that had to wait for the CPU budget, once each (§7.4).
+    pub seeder_deferred_rereads: AtomicU64,
+    /// Gauge, updated at the end of each snapshot.
+    pub seeder_stuck_helpers: AtomicU64,
 }
