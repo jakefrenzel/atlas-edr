@@ -101,6 +101,9 @@ message SensorHousekeeping {
   // Gauges.
   optional uint64 seeder_stuck_helpers = 16;
   optional uint64 seeder_negative_cache_size = 17;
+  // Requests to the agent's service threads dropped because their queue was full. A dropped
+  // work request costs its event's deadline; a dropped invalidation clears the 8.3 name cache.
+  optional uint64 service_queue_drops = 18;
 }
 
 // The agent's own resource use.

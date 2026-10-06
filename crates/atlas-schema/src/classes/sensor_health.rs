@@ -195,6 +195,8 @@ counter_group!(
         seeder_stuck_helpers: Option<u64>,
         /// Gauge.
         seeder_negative_cache_size: Option<u64>,
+        /// Requests dropped because their service lane was full.
+        service_queue_drops: Option<u64>,
     }
 );
 
