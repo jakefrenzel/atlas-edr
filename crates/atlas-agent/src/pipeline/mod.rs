@@ -248,6 +248,7 @@ impl<L: Lookups> Pipeline<L> {
             R::FileClose(x) => self.on_file_close(&h, x),
             R::FileWrite(w) => self.on_file_write(&h, w.file_object),
             R::FileSetInfo(i) => self.on_file_set_info(&h, i),
+            R::FileSetDelete(_) => {} // the delete logic comes in Task 3
             R::FileOpEnd(o) => self.on_file_op_end(&h, o),
             R::FileDeletePath(p) => self.on_file_delete_path(&h, p),
             R::FileRenamePath(p) => self.on_file_rename_path(&h, p),

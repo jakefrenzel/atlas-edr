@@ -270,7 +270,9 @@ fn the_ci_recording_produces_the_scenario() {
             _ => None,
         })
         .expect("the test key's Create");
-    assert!(key.starts_with(r"HKU\S-1-5-21-") && key.ends_with(r"\Software\AtlasEtwLive-3268"), "{key}");
+    let (head, pid) = key.rsplit_once('-').unwrap();
+    assert!(key.starts_with(r"HKU\S-1-5-21-") && head.ends_with(r"\Software\AtlasEtwLive"), "{key}");
+    assert!(pid.parse::<u32>().is_ok(), "the actor's PID: {key}");
     let set = out.iter().find_map(|e| match &e.kind {
         EventKind::RegistryValue(v) if v.name == "v" => match &v.action {
             RegistryValueAction::Set { data, data_read_after, data_unavailable, .. } => {

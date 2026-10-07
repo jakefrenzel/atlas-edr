@@ -206,15 +206,18 @@ pub struct FileWrite {
     pub extra_flags: u32,
 }
 
-/// Kernel-File 17 `SetInformation`.
+/// Kernel-File 17 `SetInformation` and 18 `SetDelete`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSetInfo {
     pub irp: u64,
     pub file_object: u64,
     pub file_key: u64,
+    /// For 18, 1 when the delete disposition is set and 0 when it is cleared
+    /// (plan 1b-3c, verified on the host for both disposition classes).
     pub extra_information: u64,
     pub issuing_tid: u32,
-    /// `FILE_INFORMATION_CLASS`: 4 basic (timestamps, attributes), 19 end of file.
+    /// `FILE_INFORMATION_CLASS`: 4 basic (timestamps, attributes), 19 end of file;
+    /// for 18, 13 `FileDispositionInformation` or 64 `FileDispositionInformationEx`.
     pub info_class: u32,
 }
 
@@ -373,6 +376,8 @@ pub enum RawEvent {
     FileClose(FileHandle),
     FileWrite(FileWrite),
     FileSetInfo(FileSetInfo),
+    /// Kernel-File 18 `SetDelete`: a delete disposition set or cleared.
+    FileSetDelete(FileSetInfo),
     FileOpEnd(FileOpEnd),
     FileDeletePath(FilePath),
     FileRenamePath(FilePath),
@@ -434,6 +439,7 @@ fn parse_known(meta: &EventMeta, payload: &[u8], exact: bool) -> Result<RawEvent
         (Provider::KernelFile, 14) => RawEvent::FileClose(file_handle(r, p)?),
         (Provider::KernelFile, 16) => RawEvent::FileWrite(file_write(r, p)?),
         (Provider::KernelFile, 17) => RawEvent::FileSetInfo(file_set_info(r, p)?),
+        (Provider::KernelFile, 18) => RawEvent::FileSetDelete(file_set_info(r, p)?),
         (Provider::KernelFile, 24) => RawEvent::FileOpEnd(file_op_end(r, p)?),
         (Provider::KernelFile, 26) => RawEvent::FileDeletePath(file_path(r, p)?),
         (Provider::KernelFile, 27) => RawEvent::FileRenamePath(file_path(r, p)?),

@@ -194,7 +194,7 @@ pub fn expected_fields(e: &RawEvent) -> Vec<(&'static str, Expect)> {
             ("IOFlags", Num(w.io_flags.into())),
             ("ExtraFlags", Num(w.extra_flags.into())),
         ],
-        RawEvent::FileSetInfo(i) => vec![
+        RawEvent::FileSetInfo(i) | RawEvent::FileSetDelete(i) => vec![
             ("Irp", Num(i.irp)),
             ("FileObject", Num(i.file_object)),
             ("FileKey", Num(i.file_key)),
