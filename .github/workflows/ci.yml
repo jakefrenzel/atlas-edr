@@ -83,11 +83,13 @@ jobs:
           path: ${{ runner.temp }}/etw/
           if-no-files-found: ignore
 
-  # Tier 3 for atlas-agent's Windows services (plan 1b-3b): the tests that need
+  # Tier 3 for atlas-agent (plans 1b-3b, 1b-3c): the Windows-service tests that need
   # SeDebugPrivilege or SeBackupPrivilege (seeding from the handle table, value
-  # reads with backup semantics, the System process's creation time). They are
-  # #[ignore]d locally; the hosted runner's account is an administrator. Plan
-  # 1b-3c adds the agent-level live test here.
+  # reads with backup semantics, the System process's creation time), and the
+  # agent-level live test: real sessions, services and pipeline thread against a
+  # scripted actor (seeding, value reads, 8.3 + watchlist, undelete, enrichment,
+  # self-filter). They are #[ignore]d locally; the hosted runner's account is an
+  # administrator.
   agent-live:
     runs-on: windows-latest
     steps:
@@ -100,6 +102,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Elevated service tests
         run: cargo test -p atlas-agent --lib -- --ignored --test-threads=1 --nocapture
+      - name: Agent live test
+        shell: bash
+        env:
+          ATLAS_AGENT_REPORT: ${{ runner.temp }}/agent/report.json
+        run: |
+          mkdir -p "$RUNNER_TEMP/agent"
+          cargo test -p atlas-agent --test live -- --ignored --test-threads=1 --nocapture
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-live
+          path: ${{ runner.temp }}/agent/
+          if-no-files-found: ignore
 
   proto:
     runs-on: ubuntu-latest
