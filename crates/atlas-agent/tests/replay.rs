@@ -11,12 +11,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::time::Duration;
 
 use atlas_agent::config::{Config, Ticks};
 use atlas_agent::counters::IntakeCounters;
-use atlas_agent::fakes::{FakeLookups, sequential_ids};
-use atlas_agent::input::{Header, Session};
+use atlas_agent::driver::{Driver, DriverConfig};
+use atlas_agent::fakes::{FakeLanes, FakeLookups, sequential_ids};
+use atlas_agent::input::{Header, Incoming, Session};
 use atlas_agent::intake::{Intake, Queues};
 use atlas_agent::pipeline::{Pipeline, Setup};
 use atlas_agent::process::Identity;
@@ -109,7 +111,67 @@ fn live_processes(lines: &[Line]) -> HashMap<u32, LiveProcess> {
     out
 }
 
+/// The pipeline and an intake for the recording, the intake's queues filled.
+struct Replay {
+    p: Pipeline<FakeLookups>,
+    intake: Intake,
+    krx: Receiver<Incoming>,
+    urx: Receiver<Incoming>,
+    counters: Arc<IntakeCounters>,
+    first: i64,
+    last: i64,
+}
+
 fn run() -> (Vec<Event>, atlas_agent::counters::Counters) {
+    let Replay { mut p, intake, krx, urx, counters, first, last } = replay();
+    let mut out = Vec::new();
+    let step = FREQ / 10; // 100 ms ticks
+    let mut now = first;
+    loop {
+        for inc in krx.try_iter().chain(urx.try_iter()) {
+            p.push(inc);
+        }
+        out.extend(p.tick(now));
+        for r in p.take_requests() {
+            if let Some(reply) = answer(&r) {
+                p.reply(reply);
+            }
+        }
+        if now > last + 70 * FREQ {
+            break;
+        }
+        now += step;
+    }
+    out.extend(p.stop());
+    drop(intake);
+    assert_eq!(IntakeCounters::get(&counters.parse_errors), 0);
+    (out, p.counters())
+}
+
+/// The same recording through the driver's loop (plan 1b-3c, D1): its fake
+/// clock moves 100 ms per pass, and closes the queues once the replay's
+/// horizon has passed, which ends the loop.
+fn run_driven() -> Vec<Event> {
+    let Replay { p, intake, krx, urx, first, last, .. } = replay();
+    let step = FREQ / 10;
+    let mut now = first - step;
+    let mut intake = Some(intake);
+    let clock = Box::new(move || {
+        now += step;
+        if now > last + 70 * FREQ {
+            intake.take();
+        }
+        now
+    });
+    let anchor = Box::new(|| panic!("no anchor refresh within a replay"));
+    let cfg = DriverConfig { cadence: Duration::ZERO, ..DriverConfig::default() };
+    let driver = Driver::new(p, FakeLanes::new(answer), krx, urx, clock, anchor, cfg);
+    let mut out = Vec::new();
+    driver.run(|e| out.push(e));
+    out
+}
+
+fn replay() -> Replay {
     let lines = fixture();
     let first = lines.first().unwrap().header.ts;
     let last = lines.iter().map(|l| l.header.ts).max().unwrap();
@@ -132,7 +194,7 @@ fn run() -> (Vec<Event>, atlas_agent::counters::Counters) {
         self_keys: vec![],
         started: first,
     };
-    let mut p = Pipeline::new(setup, lookups, sequential_ids()).unwrap();
+    let p = Pipeline::new(setup, lookups, sequential_ids()).unwrap();
     let (ktx, krx) = sync_channel(65_536);
     let (utx, urx) = sync_channel(8_192);
     let counters = Arc::new(IntakeCounters::default());
@@ -141,33 +203,15 @@ fn run() -> (Vec<Event>, atlas_agent::counters::Counters) {
     for l in &lines {
         intake.on_event(l.header, parse(&l.meta, &l.payload));
     }
-    let mut out = Vec::new();
-    let step = FREQ / 10; // 100 ms ticks
-    let mut now = first;
-    loop {
-        for inc in krx.try_iter().chain(urx.try_iter()) {
-            p.push(inc);
-        }
-        out.extend(p.tick(now));
-        for r in p.take_requests() {
-            answer(&mut p, r);
-        }
-        if now > last + 70 * FREQ {
-            break;
-        }
-        now += step;
-    }
-    out.extend(p.stop());
-    assert_eq!(IntakeCounters::get(&counters.parse_errors), 0);
-    (out, p.counters())
+    Replay { p, intake, krx, urx, counters, first, last }
 }
 
 /// The fake workers: a fixed hash for every file, the scenario's DWORD for the
 /// value it sets, the runner's long user name for 8.3 names, nothing from the seeder.
-fn answer(p: &mut Pipeline<FakeLookups>, r: Request) {
+fn answer(r: &Request) -> Option<Reply> {
     match r {
-        Request::Enrich { id, .. } => p.reply(Reply::Enriched {
-            id,
+        Request::Enrich { id, .. } => Some(Reply::Enriched {
+            id: *id,
             hashes: Some(Hashes { sha256: Some([0xaa; 32]) }),
             signature: None,
             error: false,
@@ -178,14 +222,14 @@ fn answer(p: &mut Pipeline<FakeLookups>, r: Request) {
                 size: 4,
                 data: 7u32.to_le_bytes().to_vec(),
             });
-            p.reply(Reply::ValueRead { id, result });
+            Some(Reply::ValueRead { id: *id, result })
         }
         // The runner's user is `runneradmin`, which 8.3 shortens to `RUNNER~1`.
         Request::Expand { id, slot, nt_path } => {
             let long_path = nt_path.contains("RUNNER~1").then(|| nt_path.replace("RUNNER~1", "runneradmin"));
-            p.reply(Reply::Expanded { id, slot, long_path });
+            Some(Reply::Expanded { id: *id, slot: *slot, long_path })
         }
-        Request::Seed { .. } | Request::InvalidateHash { .. } => {}
+        Request::Seed { .. } | Request::InvalidateHash { .. } => None,
     }
 }
 
@@ -343,6 +387,16 @@ fn the_output_matches_the_snapshot() {
         assert_eq!(g, w, "event {i} differs");
     }
     assert_eq!(got.len(), want.len(), "event count differs");
+}
+
+#[test]
+fn the_driver_loop_gives_the_same_events() {
+    let a: Vec<Vec<u8>> = run().0.into_iter().map(encode_event).collect();
+    let b: Vec<Vec<u8>> = run_driven().into_iter().map(encode_event).collect();
+    assert_eq!(a.len(), b.len());
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert_eq!(x, y, "event {i} differs");
+    }
 }
 
 #[test]

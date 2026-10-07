@@ -2,11 +2,13 @@
 //! tables, and event ids that depend only on the event time and order.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use atlas_schema::EventId;
 
+use crate::driver::Lanes;
 use crate::pipeline::IdGen;
-use crate::services::{LiveProcess, Lookups};
+use crate::services::{LiveProcess, Lookups, Reply, Request};
 
 /// [`Lookups`] answered from tables.
 #[derive(Debug, Clone, Default)]
@@ -42,6 +44,37 @@ impl Lookups for FakeLookups {
 
     fn account_name(&mut self, sid: &str) -> Option<String> {
         self.accounts.get(sid).cloned()
+    }
+}
+
+/// How [`FakeLanes`] answers a request, if at all.
+type Answer = Box<dyn Fn(&Request) -> Option<Reply> + Send>;
+
+/// Services that answer every request at once, through `answer`: the reply
+/// is collected on the next pass, as a real lane's would be at the earliest.
+pub struct FakeLanes {
+    answer: Answer,
+    replies: Mutex<Vec<Reply>>,
+    /// Every request submitted, in order.
+    pub submitted: Mutex<Vec<Request>>,
+}
+
+impl FakeLanes {
+    pub fn new(answer: impl Fn(&Request) -> Option<Reply> + Send + 'static) -> Self {
+        FakeLanes { answer: Box::new(answer), replies: Mutex::default(), submitted: Mutex::default() }
+    }
+}
+
+impl Lanes for FakeLanes {
+    fn submit(&self, r: Request) {
+        if let Some(reply) = (self.answer)(&r) {
+            self.replies.lock().expect("replies").push(reply);
+        }
+        self.submitted.lock().expect("submitted").push(r);
+    }
+
+    fn replies(&self) -> Vec<Reply> {
+        std::mem::take(&mut *self.replies.lock().expect("replies"))
     }
 }
 
