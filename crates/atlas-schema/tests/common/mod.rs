@@ -389,8 +389,8 @@ fn arb_health_report() -> BoxedStrategy<HealthReport> {
             callback_panics: f.9,
         });
     let quality = (
-        (counter(), counter(), counter(), counter(), arb_class_counts(), counter(), counter(), counter()),
-        (counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),
+        (counter(), counter(), counter(), counter(), arb_class_counts(), counter(), counter(), counter(), counter()),
+        (counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),
     )
         .prop_map(|(a, b)| SensorQuality {
             late_arrivals: a.0,
@@ -410,6 +410,8 @@ fn arb_health_report() -> BoxedStrategy<HealthReport> {
             enrichment_misses: b.6,
             enrichment_errors: b.7,
             reg_name_ambiguous: b.8,
+            file_delete_outcome_unknown: a.8,
+            file_cleanup_unpaired: b.9,
         });
     let housekeeping = (
         (counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter(), counter()),

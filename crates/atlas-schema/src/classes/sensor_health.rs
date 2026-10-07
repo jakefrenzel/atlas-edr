@@ -168,6 +168,10 @@ counter_group!(
         enrichment_errors: Option<u64>,
         /// Registry value names with more than one possible end (embedded NULs).
         reg_name_ambiguous: Option<u64>,
+        /// Deletes reported from the request alone (the cleanup's outcome was unknown).
+        file_delete_outcome_unknown: Option<u64>,
+        /// Cleanups whose outcome could not be paired with them.
+        file_cleanup_unpaired: Option<u64>,
     }
 );
 
@@ -182,7 +186,7 @@ counter_group!(
         hash_cache_evictions: Option<u64>,
         /// Whole buffer segments deleted by rolling retention (expected without a transport).
         retention_evictions: Option<u64>,
-        /// Failed file creates, deletes and renames that were dropped.
+        /// Failed file creates and renames that were dropped.
         file_op_failed: Option<u64>,
         pending_overflow: Option<u64>,
         seeding_enabled: Option<bool>,
