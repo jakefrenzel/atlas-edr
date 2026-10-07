@@ -3,7 +3,8 @@
 //! a hash-map operation or two per event, never a blocking call.
 //!
 //! - Parse failures are counted (`parse_errors`, `unknown_version`).
-//! - Successful OperationEnds are discarded: only failures matter (§5.5).
+//! - Successful OperationEnds are discarded: only failures matter (§5.5), and
+//!   the Cleanup outcomes that report a delete (`cleanup`; plan 1b-3c).
 //! - Session A keeps the early registry key map and sends fast-path value reads.
 //! - DNS-Client events pass a per-PID token bucket, then go to the user-mode
 //!   queue; everything else goes to the kernel queue. Full queues drop and count.
@@ -12,11 +13,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, TrySendError};
 
-use atlas_etw::parse::{ParseError, RawEvent};
+use atlas_etw::parse::{FileOpEnd, ParseError, RawEvent};
 
+use crate::cleanup;
 use crate::config::{Config, Ticks};
 use crate::counters::IntakeCounters;
 use crate::input::{Header, Incoming, Session};
+use crate::recent::Recent;
 use crate::services::{EarlyKey, ValueRead};
 
 /// Sends a fast-path read to the reader lane (plan 1b-3b). Must not block.
@@ -39,6 +42,7 @@ pub struct Intake {
     early: Option<EarlyKeys>,
     fast_read: Option<FastRead>,
     self_keys: HashSet<u64>,
+    cleanups: Cleanups,
 }
 
 impl Intake {
@@ -58,6 +62,7 @@ impl Intake {
         Intake {
             kernel: queues.kernel,
             user: queues.user,
+            cleanups: Cleanups::new(ticks, counters.clone()),
             counters,
             dns: Buckets::new(cfg.dns_rate_per_pid, ticks.frequency),
             early,
@@ -79,11 +84,31 @@ impl Intake {
                 return;
             }
         };
+        if let Some(irp) = cleanup::op_irp(&event) {
+            self.cleanups.next_op(irp);
+        }
+        let mut early_outcome = None;
         match &event {
             RawEvent::FileOpEnd(o) if !o.failed() => {
-                IntakeCounters::bump(&self.counters.op_end_discarded);
-                return;
+                if let End::Discard = self.cleanups.end(header, o.irp, o.extra_information) {
+                    IntakeCounters::bump(&self.counters.op_end_discarded);
+                    return;
+                }
             }
+            RawEvent::FileOpEnd(o) => self.cleanups.failed(o.irp),
+            RawEvent::FileCleanup(x) => {
+                early_outcome = self
+                    .cleanups
+                    .cleanup(x.irp, x.file_object, x.file_key, header.ts)
+                    .map(|(h, info)| (h, FileOpEnd { irp: x.irp, extra_information: info, status: 0 }));
+            }
+            RawEvent::FileClose(x) => self.cleanups.close(x.file_object),
+            RawEvent::FileCreate(c) if c.delete_on_close() => self.cleanups.delete_on_close(c.file_object, header.ts),
+            RawEvent::FileDeletePath(p) => self.cleanups.request(p.file_key, p.irp, header.ts),
+            RawEvent::FileSetDelete(i) if i.extra_information != 0 => {
+                self.cleanups.request(i.file_key, i.irp, header.ts)
+            }
+            RawEvent::FileSetDelete(i) => self.cleanups.clear(i.file_key, i.file_object),
             RawEvent::RegCreateKey(o) | RawEvent::RegOpenKey(o) if o.status == 0 => {
                 if let Some(m) = &mut self.early {
                     let evicted = m.open(o.key_object, o.base_object, &o.relative_name.to_string_lossy());
@@ -113,9 +138,16 @@ impl Intake {
             }
             _ => {}
         }
-        let inc = Incoming { header, event };
+        self.send(Incoming { header, event });
+        if let Some((h, o)) = early_outcome {
+            // After its Cleanup in the queue; the ordering stage sorts by time anyway.
+            self.send(Incoming { header: h, event: RawEvent::FileOpEnd(o) });
+        }
+    }
+
+    fn send(&mut self, inc: Incoming) {
         if matches!(inc.event, RawEvent::DnsQuery(_)) {
-            if !self.dns.take(header.pid, header.ts) {
+            if !self.dns.take(inc.header.pid, inc.header.ts) {
                 IntakeCounters::bump(&self.counters.dns_rate_limit_drops);
                 return;
             }
@@ -124,6 +156,167 @@ impl Intake {
             }
         } else if let Err(TrySendError::Full(_)) = self.kernel.try_send(inc) {
             IntakeCounters::bump(&self.counters.kernel_queue_drops);
+        }
+    }
+}
+
+/// What the callback keeps to pass on Cleanup outcomes (plan 1b-3c, D3):
+/// - each Cleanup's Irp until its OperationEnd;
+/// - an outcome that arrived before its Cleanup (logged on another CPU, R-M4);
+/// - the files with a delete request outstanding, for the file systems that
+///   report no outcome (SMB), and each request's Irp until its OperationEnd.
+///
+/// Irps are per thread and reused for every operation, so an event that starts
+/// another operation on an Irp ends whatever the Irp did before: a Cleanup still
+/// waiting is counted as unpaired (`file_cleanup_unpaired`), never paired with a
+/// later operation's OperationEnd. Bounded: the Irp maps clear past their cap
+/// (their entries go at once unless events are lost), the requests forget the
+/// oldest.
+pub(crate) struct Cleanups {
+    /// Cleanup Irp → (FileObject, FileKey, QPC).
+    irps: HashMap<u64, (u64, u64, i64)>,
+    /// A successful OperationEnd that reports a removed name and found no
+    /// Cleanup: Irp → its header and outcome.
+    early: HashMap<u64, (Header, u64)>,
+    /// FileKeys with a delete requested (`DeletePath`, `SetDelete` set, or a
+    /// delete-on-close handle's Cleanup) and not cleared or reported since.
+    requested: Recent<u64>,
+    /// A request's Irp → its FileKey, until the request's OperationEnd: a
+    /// failed one takes the request back, a successful one is passed on so the
+    /// pipeline knows the request stood (R-M1).
+    request_irps: HashMap<u64, u64>,
+    /// Handles opened delete-on-close and not closed yet.
+    on_close: Recent<u64>,
+    /// An outcome comes within this many ticks of its Cleanup (1 s). The rules
+    /// that keep a Cleanup from pairing with another operation are the next
+    /// operation and the value check; the window bounds what neither sees
+    /// (an operation whose start is not logged, such as a query).
+    window: i64,
+    counters: Arc<IntakeCounters>,
+}
+
+/// What to do with a successful OperationEnd.
+enum End {
+    Pass,
+    Discard,
+}
+
+const CLEANUP_IRPS_CAP: usize = 4096;
+const DELETE_REQUESTS_CAP: usize = 4096;
+
+impl Cleanups {
+    fn new(ticks: Ticks, counters: Arc<IntakeCounters>) -> Self {
+        Cleanups {
+            irps: HashMap::new(),
+            early: HashMap::new(),
+            requested: Recent::new(DELETE_REQUESTS_CAP),
+            request_irps: HashMap::new(),
+            on_close: Recent::new(DELETE_REQUESTS_CAP),
+            window: ticks.frequency.max(1),
+            counters,
+        }
+    }
+
+    /// Another operation starts on `irp` (any Kernel-File event with an Irp
+    /// but a Cleanup or an OperationEnd).
+    fn next_op(&mut self, irp: u64) {
+        self.early.remove(&irp);
+        self.request_irps.remove(&irp);
+        if self.irps.remove(&irp).is_some() {
+            IntakeCounters::bump(&self.counters.cleanup_unpaired);
+        }
+    }
+
+    /// A Cleanup. Returns the outcome to pass on now, if it arrived first.
+    fn cleanup(&mut self, irp: u64, fo: u64, key: u64, ts: i64) -> Option<(Header, u64)> {
+        let early = self.early.remove(&irp);
+        self.next_op(irp);
+        if self.on_close.get(&fo).is_some() {
+            // The FileKey is first known here: a later Cleanup on another
+            // handle may be the one that deletes.
+            self.requested.insert(key, ts);
+        }
+        if let Some((h, info)) = early
+            && h.ts >= ts
+            && h.ts - ts <= self.window
+        {
+            return self.decide(fo, key, info).then_some((h, info));
+        }
+        if self.irps.len() >= CLEANUP_IRPS_CAP {
+            self.irps.clear();
+        }
+        self.irps.insert(irp, (fo, key, ts));
+        None
+    }
+
+    /// A successful OperationEnd: passed on if it is a Cleanup's and reports a
+    /// delete, or reports nothing for a file whose delete was requested; or if
+    /// it is a delete request's.
+    fn end(&mut self, header: Header, irp: u64, info: u64) -> End {
+        let request = self.request_irps.remove(&irp).is_some();
+        let pass = match self.irps.remove(&irp) {
+            Some((fo, key, ts)) if header.ts >= ts && header.ts - ts <= self.window => self.decide(fo, key, info),
+            Some(_) => {
+                IntakeCounters::bump(&self.counters.cleanup_outcome_late);
+                false
+            }
+            None => {
+                if cleanup::removed(info) {
+                    if self.early.len() >= CLEANUP_IRPS_CAP {
+                        self.early.clear();
+                    }
+                    self.early.insert(irp, (header, info));
+                }
+                false
+            }
+        };
+        if pass || request { End::Pass } else { End::Discard }
+    }
+
+    /// Whether a Cleanup's outcome is passed on. A delete passed on is no
+    /// longer outstanding.
+    fn decide(&mut self, fo: u64, key: u64, info: u64) -> bool {
+        let requested = self.requested.get(&key).is_some() || self.on_close.get(&fo).is_some();
+        let pass = cleanup::removed(info) || (info == cleanup::UNKNOWN && requested);
+        if pass {
+            self.requested.remove(&key);
+        }
+        pass
+    }
+
+    /// A failed OperationEnd: a failed request is taken back.
+    fn failed(&mut self, irp: u64) {
+        self.irps.remove(&irp);
+        self.early.remove(&irp);
+        if let Some(key) = self.request_irps.remove(&irp) {
+            self.requested.remove(&key);
+        }
+    }
+
+    fn close(&mut self, fo: u64) {
+        if !self.on_close.is_empty() {
+            self.on_close.remove(&fo);
+        }
+    }
+
+    fn delete_on_close(&mut self, fo: u64, ts: i64) {
+        self.on_close.insert(fo, ts);
+    }
+
+    fn request(&mut self, key: u64, irp: u64, ts: i64) {
+        if self.request_irps.len() >= CLEANUP_IRPS_CAP {
+            self.request_irps.clear();
+        }
+        self.request_irps.insert(irp, key);
+        self.requested.insert(key, ts);
+    }
+
+    /// A `SetDelete` clear. On a delete-on-close handle it is taken as
+    /// `FileDispositionInformationEx` clearing that handle's flag, and leaves a
+    /// disposition another handle set (R-m3); otherwise it clears the file's.
+    fn clear(&mut self, key: u64, fo: u64) {
+        if self.on_close.remove(&fo).is_none() {
+            self.requested.remove(&key);
         }
     }
 }
@@ -238,7 +431,9 @@ impl Buckets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atlas_etw::parse::{DnsQuery, FileOpEnd, RegKey, RegOpen, RegSetValue, WStr};
+    use atlas_etw::parse::{
+        DnsQuery, FileCreate, FileHandle, FileOpEnd, FileSetInfo, RegKey, RegOpen, RegSetValue, WStr,
+    };
     use std::sync::Mutex;
     use std::sync::mpsc::{Receiver, sync_channel};
 
@@ -289,6 +484,190 @@ mod tests {
         assert_eq!(IntakeCounters::get(&c.op_end_discarded), 2);
         assert!(matches!(krx.try_recv().unwrap().event, RawEvent::FileOpEnd(o) if o.irp == 3));
         assert!(krx.try_recv().is_err());
+    }
+
+    fn ev(i: &mut Intake, e: RawEvent) {
+        i.on_event(header(1, 0), Ok(e));
+    }
+
+    fn cleanup(irp: u64, fo: u64, file_key: u64) -> RawEvent {
+        RawEvent::FileCleanup(FileHandle { irp, file_object: fo, file_key, issuing_tid: 1 })
+    }
+
+    fn outcome(irp: u64, info: u64) -> RawEvent {
+        RawEvent::FileOpEnd(FileOpEnd { irp, extra_information: info, status: 0 })
+    }
+
+    fn passed_outcomes(krx: &Receiver<Incoming>) -> Vec<(u64, u64)> {
+        krx.try_iter()
+            .filter_map(|inc| match inc.event {
+                RawEvent::FileOpEnd(o) if !o.failed() => Some((o.irp, o.extra_information)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cleanup_outcomes_pass_when_they_report_a_delete() {
+        let (mut i, krx, _, c, _) = intake(64);
+        // Removed names pass; a file that remains does not, nor an OperationEnd
+        // of another operation that happens to carry the same number.
+        for (irp, info) in [(1, cleanup::FILE_DELETED), (2, cleanup::LINK_DELETED), (3, cleanup::STREAM_DELETED)] {
+            ev(&mut i, cleanup(irp, 0x10 + irp, 0x20 + irp));
+            ev(&mut i, outcome(irp, info));
+        }
+        ev(&mut i, cleanup(4, 0x14, 0x24));
+        ev(&mut i, outcome(4, cleanup::FILE_REMAINS));
+        ev(&mut i, outcome(5, cleanup::FILE_DELETED)); // a write of 4 bytes, say
+        assert_eq!(passed_outcomes(&krx), [(1, 4), (2, 8), (3, 0x10)]);
+        assert_eq!(IntakeCounters::get(&c.op_end_discarded), 2);
+    }
+
+    #[test]
+    fn an_unknown_outcome_passes_only_for_a_requested_delete() {
+        let (mut i, krx, _, _, _) = intake(64);
+        let set = |key, on| {
+            RawEvent::FileSetDelete(FileSetInfo {
+                irp: 0,
+                file_object: 0x10,
+                file_key: key,
+                extra_information: on,
+                issuing_tid: 1,
+                info_class: 13,
+            })
+        };
+        // Asked for: passes.
+        ev(&mut i, set(0x20, 1));
+        ev(&mut i, cleanup(1, 0x10, 0x20));
+        ev(&mut i, outcome(1, cleanup::UNKNOWN));
+        // Asked for, then cleared: does not.
+        ev(&mut i, set(0x21, 1));
+        ev(&mut i, set(0x21, 0));
+        ev(&mut i, cleanup(2, 0x10, 0x21));
+        ev(&mut i, outcome(2, cleanup::UNKNOWN));
+        // Never asked for: does not.
+        ev(&mut i, cleanup(3, 0x11, 0x22));
+        ev(&mut i, outcome(3, cleanup::UNKNOWN));
+        // Asked for, but the request failed (a read-only file): does not, even
+        // once the FileKey is reused.
+        ev(
+            &mut i,
+            RawEvent::FileSetDelete(FileSetInfo {
+                irp: 8,
+                file_object: 0x10,
+                file_key: 0x24,
+                extra_information: 1,
+                issuing_tid: 1,
+                info_class: 13,
+            }),
+        );
+        ev(&mut i, RawEvent::FileOpEnd(FileOpEnd { irp: 8, extra_information: 0, status: 0xC000_0121 }));
+        ev(&mut i, cleanup(6, 0x14, 0x24));
+        ev(&mut i, outcome(6, cleanup::UNKNOWN));
+        // A delete-on-close handle: its own Cleanup, and another handle's after it.
+        ev(
+            &mut i,
+            RawEvent::FileCreate(FileCreate {
+                irp: 9,
+                file_object: 0x12,
+                issuing_tid: 1,
+                create_options: FileCreate::DELETE_ON_CLOSE,
+                create_attributes: 0,
+                share_access: 7,
+                file_name: WStr::default(),
+            }),
+        );
+        ev(&mut i, cleanup(4, 0x12, 0x23));
+        ev(&mut i, outcome(4, cleanup::UNKNOWN));
+        // That outcome was the delete: the file's later Cleanups are not (R-m2).
+        ev(&mut i, cleanup(5, 0x13, 0x23));
+        ev(&mut i, outcome(5, cleanup::UNKNOWN));
+        assert_eq!(passed_outcomes(&krx), [(1, 0), (4, 0)]);
+    }
+
+    fn ev_at(i: &mut Intake, ts: i64, e: RawEvent) {
+        i.on_event(header(1, ts), Ok(e));
+    }
+
+    /// The thread moved to another CPU between the Cleanup and its
+    /// OperationEnd, and the OperationEnd's buffer came first (review R-M4).
+    #[test]
+    fn an_outcome_delivered_before_its_cleanup_is_paired() {
+        let (mut i, krx, _, _, _) = intake(64);
+        ev(&mut i, outcome(1, cleanup::FILE_DELETED));
+        ev(&mut i, cleanup(1, 0x10, 0x20));
+        // The thread's next operation on the same Irp: a 100-byte write.
+        ev(&mut i, outcome(1, 100));
+        assert_eq!(passed_outcomes(&krx), [(1, 4)], "the delete passes, the write does not");
+    }
+
+    /// A Cleanup whose outcome never came is not paired with a later operation
+    /// on its Irp, nor with an OperationEnd past the window; both are counted.
+    #[test]
+    fn an_unpaired_cleanup_is_counted_never_paired_later() {
+        let (mut i, krx, _, c, _) = intake(64);
+        ev_at(&mut i, 0, cleanup(1, 0x10, 0x20));
+        ev_at(&mut i, 1, RawEvent::FileClose(FileHandle { irp: 1, file_object: 0x10, file_key: 0x20, issuing_tid: 1 }));
+        ev_at(&mut i, 2, outcome(1, cleanup::FILE_DELETED)); // the Close's own: not a Cleanup's
+        ev_at(&mut i, 3, cleanup(2, 0x11, 0x21));
+        ev_at(&mut i, 1_500, outcome(2, cleanup::FILE_DELETED)); // 1.5 s later; the window is 1 s
+        assert!(passed_outcomes(&krx).is_empty());
+        assert_eq!(IntakeCounters::get(&c.cleanup_unpaired), 1);
+        assert_eq!(IntakeCounters::get(&c.cleanup_outcome_late), 1);
+    }
+
+    /// A delete request's own OperationEnd is passed on, so the pipeline knows
+    /// the request stood (review R-M1).
+    #[test]
+    fn a_requests_operation_end_is_passed_on() {
+        let (mut i, krx, _, _, _) = intake(64);
+        ev(
+            &mut i,
+            RawEvent::FileSetDelete(FileSetInfo {
+                irp: 7,
+                file_object: 0x10,
+                file_key: 0x20,
+                extra_information: 1,
+                issuing_tid: 1,
+                info_class: 13,
+            }),
+        );
+        ev(&mut i, outcome(7, 0));
+        assert_eq!(passed_outcomes(&krx), [(7, 0)]);
+    }
+
+    /// Clearing a delete-on-close handle's flag leaves another handle's
+    /// request (review R-m3): an SMB Cleanup still passes.
+    #[test]
+    fn clearing_a_handles_delete_on_close_keeps_another_handles_request() {
+        let (mut i, krx, _, _, _) = intake(64);
+        let set = |fo, on| {
+            RawEvent::FileSetDelete(FileSetInfo {
+                irp: 9,
+                file_object: fo,
+                file_key: 0x20,
+                extra_information: on,
+                issuing_tid: 1,
+                info_class: 64,
+            })
+        };
+        ev(&mut i, set(0x10, 1));
+        ev(
+            &mut i,
+            RawEvent::FileCreate(FileCreate {
+                irp: 8,
+                file_object: 0x12,
+                issuing_tid: 1,
+                create_options: FileCreate::DELETE_ON_CLOSE,
+                create_attributes: 0,
+                share_access: 7,
+                file_name: WStr::default(),
+            }),
+        );
+        ev(&mut i, set(0x12, 0));
+        ev(&mut i, cleanup(3, 0x14, 0x20));
+        ev(&mut i, outcome(3, cleanup::UNKNOWN));
+        assert!(passed_outcomes(&krx).contains(&(3, 0)));
     }
 
     #[test]

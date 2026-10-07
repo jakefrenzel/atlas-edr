@@ -215,6 +215,31 @@ fn op_end(irp: u64, status: u32) -> RawEvent {
     RawEvent::FileOpEnd(FileOpEnd { irp, extra_information: 0, status })
 }
 
+/// A Cleanup with its Irp and FileKey, for the outcome that follows.
+fn cleanup(irp: u64, fo: u64, file_key: u64) -> RawEvent {
+    RawEvent::FileCleanup(FileHandle { irp, file_object: fo, file_key, issuing_tid: 1 })
+}
+
+/// A Cleanup's successful OperationEnd reporting `FILE_CLEANUP_*` (`info`).
+fn outcome(irp: u64, info: u64) -> RawEvent {
+    RawEvent::FileOpEnd(FileOpEnd { irp, extra_information: info, status: 0 })
+}
+
+fn set_delete(fo: u64, file_key: u64, delete: bool) -> RawEvent {
+    RawEvent::FileSetDelete(FileSetInfo {
+        irp: 0,
+        file_object: fo,
+        file_key,
+        extra_information: u64::from(delete),
+        issuing_tid: 1,
+        info_class: 13,
+    })
+}
+
+fn delete_path(irp: u64, fo: u64, file_key: u64, path: &str) -> RawEvent {
+    RawEvent::FileDeletePath(FilePath { file_key, ..path_event(irp, fo, path) })
+}
+
 fn path_event(irp: u64, fo: u64, path: &str) -> FilePath {
     FilePath {
         irp,
@@ -562,41 +587,200 @@ fn one_update_per_written_handle_with_the_opener_as_actor() {
     valid(&out);
 }
 
+/// The renames' results, the only part a rename of an unknown handle carries.
+fn rename_results(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::File(f) => match &f.action {
+                FileAction::Rename { file_result } => Some(file_result.path.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn delete_on_close_emits_a_delete_at_cleanup() {
+fn delete_on_close_is_a_delete_when_the_cleanup_reports_it() {
     let mut t = T::new();
     running(&mut t, 100, 10, EXPLORER);
     let f = r"\Device\HarddiskVolume3\tmp\d.txt";
     t.ev(5, 100, Some(key(10)), create(1, 0xA, f, FileCreate::DELETE_ON_CLOSE));
-    t.ev(6, 100, Some(key(10)), RawEvent::FileCleanup(handle(0xA)));
+    t.ev(6, 100, Some(key(10)), cleanup(2, 0xA, 0x50));
+    t.ev(6, 100, Some(key(10)), outcome(2, crate::cleanup::FILE_DELETED));
+    // Cleared through FileDispositionInformationEx before the Cleanup: no outcome, no Delete.
+    t.ev(7, 100, Some(key(10)), create(3, 0xB, r"\Device\HarddiskVolume3\tmp\e.txt", FileCreate::DELETE_ON_CLOSE));
+    t.ev(8, 100, Some(key(10)), set_delete(0xB, 0x51, false));
+    t.ev(9, 100, Some(key(10)), cleanup(4, 0xB, 0x51));
+    t.ev(9, 100, Some(key(10)), outcome(4, crate::cleanup::FILE_REMAINS));
     assert_eq!(files(&t.settle()), [("delete", r"C:\tmp\d.txt".into(), 100)]);
+}
+
+#[test]
+fn an_undelete_gives_no_delete() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\u.txt", 0));
+    t.ev(6, 100, Some(key(10)), set_delete(0xA, 0x50, true));
+    t.ev(6, 100, Some(key(10)), delete_path(2, 0xA, 0x50, r"\Device\HarddiskVolume3\u.txt"));
+    t.ev(7, 100, Some(key(10)), set_delete(0xA, 0x50, false));
+    t.ev(8, 100, Some(key(10)), cleanup(3, 0xA, 0x50));
+    t.ev(8, 100, Some(key(10)), outcome(3, crate::cleanup::FILE_REMAINS));
+    // On SMB the outcome is unknown: a cleared request is not reported either.
+    t.ev(9, 100, Some(key(10)), create(4, 0xB, r"\Device\Mup\srv\share\u.txt", 0));
+    t.ev(10, 100, Some(key(10)), delete_path(5, 0xB, 0x60, r"\Device\Mup\srv\share\u.txt"));
+    t.ev(11, 100, Some(key(10)), set_delete(0xB, 0x60, false));
+    t.ev(12, 100, Some(key(10)), cleanup(6, 0xB, 0x60));
+    t.ev(12, 100, Some(key(10)), outcome(6, crate::cleanup::UNKNOWN));
+    assert!(files(&t.settle()).is_empty());
+    assert_eq!(t.p.counters().file_delete_outcome_unknown, 0);
+}
+
+#[test]
+fn a_delete_comes_from_the_cleanup_that_removed_the_name_with_the_requester_as_actor() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    running(&mut t, 200, 20, CMD);
+    let f = r"\Device\HarddiskVolume3\shared.txt";
+    // 200 holds the file open; 100 asks for the delete and closes first.
+    t.ev(5, 200, Some(key(20)), create(1, 0xB, f, 0));
+    t.ev(6, 100, Some(key(10)), create(2, 0xA, f, 0));
+    t.ev(7, 100, Some(key(10)), set_delete(0xA, 0x50, true));
+    t.ev(7, 100, Some(key(10)), delete_path(3, 0xA, 0x50, f));
+    t.ev(8, 100, Some(key(10)), cleanup(4, 0xA, 0x50));
+    t.ev(8, 100, Some(key(10)), outcome(4, crate::cleanup::FILE_REMAINS));
+    t.at(2_000);
+    assert!(files(&t.out).is_empty(), "not deleted yet");
+    // 200's Cleanup is the last: the name goes then.
+    t.ev(3_000, 200, Some(key(20)), cleanup(5, 0xB, 0x50));
+    t.ev(3_000, 200, Some(key(20)), outcome(5, crate::cleanup::FILE_DELETED));
+    let out = t.settle();
+    assert_eq!(files(&out), [("delete", r"C:\shared.txt".into(), 100)]);
+    assert!(
+        t.requests().iter().any(|r| matches!(r, Request::InvalidateHash { nt_path } if nt_path == f)),
+        "the hash cache forgets the file"
+    );
+    // A delete nobody was seen asking for (a handle from before the agent):
+    // the process whose Cleanup removed the name.
+    t.ev(4_000, 200, Some(key(20)), create(6, 0xC, r"\Device\HarddiskVolume3\other.txt", 0));
+    t.ev(4_001, 200, Some(key(20)), cleanup(7, 0xC, 0x70));
+    t.ev(4_001, 200, Some(key(20)), outcome(7, crate::cleanup::FILE_DELETED | crate::cleanup::POSIX_STYLE_DELETE));
+    assert_eq!(files(&t.settle()), [("delete", r"C:\other.txt".into(), 200)]);
+    valid(&out);
+}
+
+#[test]
+fn a_posix_delete_reported_twice_is_one_delete() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let d = r"\Device\HarddiskVolume3\dir";
+    let posix = crate::cleanup::FILE_DELETED | crate::cleanup::POSIX_STYLE_DELETE;
+    let deleted = crate::cleanup::FILE_DELETED;
+    // remove_dir_all: an enumeration handle stays open while another deletes.
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, d, 0));
+    t.ev(6, 100, Some(key(10)), create(2, 0xB, d, 0));
+    t.ev(7, 100, Some(key(10)), delete_path(3, 0xB, 0x50, d));
+    t.ev(8, 100, Some(key(10)), cleanup(4, 0xB, 0x50));
+    t.ev(8, 100, Some(key(10)), outcome(4, posix));
+    t.ev(9, 100, Some(key(10)), cleanup(5, 0xA, 0x50));
+    t.ev(9, 100, Some(key(10)), outcome(5, deleted));
+    // The FileKey reused by another file, deleted the classic way: its own Delete.
+    t.ev(10, 100, Some(key(10)), create(6, 0xC, r"\Device\HarddiskVolume3\new.txt", 0));
+    t.ev(11, 100, Some(key(10)), cleanup(7, 0xC, 0x50));
+    t.ev(11, 100, Some(key(10)), outcome(7, deleted));
+    // A POSIX delete with no second report (a mapped file: no other handle),
+    // then its FileKey reused by another file: that file's delete stands.
+    t.ev(12, 100, Some(key(10)), create(8, 0xE, r"\Device\HarddiskVolume3\mapped.txt", 0));
+    t.ev(13, 100, Some(key(10)), cleanup(9, 0xE, 0x60));
+    t.ev(13, 100, Some(key(10)), outcome(9, posix));
+    t.ev(14, 100, Some(key(10)), create(10, 0xF, r"\Device\HarddiskVolume3\later.txt", 0));
+    t.ev(15, 100, Some(key(10)), cleanup(11, 0xF, 0x60));
+    t.ev(15, 100, Some(key(10)), outcome(11, deleted));
+    let out = t.settle();
+    let got: Vec<_> = files(&out).into_iter().map(|(a, p, _)| (a, p)).collect();
+    assert_eq!(
+        got,
+        [
+            ("delete", r"C:\dir".into()),
+            ("delete", r"C:\new.txt".into()),
+            ("delete", r"C:\mapped.txt".into()),
+            ("delete", r"C:\later.txt".into())
+        ]
+    );
+}
+
+#[test]
+fn links_and_streams_are_deletes_of_their_own_name() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let link = r"\Device\HarddiskVolume3\link.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, link, 0));
+    t.ev(6, 100, Some(key(10)), delete_path(2, 0xA, 0x50, link));
+    t.ev(7, 100, Some(key(10)), cleanup(3, 0xA, 0x50));
+    t.ev(7, 100, Some(key(10)), outcome(3, crate::cleanup::LINK_DELETED));
+    let stream = r"\Device\HarddiskVolume3\s.txt:x";
+    t.ev(8, 100, Some(key(10)), create(4, 0xB, stream, 0));
+    t.ev(9, 100, Some(key(10)), delete_path(5, 0xB, 0x60, stream));
+    t.ev(10, 100, Some(key(10)), cleanup(6, 0xB, 0x60));
+    t.ev(10, 100, Some(key(10)), outcome(6, crate::cleanup::STREAM_DELETED));
+    let out = t.settle();
+    let got: Vec<_> = files(&out).into_iter().map(|(a, p, _)| (a, p)).collect();
+    assert_eq!(got, [("delete", r"C:\link.txt".into()), ("delete", r"C:\s.txt:x".into())]);
+}
+
+#[test]
+fn an_unknown_outcome_reports_a_requested_delete_and_counts_it() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\Mup\srv\share\x.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, f, 0));
+    t.ev(6, 100, Some(key(10)), delete_path(2, 0xA, 0x50, f));
+    t.ev(7, 100, Some(key(10)), cleanup(3, 0xA, 0x50));
+    t.ev(7, 100, Some(key(10)), outcome(3, crate::cleanup::UNKNOWN));
+    // Nothing asked for on this one.
+    t.ev(8, 100, Some(key(10)), create(4, 0xB, r"\Device\Mup\srv\share\y.txt", 0));
+    t.ev(9, 100, Some(key(10)), cleanup(5, 0xB, 0x60));
+    t.ev(9, 100, Some(key(10)), outcome(5, crate::cleanup::UNKNOWN));
+    let out = t.settle();
+    assert_eq!(files(&out).len(), 1);
+    assert_eq!(files(&out)[0].0, "delete");
+    assert_eq!(t.p.counters().file_delete_outcome_unknown, 1);
 }
 
 #[test]
 fn failed_operations_are_dropped_by_irp_within_the_window() {
     let mut t = T::new();
     running(&mut t, 100, 10, EXPLORER);
-    let p = |irp, path: &str| path_event(irp, 0xF, path);
-    // A failed delete, a failed rename, a delete that stands.
-    t.ev(5, 100, Some(key(10)), RawEvent::FileDeletePath(p(1, r"\Device\HarddiskVolume3\ro.txt")));
-    t.ev(6, 100, Some(key(10)), op_end(1, 0xC000_0121));
-    t.ev(7, 100, Some(key(10)), RawEvent::FileRenamePath(p(2, r"\Device\HarddiskVolume3\new.txt")));
+    running(&mut t, 200, 20, CMD);
+    let p = |irp, path: &str| RawEvent::FileRenamePath(path_event(irp, 0xF, path));
+    // A failed rename, a rename that stands.
+    t.ev(7, 100, Some(key(10)), p(2, r"\Device\HarddiskVolume3\new.txt"));
     t.ev(8, 100, Some(key(10)), op_end(2, 0xC000_0035));
-    t.ev(9, 100, Some(key(10)), RawEvent::FileDeletePath(p(3, r"\Device\HarddiskVolume3\ok.txt")));
+    t.ev(9, 100, Some(key(10)), p(3, r"\Device\HarddiskVolume3\ok.txt"));
     t.ev(10, 100, Some(key(10)), op_end(3, 0x104)); // informational, not a failure
-    // A failure long after the window: the delete stands, counted as late.
-    t.ev(30, 100, Some(key(10)), RawEvent::FileDeletePath(p(5, r"\Device\HarddiskVolume3\slow.txt")));
+    // A failure long after the window: the rename stands, counted as late.
+    t.ev(30, 100, Some(key(10)), p(5, r"\Device\HarddiskVolume3\slow.txt"));
     t.ev(900, 100, Some(key(10)), op_end(5, 0xC000_0001));
     // The failure is processed first when its operation arrives late (after
     // the ordering stage released newer events): the ring of failures catches it.
     t.ev(1_000, 100, Some(key(10)), op_end(4, 0xC000_0043));
     t.at(2_000);
-    t.ev(999, 100, Some(key(10)), RawEvent::FileDeletePath(p(4, r"\Device\HarddiskVolume3\late.txt")));
+    t.ev(999, 100, Some(key(10)), p(4, r"\Device\HarddiskVolume3\late.txt"));
+    // A failed delete: no Cleanup ever reports it removed, and the request is
+    // taken back: the FileKey, reused by another file that 200 deletes through
+    // a handle we never saw opened, does not make 100 its actor.
+    t.ev(2_100, 100, Some(key(10)), delete_path(6, 0xE, 0x50, r"\Device\HarddiskVolume3\ro.txt"));
+    t.ev(2_101, 100, Some(key(10)), op_end(6, 0xC000_0121));
+    t.ev(2_200, 200, Some(key(20)), create(7, 0xD, r"\Device\HarddiskVolume3\other.txt", 0));
+    t.ev(2_201, 200, Some(key(20)), cleanup(8, 0xD, 0x50));
+    t.ev(2_201, 200, Some(key(20)), outcome(8, crate::cleanup::FILE_DELETED));
     let out = t.settle();
-    let got: Vec<String> = files(&out).into_iter().map(|(_, p, _)| p).collect();
-    assert_eq!(got, [r"C:\ok.txt", r"C:\slow.txt"]);
+    assert_eq!(rename_results(&out), [r"C:\ok.txt", r"C:\slow.txt"]);
+    assert_eq!(files(&out).len(), 3);
+    assert_eq!(files(&out)[2], ("delete", r"C:\other.txt".into(), 200));
     let c = t.p.counters();
-    assert_eq!((c.file_op_failed, c.file_op_late_failure, c.late_arrivals), (3, 1, 1));
+    assert_eq!((c.file_op_failed, c.file_op_late_failure, c.late_arrivals), (2, 1, 1));
 }
 
 #[test]
@@ -723,7 +907,9 @@ fn short_names_in_emitted_paths_are_expanded() {
     // A failed expansion leaves the path as logged.
     let mut t = T::new();
     running(&mut t, 100, 10, EXPLORER);
-    t.ev(5, 100, Some(key(10)), RawEvent::FileDeletePath(path_event(1, 0xB, short)));
+    t.ev(5, 100, Some(key(10)), create(1, 0xB, short, 0));
+    t.ev(6, 100, Some(key(10)), cleanup(2, 0xB, 0x50));
+    t.ev(6, 100, Some(key(10)), outcome(2, crate::cleanup::FILE_DELETED));
     t.at(1_000);
     for r in t.requests() {
         if let Request::Expand { id, slot, .. } = r {
@@ -1054,10 +1240,10 @@ fn the_agents_own_activity_is_not_emitted() {
 fn a_clean_stop_emits_everything_pending() {
     let mut t = T::new();
     running(&mut t, 100, 10, EXPLORER);
-    t.ev(5, 100, Some(key(10)), RawEvent::FileDeletePath(path_event(1, 0xA, r"\Device\HarddiskVolume3\x")));
+    t.ev(5, 100, Some(key(10)), RawEvent::FileRenamePath(path_event(1, 0xA, r"\Device\HarddiskVolume3\x")));
     t.ev(6, 4, None, RawEvent::UdpSend(net(100, "10.0.0.5", 5353, "8.8.8.8", 53)));
     let out = t.p.stop();
-    // The delete (its window not yet passed) and the flow's Open and Close.
+    // The rename (its window not yet passed) and the flow's Open and Close.
     assert_eq!(out.len(), 3);
     valid(&out);
 }
@@ -1334,4 +1520,224 @@ fn an_event_older_than_stream_time_is_late() {
 #[test]
 fn reg_value_types_map_to_the_schema() {
     assert_eq!(RegType::from_raw(4), RegType::Known(RegValueType::Dword));
+}
+
+// ---- the independent review's cases (plan 1b-3c, Review Log) ----
+
+fn set_delete_irp(irp: u64, fo: u64, file_key: u64, delete: bool) -> RawEvent {
+    RawEvent::FileSetDelete(FileSetInfo {
+        irp,
+        file_object: fo,
+        file_key,
+        extra_information: u64::from(delete),
+        issuing_tid: 1,
+        info_class: 13,
+    })
+}
+
+/// Real Irps are per-thread and reused: the request, its Cleanup and the next
+/// failed open all carry the same Irp. The request's own successful
+/// OperationEnd never reaches the pipeline (the callback drops it).
+#[test]
+fn a_later_failure_on_the_requests_irp_does_not_take_the_request_back() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    running(&mut t, 200, 20, CMD);
+    let f = r"\Device\HarddiskVolume3\shared.txt";
+    t.ev(5, 200, Some(key(20)), create(9, 0xB, f, 0));
+    t.ev(6, 100, Some(key(10)), create(3, 0xA, f, 0));
+    t.ev(7, 100, Some(key(10)), set_delete_irp(3, 0xA, 0x50, true));
+    t.ev(7, 100, Some(key(10)), delete_path(3, 0xA, 0x50, f));
+    t.ev(8, 100, Some(key(10)), cleanup(3, 0xA, 0x50));
+    // (FILE_REMAINS: the callback drops it)
+    // 100 checks whether the file is gone: delete pending, the open fails.
+    t.ev(9, 100, Some(key(10)), create(3, 0xC, f, 0));
+    t.ev(9, 100, Some(key(10)), op_end(3, 0xC000_0056));
+    // 200 closes last.
+    t.ev(50, 200, Some(key(20)), cleanup(10, 0xB, 0x50));
+    t.ev(50, 200, Some(key(20)), outcome(10, crate::cleanup::FILE_DELETED));
+    let out = t.settle();
+    assert_eq!(files(&out), [("delete", r"C:\shared.txt".into(), 100)], "the requester");
+}
+
+/// The same, with the last handle the agent's own (a hash worker): the actor
+/// is still the requester, so the Delete is not self-filtered away.
+#[test]
+fn the_same_with_the_agent_closing_last() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    running(&mut t, 999, 0x999, CMD);
+    let f = r"\Device\HarddiskVolume3\shared.txt";
+    t.ev(5, 999, Some(key(0x999)), create(9, 0xB, f, 0));
+    t.ev(6, 100, Some(key(10)), create(3, 0xA, f, 0));
+    t.ev(7, 100, Some(key(10)), set_delete_irp(3, 0xA, 0x50, true));
+    t.ev(7, 100, Some(key(10)), delete_path(3, 0xA, 0x50, f));
+    t.ev(8, 100, Some(key(10)), cleanup(3, 0xA, 0x50));
+    t.ev(9, 100, Some(key(10)), create(3, 0xC, f, 0));
+    t.ev(9, 100, Some(key(10)), op_end(3, 0xC000_0056));
+    t.ev(50, 999, Some(key(0x999)), cleanup(10, 0xB, 0x50));
+    t.ev(50, 999, Some(key(0x999)), outcome(10, crate::cleanup::FILE_DELETED));
+    let out = t.settle();
+    assert_eq!(files(&out), [("delete", r"C:\shared.txt".into(), 100)], "the requester");
+}
+
+/// Rename, then delete through the same handle, inside the confirm window.
+#[test]
+fn rename_then_delete_on_one_handle_reports_the_new_name() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let old = r"\Device\HarddiskVolume3\a.txt";
+    let new = r"\Device\HarddiskVolume3\b.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, old, 0));
+    t.ev(6, 100, Some(key(10)), RawEvent::FileRenamePath(path_event(1, 0xA, new)));
+    t.ev(7, 100, Some(key(10)), delete_path(1, 0xA, 0x50, new));
+    t.ev(8, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    t.ev(8, 100, Some(key(10)), outcome(1, crate::cleanup::FILE_DELETED));
+    let out = t.settle();
+    let d: Vec<_> = files(&out).into_iter().filter(|f| f.0 == "delete").collect();
+    assert_eq!(d, [("delete", r"C:\b.txt".into(), 100)]);
+}
+
+/// A handle opened before another handle renamed the file, then used to delete it.
+#[test]
+fn delete_through_a_handle_opened_before_a_rename() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let old = r"\Device\HarddiskVolume3\a.txt";
+    let new = r"\Device\HarddiskVolume3\b.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xB, old, 0));
+    t.ev(6, 100, Some(key(10)), create(2, 0xA, old, 0));
+    t.ev(7, 100, Some(key(10)), RawEvent::FileRenamePath(path_event(2, 0xA, new)));
+    t.ev(800, 100, Some(key(10)), delete_path(3, 0xB, 0x50, new));
+    t.ev(801, 100, Some(key(10)), cleanup(3, 0xB, 0x50));
+    t.ev(801, 100, Some(key(10)), outcome(3, crate::cleanup::FILE_DELETED));
+    let out = t.settle();
+    let d: Vec<_> = files(&out).into_iter().filter(|f| f.0 == "delete").collect();
+    assert_eq!(d, [("delete", r"C:\b.txt".into(), 100)]);
+}
+
+/// A POSIX delete that is never reported a second time (a mapped file), then
+/// the same path recreated, its FileKey reused, and deleted the ordinary way.
+#[test]
+fn a_stale_posix_entry_does_not_suppress_a_later_delete_of_the_same_path() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\app.dll";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, f, 0));
+    t.ev(6, 100, Some(key(10)), delete_path(1, 0xA, 0x50, f));
+    t.ev(7, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    t.ev(7, 100, Some(key(10)), outcome(1, crate::cleanup::FILE_DELETED | crate::cleanup::POSIX_STYLE_DELETE));
+    t.ev(60_000, 100, Some(key(10)), create(2, 0xB, f, 0));
+    t.ev(60_001, 100, Some(key(10)), delete_path(2, 0xB, 0x50, f));
+    t.ev(60_002, 100, Some(key(10)), cleanup(2, 0xB, 0x50));
+    t.ev(60_002, 100, Some(key(10)), outcome(2, crate::cleanup::FILE_DELETED));
+    let out = t.settle();
+    let d: Vec<_> = files(&out).into_iter().filter(|f| f.0 == "delete").collect();
+    assert_eq!(d.len(), 2, "{d:?}");
+}
+
+/// A POSIX delete whose other handle was opened by its 8.3 name.
+#[test]
+fn a_posix_double_report_through_a_short_name_is_one_delete() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let long = r"\Device\HarddiskVolume3\longdirectory";
+    let short = r"\Device\HarddiskVolume3\LONGDI~1";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, short, 0));
+    t.ev(6, 100, Some(key(10)), create(2, 0xB, long, 0));
+    t.ev(7, 100, Some(key(10)), delete_path(2, 0xB, 0x50, long));
+    t.ev(8, 100, Some(key(10)), cleanup(2, 0xB, 0x50));
+    t.ev(8, 100, Some(key(10)), outcome(2, crate::cleanup::FILE_DELETED | crate::cleanup::POSIX_STYLE_DELETE));
+    t.ev(9, 100, Some(key(10)), cleanup(3, 0xA, 0x50));
+    t.ev(9, 100, Some(key(10)), outcome(3, crate::cleanup::FILE_DELETED));
+    let out = t.settle();
+    let d: Vec<_> = files(&out).into_iter().filter(|f| f.0 == "delete").collect();
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+/// Without seeding (no SeDebugPrivilege), a delete through a handle the agent
+/// never saw opened. The DeletePath carries the path; 1b-3a reported it.
+#[test]
+fn a_delete_through_an_unknown_handle_without_seeding() {
+    let cfg = Config { seed_on_miss: false, seed_on_start: false, ..Config::default() };
+    let mut t = T::with(cfg, FakeLookups::default());
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\pre.txt";
+    t.ev(6, 100, Some(key(10)), delete_path(1, 0xA, 0x50, f));
+    t.ev(7, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    t.ev(7, 100, Some(key(10)), outcome(1, crate::cleanup::FILE_DELETED));
+    let out = t.settle();
+    assert_eq!(
+        files(&out),
+        [("delete", r"C:\pre.txt".into(), 100)],
+        "unknown_file_object {}",
+        t.p.counters().unknown_file_object
+    );
+}
+
+/// The Cleanup's outcome processed before the Cleanup (a late Cleanup).
+#[test]
+fn an_outcome_processed_before_its_late_cleanup_is_paired() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\x.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, f, 0));
+    t.ev(6, 100, Some(key(10)), delete_path(1, 0xA, 0x50, f));
+    t.ev(8, 100, Some(key(10)), outcome(1, crate::cleanup::FILE_DELETED));
+    t.at(2_000);
+    t.ev(7, 100, Some(key(10)), cleanup(1, 0xA, 0x50)); // late
+    let out = t.settle();
+    let d: Vec<_> = files(&out).into_iter().filter(|f| f.0 == "delete").collect();
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+/// A late Cleanup's outcome must not be another operation's OperationEnd.
+#[test]
+fn a_cleanup_never_pairs_with_another_operations_end() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\x.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, f, 0));
+    t.ev(6, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    // (its outcome, FILE_REMAINS, the callback drops)
+    t.ev(8, 100, Some(key(10)), create(1, 0xB, f, 0));
+    t.ev(9, 100, Some(key(10)), outcome(1, crate::cleanup::FILE_DELETED)); // no Cleanup on 0xB: not ours
+    let out = t.settle();
+    assert!(files(&out).iter().all(|f| f.0 != "delete"), "{:?}", files(&out));
+}
+
+/// Clearing a delete-on-close handle's flag (`FileDispositionInformationEx`)
+/// leaves the disposition another handle set (review R-m3).
+#[test]
+fn clearing_a_handles_delete_on_close_keeps_another_handles_request() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    running(&mut t, 200, 20, CMD);
+    let f = r"\Device\HarddiskVolume3\both.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, f, 0));
+    t.ev(6, 100, Some(key(10)), set_delete(0xA, 0x50, true));
+    t.ev(6, 100, Some(key(10)), delete_path(2, 0xA, 0x50, f));
+    t.ev(7, 200, Some(key(20)), create(3, 0xB, f, FileCreate::DELETE_ON_CLOSE));
+    t.ev(8, 200, Some(key(20)), set_delete(0xB, 0x50, false));
+    t.ev(9, 200, Some(key(20)), cleanup(4, 0xB, 0x50));
+    t.ev(9, 200, Some(key(20)), outcome(4, crate::cleanup::FILE_DELETED));
+    assert_eq!(files(&t.settle()), [("delete", r"C:\both.txt".into(), 100)]);
+}
+
+/// The request's own OperationEnd (passed on by the callback) closes its Irp:
+/// a failure of a later operation on the Irp whose start the agent does not
+/// log (a query) does not take it back (review R-M1).
+#[test]
+fn a_request_that_succeeded_stands_against_a_later_failure_on_its_irp() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    running(&mut t, 200, 20, CMD);
+    let f = r"\Device\HarddiskVolume3\kept.txt";
+    t.ev(5, 200, Some(key(20)), create(9, 0xB, f, 0));
+    t.ev(6, 100, Some(key(10)), delete_path(3, 0xA, 0x50, f));
+    t.ev(6, 100, Some(key(10)), outcome(3, 0)); // the request's success
+    t.ev(7, 100, Some(key(10)), op_end(3, 0xC000_0022)); // a query on the same Irp fails
+    t.ev(50, 200, Some(key(20)), cleanup(10, 0xB, 0x50));
+    t.ev(50, 200, Some(key(20)), outcome(10, crate::cleanup::FILE_DELETED));
+    assert_eq!(files(&t.settle()), [("delete", r"C:\kept.txt".into(), 100)]);
 }

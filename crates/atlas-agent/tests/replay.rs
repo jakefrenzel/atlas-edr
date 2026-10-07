@@ -252,6 +252,14 @@ fn the_ci_recording_produces_the_scenario() {
     // final delete (after clearing read-only) does.
     assert_eq!(files.iter().filter(|(a, n)| a == "delete" && n == "c.txt").count(), 1, "{files:?}");
     assert!(counters.file_op_failed >= 2, "{counters:?}");
+    // Deletes come from the Cleanup outcome (plan 1b-3c): the undelete gives
+    // none (u.txt's one Delete is the directory's removal at the end), the
+    // hard link and the stream each give their own.
+    let deletes = |n: &str| files.iter().filter(|(a, x)| a == "delete" && x == n).count();
+    assert_eq!(deletes("u.txt"), 1, "{files:?}");
+    assert_eq!(deletes("l2.txt"), 1, "{files:?}");
+    assert_eq!(deletes("s.txt:x"), 1, "{files:?}");
+    assert_eq!(counters.file_delete_outcome_unknown, 0, "{counters:?}");
     // One spelling: no emitted path keeps the runner's 8.3 user name (plan 1b-3a Q4).
     for e in &out {
         if let EventKind::File(f) = &e.kind {
