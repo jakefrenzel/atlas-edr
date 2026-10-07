@@ -1,6 +1,6 @@
 # Sub-project 1b-3c — Agent Driver, Deletes and Live Test Implementation Plan
 
-> **Status:** Reviewed (2026-10-06), awaiting approval. **For agentic workers:** steps use checkbox (`- [ ]`) syntax for tracking. Task 7 needs one elevated run on the host, by the user, from a script; nothing in this plan needs the VM or a kernel driver.
+> **Status:** Approved (2026-10-06). **For agentic workers:** steps use checkbox (`- [ ]`) syntax for tracking. Task 7 needs one elevated run on the host, by the user, from a script; nothing in this plan needs the VM or a kernel driver.
 
 **Goal:** Run the sensor end to end (sensor spec §3.2, §11.4, §12.3): the threads that 1b-3a and 1b-3b built, wired together, and tested live at agent level.
 - **the driver:** the pipeline thread's loop, and `win::agent`, which starts and stops identity, both sessions, their consumers and intakes, the services and the pipeline thread;
