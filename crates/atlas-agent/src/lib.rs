@@ -1,8 +1,10 @@
 //! The Atlas agent (sensor spec §3).
 
+pub mod cleanup;
 pub mod completion;
 pub mod config;
 pub mod counters;
+pub mod driver;
 pub mod evict;
 pub mod fakes;
 pub mod input;

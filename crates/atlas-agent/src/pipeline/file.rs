@@ -1,6 +1,13 @@
 //! Files (sensor spec §5.5, §7.1, §7.2): the FileObject map, the failure-confirm
-//! window, Update coalescing, delete-on-close, renames and watchlist Opens.
+//! window, Update coalescing, deletes, renames and watchlist Opens.
 //! Every emitted path with 8.3 components is expanded first (`expand`).
+//!
+//! A Delete comes from the Cleanup that removed the name, as the file system
+//! reports it (`cleanup`; plan 1b-3c, D3), so an undelete gives none. Its actor
+//! is whoever asked for the delete (`DeletePath`, `SetDelete`, a delete-on-close
+//! open), else the process whose Cleanup removed it. Where the file system
+//! reports no outcome (SMB), a Cleanup of a file with a delete outstanding is
+//! taken as the delete (`file_delete_outcome_unknown`).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -10,18 +17,21 @@ use atlas_schema::{Event, EventKind, File, ProcessRef, ProcessUid};
 
 use super::Pipeline;
 use super::expand::{Expansion, Slot};
+use crate::cleanup;
 use crate::completion::{PendingId, Reason, Wait};
 use crate::counters::Class;
 use crate::input::Header;
 use crate::paths::has_short_name;
 use crate::process::{empty_file, file_name};
-use crate::recent::Recent;
+use crate::recent::{Recent, RecentMap};
 use crate::services::{HandleKind, Lookups, Request};
 
 /// Caps of the Irp and coalescing sets (each also expires by time).
 const FAILED_CAP: usize = 1 << 16;
 const CONFIRMED_CAP: usize = 1 << 18;
 const OPENED_CAP: usize = 1 << 16;
+const CLEANUPS_CAP: usize = 1 << 16;
+const REQUESTS_CAP: usize = 1 << 14;
 
 /// A watchlist Open's coalescing key: (actor, logged path lowercased).
 type OpenKey = (ProcessUid, String);
@@ -37,7 +47,8 @@ pub(crate) struct FileEntry {
     pub(crate) nt: Option<String>,
     /// Its long form, once an expansion of `nt` came back.
     pub(crate) expanded: Option<String>,
-    /// Who opened the handle: the actor of its Update and delete-on-close Delete.
+    /// Who opened the handle: the actor of its Update, and of a Delete it asked
+    /// for by opening delete-on-close.
     pub(crate) opener: Option<ProcessRef>,
     written: bool,
     delete_on_close: bool,
@@ -65,10 +76,6 @@ enum Held {
         fo: u64,
         open: Option<PendingId>,
         coalesce: Option<(OpenKey, i64)>,
-    },
-    /// The event's id, unless it went out at once (`file.op_end` off).
-    Delete {
-        id: Option<PendingId>,
     },
     Rename {
         id: Option<PendingId>,
@@ -98,6 +105,30 @@ pub struct Files {
     opened: Recent<OpenKey>,
     /// Pending id → the handle it waits on, to forget it when it leaves.
     waiter_fo: HashMap<PendingId, u64>,
+    /// Cleanups whose outcome may follow: Irp → (FileObject, FileKey). The next
+    /// operation on the Irp ends the wait (Irps are per thread and reused).
+    cleanups: RecentMap<u64, (u64, u64)>,
+    /// An outcome processed before its Cleanup (a late Cleanup): Irp → (its
+    /// header, outcome).
+    early_outcomes: RecentMap<u64, (Header, u64)>,
+    /// Deletes asked for and not cleared or reported: FileKey → who asked.
+    requests: RecentMap<u64, Requester>,
+    /// A request's Irp → its FileKey, until the request's OperationEnd: the
+    /// callback passes on both a failed one (the request is taken back) and a
+    /// successful one (it stands, review R-M1).
+    request_irps: RecentMap<u64, u64>,
+    /// POSIX-style deletes already reported: (FileKey, kind) → when.
+    posix_deleted: RecentMap<(u64, u64), i64>,
+}
+
+/// Who asked for a delete (§5.3: the actor of the Delete).
+#[derive(Debug, Clone)]
+enum Requester {
+    /// A `DeletePath` (with the path it names) or a `SetDelete`: resolved when
+    /// the delete happens.
+    Event(Header, Option<String>),
+    /// The opener of a delete-on-close handle.
+    Opener(ProcessRef),
 }
 
 impl Files {
@@ -115,11 +146,16 @@ impl Files {
             confirmed: Recent::new(CONFIRMED_CAP),
             opened: Recent::new(OPENED_CAP),
             waiter_fo: HashMap::new(),
+            cleanups: RecentMap::new(CLEANUPS_CAP),
+            requests: RecentMap::new(REQUESTS_CAP),
+            early_outcomes: RecentMap::new(REQUESTS_CAP),
+            request_irps: RecentMap::new(REQUESTS_CAP),
+            posix_deleted: RecentMap::new(REQUESTS_CAP),
         }
     }
 
     #[cfg(test)]
-    pub(super) fn sizes(&self) -> [(&'static str, usize); 6] {
+    pub(super) fn sizes(&self) -> [(&'static str, usize); 7] {
         [
             ("file waiters", self.map.values().map(|e| e.waiting.len()).sum()),
             ("file waiter index", self.waiter_fo.len()),
@@ -127,6 +163,7 @@ impl Files {
             ("failed irps", self.failed.len()),
             ("confirmed irps", self.confirmed.len()),
             ("watchlist opens", self.opened.len()),
+            ("cleanups awaiting an outcome", self.cleanups.len() + self.early_outcomes.len() + self.request_irps.len()),
         ]
     }
 
@@ -235,7 +272,7 @@ impl<L: Lookups> Pipeline<L> {
                     self.files.opened.remove(&key);
                 }
             }
-            Held::Delete { id } | Held::Rename { id, .. } => {
+            Held::Rename { id, .. } => {
                 if let Some(id) = id {
                     self.completion.cancel(id);
                 }
@@ -372,15 +409,95 @@ impl<L: Lookups> Pipeline<L> {
         }
     }
 
+    /// A delete asked for. It happens, if at all, at a Cleanup (`on_cleanup_outcome`).
+    /// Without OperationEnds (`file.op_end` off) there is no outcome, and the
+    /// request is reported as the delete (an undelete then gives one too).
     pub(super) fn on_file_delete_path(&mut self, h: &Header, p: FilePath) {
+        if self.cfg.file_op_end {
+            self.ask_delete(h, p.file_key, p.irp, Some(p.file_path.to_string_lossy()));
+            return;
+        }
         let Some(actor) = self.actor_sync(h, Class::File) else { return };
         let nt = p.file_path.to_string_lossy();
         self.requests.push(Request::InvalidateHash { nt_path: nt.clone() });
         let (file, expand) = self.emit_file(&nt, None);
         let ev = self.file_event(h.ts, actor, file, FileAction::Delete);
-        let waits = self.confirm_waits();
-        let id = self.push_with(ev, waits, expansion(expand, Expansion::file(None)));
-        self.hold(h.ts, p.irp, Held::Delete { id });
+        self.push_with(ev, vec![], expansion(expand, Expansion::file(None)));
+    }
+
+    /// Records who asked for a delete. A failed request is taken back when its
+    /// OperationEnd comes, so a FileKey later reused by another file does not
+    /// inherit it.
+    fn ask_delete(&mut self, h: &Header, key: u64, irp: u64, path: Option<String>) {
+        // A `SetDelete` comes before its `DeletePath`, which names the path.
+        let path = path.or_else(|| match self.files.requests.get(&key) {
+            Some(Requester::Event(_, p)) => p.clone(),
+            _ => None,
+        });
+        self.files.requests.insert(key, h.ts, Requester::Event(*h, path));
+        self.files.request_irps.insert(irp, h.ts, key);
+    }
+
+    /// A delete disposition set (`ExtraInformation` 1) or cleared (0), on any
+    /// handle for the file. On a delete-on-close handle a clear is taken as
+    /// `FileDispositionInformationEx` clearing that handle's flag, which leaves
+    /// a disposition another handle set (review R-m3).
+    pub(super) fn on_file_set_delete(&mut self, h: &Header, i: FileSetInfo) {
+        if i.extra_information != 0 {
+            self.ask_delete(h, i.file_key, i.irp, None);
+            return;
+        }
+        match self.files.map.get_mut(&i.file_object) {
+            Some(e) if e.delete_on_close => e.delete_on_close = false,
+            _ => {
+                self.files.requests.remove(&i.file_key);
+            }
+        }
+    }
+
+    /// A Cleanup's outcome (`cleanup`), which the callback passes on only when
+    /// it reports a removed name, or nothing for a file with a delete asked for.
+    fn on_cleanup_outcome(&mut self, h: &Header, fo: u64, key: u64, info: u64) {
+        let opener = self.files.map.get(&fo).filter(|e| e.delete_on_close).and_then(|e| e.opener.clone());
+        let requester = self.files.requests.get(&key).cloned().or(opener.map(Requester::Opener));
+        if !cleanup::removed(info) {
+            if info != cleanup::UNKNOWN || requester.is_none() {
+                return;
+            }
+            self.counters.file_delete_outcome_unknown += 1;
+        }
+        self.files.requests.remove(&key);
+        // A POSIX-style delete while another handle is open is reported twice:
+        // the name goes at the deleter's Cleanup (`POSIX_STYLE_DELETE`), the
+        // file at the last handle's (without it). Report it once. Only a handle
+        // opened before the POSIX delete can still reach the deleted file, so a
+        // FileKey reused by a new file is never mistaken for it (review R-M3).
+        let kind = info & !cleanup::POSIX_STYLE_DELETE;
+        if info & cleanup::POSIX_STYLE_DELETE != 0 {
+            self.files.posix_deleted.insert((key, kind), h.ts, h.ts);
+        } else if let Some(&at) = self.files.posix_deleted.get(&(key, kind))
+            && self.files.map.get(&fo).is_none_or(|e| e.since < at)
+        {
+            self.files.posix_deleted.remove(&(key, kind));
+            return;
+        }
+        let (actor, path) = match requester {
+            Some(Requester::Opener(a)) => (Some(a), None),
+            Some(Requester::Event(rh, path)) => (self.actor_sync(&rh, Class::File), path),
+            None => (self.actor_sync(h, Class::File), None),
+        };
+        let Some(actor) = actor else { return };
+        match path {
+            // The request's own path: current even after a rename, and known
+            // for a handle the agent never saw opened (review R-M2).
+            Some(nt) => {
+                self.requests.push(Request::InvalidateHash { nt_path: nt.clone() });
+                let (file, expand) = self.emit_file(&nt, None);
+                let ev = self.file_event(h.ts, actor, file, FileAction::Delete);
+                self.push_with(ev, vec![], expansion(expand, Expansion::file(None)));
+            }
+            None => self.file_action_on(h.ts, fo, actor, FileAction::Delete, Fill::File, true),
+        }
     }
 
     pub(super) fn on_file_rename_path(&mut self, h: &Header, p: FilePath) {
@@ -414,7 +531,23 @@ impl<L: Lookups> Pipeline<L> {
 
     pub(super) fn on_file_op_end(&mut self, h: &Header, o: FileOpEnd) {
         if !o.failed() {
-            return; // the callback discards these (§3.2); replay may not
+            // The callback passes on Cleanup outcomes and delete requests'
+            // OperationEnds (§3.2); replay may pass more.
+            self.files.request_irps.remove(&o.irp); // the request stands
+            match self.files.cleanups.remove(&o.irp) {
+                Some((_, (fo, key))) => self.on_cleanup_outcome(h, fo, key, o.extra_information),
+                // Its Cleanup may still come, late (review R-m1).
+                None if cleanup::removed(o.extra_information) || o.extra_information == cleanup::UNKNOWN => {
+                    self.files.early_outcomes.insert(o.irp, h.ts, (*h, o.extra_information));
+                }
+                None => {}
+            }
+            return;
+        }
+        self.files.cleanups.remove(&o.irp);
+        self.files.early_outcomes.remove(&o.irp);
+        if let Some((_, key)) = self.files.request_irps.remove(&o.irp) {
+            self.files.requests.remove(&key);
         }
         // The most recent held operation with this Irp (Irps are recycled).
         let base = self.files.held_base;
@@ -433,12 +566,41 @@ impl<L: Lookups> Pipeline<L> {
         }
     }
 
+    /// Another operation starts on `irp`: whatever the Irp did before is over
+    /// (Irps are per thread and reused). A Cleanup still waiting gets no outcome.
+    pub(super) fn file_next_op(&mut self, irp: u64) {
+        self.files.cleanups.remove(&irp);
+        self.files.early_outcomes.remove(&irp);
+        self.files.request_irps.remove(&irp);
+    }
+
     pub(super) fn on_file_cleanup(&mut self, h: &Header, x: FileHandle) {
+        let op_end = self.cfg.file_op_end;
+        // A late Cleanup whose outcome was processed first.
+        let early = self.files.early_outcomes.remove(&x.irp).map(|(_, v)| v).filter(|(oh, _)| oh.ts >= h.ts);
+        self.file_next_op(x.irp);
+        if op_end && early.is_none() {
+            self.files.cleanups.insert(x.irp, h.ts, (x.file_object, x.file_key));
+        }
+        self.cleanup_handle(h, &x);
+        if let Some((oh, info)) = early {
+            self.on_cleanup_outcome(&oh, x.file_object, x.file_key, info);
+        }
+    }
+
+    fn cleanup_handle(&mut self, h: &Header, x: &FileHandle) {
+        let op_end = self.cfg.file_op_end;
         let Some(e) = self.files.touch(x.file_object) else { return };
         let update = e.written && !e.cleaned;
-        let delete = e.delete_on_close;
+        // With OperationEnds the outcome reports the delete, possibly on another
+        // handle's Cleanup: the FileKey remembers who asked.
+        let delete = e.delete_on_close && !op_end;
+        let asked = if op_end && e.delete_on_close { e.opener.clone() } else { None };
         e.cleaned = true;
         let opener = e.opener.clone();
+        if let Some(a) = asked {
+            self.files.requests.insert(x.file_key, h.ts, Requester::Opener(a));
+        }
         for action in [update.then_some(FileAction::Update), delete.then_some(FileAction::Delete)].into_iter().flatten()
         {
             // The actor is the handle's opener, never the Cleanup's header (§7.1).
@@ -468,7 +630,7 @@ impl<L: Lookups> Pipeline<L> {
     /// An operation stands (§5.5).
     fn confirm(&mut self, held: Held) {
         match held {
-            Held::Create { open, .. } | Held::Delete { id: open } => {
+            Held::Create { open, .. } => {
                 if let Some(id) = open {
                     self.completion.resolve(id, Reason::Confirm);
                 }
@@ -504,6 +666,12 @@ impl<L: Lookups> Pipeline<L> {
             }
         }
         self.files.failed.expire(stream.saturating_sub(window));
+        // A Cleanup's OperationEnd follows it at once: a window is plenty.
+        self.files.cleanups.expire(stream.saturating_sub(window));
+        // Kept longer: a slow request's OperationEnd, and a Cleanup that comes
+        // late, are recognised for 40 windows (10 s), like late failures.
+        self.files.request_irps.expire(stream.saturating_sub(window.saturating_mul(40)));
+        self.files.early_outcomes.expire(stream.saturating_sub(window.saturating_mul(40)));
         self.files.confirmed.expire(stream.saturating_sub(window.saturating_mul(40)));
         self.files.opened.expire(stream.saturating_sub(self.ticks.of(self.cfg.watchlist_coalesce)));
     }

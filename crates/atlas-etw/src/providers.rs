@@ -85,7 +85,7 @@ pub fn session_a(udp: bool) -> Vec<Enable> {
         Enable {
             provider: Provider::KernelFile,
             keywords: 0x1EE0,
-            event_ids: vec![12, 13, 14, 16, 17, 24, 26, 27, 30],
+            event_ids: vec![12, 13, 14, 16, 17, 18, 24, 26, 27, 30],
         },
         // CloseKey 0x1, SetValueKey 0x100, DeleteValueKey 0x200, CreateKey 0x1000,
         // OpenKey 0x2000, DeleteKey 0x4000.

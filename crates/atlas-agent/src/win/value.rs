@@ -65,11 +65,11 @@ fn open_key(nt_path: &str, backup: bool) -> Option<Owned> {
 pub(crate) mod tests {
     use super::*;
     use windows::Wdk::Foundation::{NtQueryObject, OBJECT_INFORMATION_CLASS};
-    use windows::Wdk::System::Registry::NtSetValueKey;
+    use windows::Wdk::System::Registry::{NtDeleteKey, NtSetValueKey};
     use windows::Win32::Foundation::UNICODE_STRING;
     use windows::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_BINARY, REG_DWORD, REG_LINK, REG_OPTION_CREATE_LINK,
-        REG_OPTION_VOLATILE, REG_SZ, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+        REG_OPTION_VOLATILE, REG_SZ, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW,
     };
     use windows::core::{HSTRING, PCWSTR};
 
@@ -79,12 +79,15 @@ pub(crate) mod tests {
     pub(crate) struct TestKey {
         pub hkey: HKEY,
         sub: String,
+        /// Symbolic-link children: `RegDeleteTreeW` follows a link instead of
+        /// deleting it, which left the whole test key behind (plan 1b-3c, F7).
+        links: std::cell::RefCell<Vec<HKEY>>,
     }
 
     impl TestKey {
         pub(crate) fn new(tag: &str) -> Self {
             let sub = format!(r"Software\AtlasTest-{tag}-{}", std::process::id());
-            TestKey { hkey: Self::create(&sub, REG_OPTION_VOLATILE.0), sub }
+            TestKey { hkey: Self::create(&sub, REG_OPTION_VOLATILE.0), sub, links: Default::default() }
         }
 
         fn create(sub: &str, options: u32) -> HKEY {
@@ -109,7 +112,11 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn child(&self, name: &str, options: u32) -> HKEY {
-            Self::create(&format!(r"{}\{name}", self.sub), options)
+            let h = Self::create(&format!(r"{}\{name}", self.sub), options);
+            if options & REG_OPTION_CREATE_LINK.0 != 0 {
+                self.links.borrow_mut().push(h);
+            }
+            h
         }
 
         /// The key's NT name (`\REGISTRY\USER\<SID>\Software\…`).
@@ -148,8 +155,12 @@ pub(crate) mod tests {
 
     impl Drop for TestKey {
         fn drop(&mut self) {
-            // SAFETY: deletes the test tree.
+            // SAFETY: deletes the link keys through their own handles (opened
+            // with KEY_ALL_ACCESS), then the test tree.
             unsafe {
+                for h in self.links.borrow().iter() {
+                    let _ = NtDeleteKey(HANDLE(h.0));
+                }
                 let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(self.sub.as_str()));
             }
         }
@@ -235,6 +246,13 @@ pub(crate) mod tests {
         let through = format!(r"{}\link", k.path());
         assert_eq!(read(&read_of(through, &units("v")), false), None, "the link itself has no value v");
         assert!(read(&read_of(TestKey::nt_name(target), &units("v")), false).is_some());
+        // Dropping the test key deletes it, link included (plan 1b-3c, F7).
+        let sub = HSTRING::from(k.sub.as_str());
+        drop(k);
+        let mut h = HKEY::default();
+        // SAFETY: test-only; opens (read access) a key that must be gone.
+        let open = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &sub, None, KEY_QUERY_VALUE, &mut h) };
+        assert!(open.is_err(), "the test key is still there");
     }
 
     #[test]

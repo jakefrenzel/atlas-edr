@@ -33,7 +33,9 @@ use windows::Wdk::System::Registry::{NtCreateKey, NtDeleteKey, NtDeleteValueKey,
 use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, UNICODE_STRING};
 use windows::Win32::NetworkManagement::Dns::*;
 use windows::Win32::Security::{LookupAccountSidW, PSID, SID_NAME_USE};
-use windows::Win32::Storage::FileSystem::DeleteFileW;
+use windows::Win32::Storage::FileSystem::{
+    CreateHardLinkW, DeleteFileW, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::GetCurrentProcess;
@@ -341,6 +343,24 @@ fn open_key(path: &str) -> Key {
     Key(k)
 }
 
+/// `DELETE` access, for the disposition steps.
+const DELETE: u32 = 0x0001_0000;
+
+fn set_disposition(f: &std::fs::File, delete: bool) {
+    use std::os::windows::io::AsRawHandle;
+    let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
+    // SAFETY: a valid handle and a buffer of the class's size.
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(f.as_raw_handle()),
+            FileDispositionInfo,
+            (&raw const info).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .expect("SetFileInformationByHandle(FileDispositionInfo)");
+}
+
 /// A counted `UNICODE_STRING` over `name` (which may contain NULs).
 fn counted(name: &[u16]) -> UNICODE_STRING {
     let len = (name.len() * 2) as u16;
@@ -433,6 +453,36 @@ fn actor() -> Value {
         let f = std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(0x0400_0000).open(&d).unwrap();
         drop(f);
         assert!(!d.exists());
+    });
+    // Deletes the file system reports at Cleanup (plan 1b-3c): an undelete, a
+    // hard link and a stream. Each handle closes inside its step, so the
+    // Cleanup's OperationEnd falls in the step's window.
+    let u = dir.join("u.txt");
+    std::fs::write(&u, b"u").unwrap();
+    steps.run("file_undelete", || {
+        let f = std::fs::OpenOptions::new().access_mode(DELETE).open(&u).unwrap();
+        set_disposition(&f, true);
+        set_disposition(&f, false);
+        drop(f);
+        assert!(u.exists());
+    });
+    let (l, l2) = (dir.join("l.txt"), dir.join("l2.txt"));
+    std::fs::write(&l, b"l").unwrap();
+    // SAFETY: valid paths.
+    unsafe {
+        CreateHardLinkW(PCWSTR(wide(&l2.to_string_lossy()).as_ptr()), PCWSTR(wide(&l.to_string_lossy()).as_ptr()), None)
+    }
+    .expect("CreateHardLinkW");
+    steps.run("file_delete_hard_link", || {
+        std::fs::remove_file(&l2).unwrap();
+        assert!(l.exists());
+    });
+    let s = dir.join("s.txt");
+    std::fs::write(&s, b"s").unwrap();
+    std::fs::write(dir.join("s.txt:x"), b"x").unwrap();
+    steps.run("file_delete_stream", || {
+        std::fs::remove_file(dir.join("s.txt:x")).unwrap();
+        assert!(s.exists());
     });
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -895,6 +945,40 @@ fn analyse(r: &mut Report, steps: &Steps, events: &[Captured], actor: &Value, ob
             .any(|e| matches!(e, RawEvent::FileCreate(c) if ends_with(&c.file_name, r"\d.txt") && c.delete_on_close())),
         "",
     );
+    // The Cleanup outcome (plan 1b-3c): the OperationEnd of the Cleanups in a
+    // step report FILE_CLEANUP_* in ExtraInformation.
+    // Irps are recycled: each Cleanup pairs with the next OperationEnd of its
+    // Irp (the events are in time order).
+    let outcomes = |step: &str| -> Vec<u64> {
+        let ev = fev(step);
+        ev.iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let RawEvent::FileCleanup(h) = e else { return None };
+                ev[i + 1..].iter().find_map(|x| match x {
+                    RawEvent::FileOpEnd(o) if o.irp == h.irp => Some(o.extra_information),
+                    _ => None,
+                })
+            })
+            .collect()
+    };
+    let has = |v: &[u64], bit: u64| v.iter().any(|x| x & bit != 0);
+    let (deleted, link, stream) = (4, 8, 0x10);
+    let o = outcomes("file_delete");
+    r.check("cleanup_outcome_file_deleted", has(&o, deleted), format!("{o:x?}"));
+    let o = outcomes("file_delete_on_close");
+    r.check("cleanup_outcome_delete_on_close", has(&o, deleted), format!("{o:x?}"));
+    let o = outcomes("file_undelete");
+    r.check("cleanup_outcome_undelete_remains", !o.is_empty() && o.iter().all(|x| *x == 2), format!("{o:x?}"));
+    let sd: Vec<u64> = fev("file_undelete")
+        .iter()
+        .filter_map(|e| if let RawEvent::FileSetDelete(i) = e { Some(i.extra_information) } else { None })
+        .collect();
+    r.check("set_delete_on_set_and_clear", sd == [1, 0], format!("{sd:?}"));
+    let o = outcomes("file_delete_hard_link");
+    r.check("cleanup_outcome_link_deleted", has(&o, link) && !has(&o, deleted), format!("{o:x?}"));
+    let o = outcomes("file_delete_stream");
+    r.check("cleanup_outcome_stream_deleted", has(&o, stream) && !has(&o, deleted), format!("{o:x?}"));
 
     // Registry.
     let rev = fev;

@@ -54,6 +54,8 @@ pub struct Counters {
     pub file_object_replaced: u64,
     pub enrichment_misses: u64,
     pub enrichment_errors: u64,
+    /// Deletes reported from the request alone: the Cleanup's outcome was unknown (plan 1b-3c).
+    pub file_delete_outcome_unknown: u64,
     // Housekeeping.
     pub process_cache_evictions: u64,
     pub file_map_evictions: u64,
@@ -84,6 +86,12 @@ pub struct IntakeCounters {
     pub op_end_discarded: AtomicU64,
     /// Value reads sent on the fast path (§7.5).
     pub fast_reads: AtomicU64,
+    /// Cleanups whose outcome could not be paired with them, because another
+    /// operation on their Irp came first. With `cleanup_outcome_late` (an
+    /// outcome past the window), `quality.file_cleanup_unpaired` (plan 1b-3c,
+    /// review R-M4).
+    pub cleanup_unpaired: AtomicU64,
+    pub cleanup_outcome_late: AtomicU64,
 }
 
 impl IntakeCounters {

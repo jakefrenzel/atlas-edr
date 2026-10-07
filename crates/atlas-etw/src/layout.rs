@@ -298,6 +298,7 @@ pub const LAYOUTS: &[Layout] = &[
     l(Provider::KernelFile, 14, 1, FILE_HANDLE_V1),
     l(Provider::KernelFile, 16, 1, FILE_WRITE_V1),
     l(Provider::KernelFile, 17, 1, FILE_SET_INFO_V1),
+    l(Provider::KernelFile, 18, 1, FILE_SET_INFO_V1),
     l(Provider::KernelFile, 24, 0, FILE_OP_END_V0),
     l(Provider::KernelFile, 26, 1, FILE_PATH_V1),
     l(Provider::KernelFile, 27, 1, FILE_PATH_V1),

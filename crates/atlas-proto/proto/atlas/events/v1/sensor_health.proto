@@ -76,6 +76,12 @@ message SensorQuality {
   optional uint64 enrichment_errors = 16;
   // Registry value names that could end in more than one place (embedded NULs); the last fit was used.
   optional uint64 reg_name_ambiguous = 17;
+  // File deletes reported from the delete request alone, because the file system did not report
+  // the cleanup's outcome (SMB shares): a delete cleared later on another handle is still reported.
+  optional uint64 file_delete_outcome_unknown = 18;
+  // File Cleanups whose outcome could not be paired with them (its OperationEnd came too late,
+  // or never): a delete there may be missed.
+  optional uint64 file_cleanup_unpaired = 19;
 }
 
 // Evictions from bounded structures, and expected drops.
@@ -88,7 +94,7 @@ message SensorHousekeeping {
   optional uint64 hash_cache_evictions = 6;
   // Whole buffer segments deleted by rolling retention (expected while there is no transport).
   optional uint64 retention_evictions = 7;
-  // Failed file creates, deletes and renames that were dropped.
+  // Failed file creates and renames that were dropped (a failed delete never reports one, §5.1).
   optional uint64 file_op_failed = 8;
   optional uint64 pending_overflow = 9;
   // Handle-table seeding.

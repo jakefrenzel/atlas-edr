@@ -9,7 +9,7 @@ use std::time::Duration;
 pub struct Config {
     /// Ordering stage: how long an event is held before release (§3.2).
     pub hold: Duration,
-    /// Failure-confirm window for Create, DeletePath and RenamePath (§5.5).
+    /// Failure-confirm window for Create and RenamePath (§5.5).
     pub confirm_window: Duration,
     /// Completion deadlines (§3.2).
     pub enrich_deadline: Duration,
@@ -46,9 +46,10 @@ pub struct Config {
     pub pending_cap: usize,
     /// Registry value reads after the event (§7.5).
     pub registry_value_reads: bool,
-    /// Failure confirmation for Create, DeletePath and RenamePath (§5.5). Off
-    /// (the second §13 fallback, with the OP_END keyword disabled), they are
-    /// emitted at once.
+    /// OperationEnds: failure confirmation for Create and RenamePath, and the
+    /// Cleanup outcomes that report deletes (§5.1, §5.5). Off (the second §13
+    /// fallback, with the OP_END keyword disabled), Create and RenamePath are
+    /// emitted at once and a DeletePath is taken as the Delete.
     pub file_op_end: bool,
     /// Seed the key and file maps from the handle table at start (§7.4).
     pub seed_on_start: bool,
