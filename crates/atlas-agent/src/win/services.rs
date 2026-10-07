@@ -60,6 +60,17 @@ pub struct Services {
     counters: Arc<ServiceCounters>,
 }
 
+/// The driver's view (plan 1b-3c): the same two calls.
+impl crate::driver::Lanes for Services {
+    fn submit(&self, r: Request) {
+        Services::submit(self, r);
+    }
+
+    fn replies(&self) -> Vec<Reply> {
+        Services::replies(self).collect()
+    }
+}
+
 impl Services {
     /// Starts the threads. Enables `SeBackupPrivilege` for value reads and
     /// `SeDebugPrivilege` for the seeder; without them reads use a normal open
