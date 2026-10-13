@@ -7,6 +7,7 @@ pub mod counters;
 pub mod driver;
 pub mod evict;
 pub mod fakes;
+pub mod health;
 pub mod input;
 pub mod intake;
 pub mod keymap;
