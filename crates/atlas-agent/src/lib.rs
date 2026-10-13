@@ -16,6 +16,7 @@ pub mod pipeline;
 pub mod process;
 pub mod recent;
 pub mod services;
+pub mod settings;
 pub mod time;
 pub mod watchlist;
 #[cfg(windows)]
