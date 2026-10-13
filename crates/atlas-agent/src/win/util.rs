@@ -1,8 +1,10 @@
 //! Small helpers shared by the Windows services.
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, UNICODE_STRING};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree, UNICODE_STRING};
+use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 /// A NUL-terminated UTF-16 copy of `s`.
 pub(crate) fn wide(s: &str) -> Vec<u16> {
@@ -32,6 +34,31 @@ impl Drop for Owned {
 
 // SAFETY: a kernel handle value can be used and closed from any thread.
 unsafe impl Send for Owned {}
+
+/// A security descriptor allocated by the system, freed with `LocalFree`.
+pub(crate) struct SecurityDescriptor(pub PSECURITY_DESCRIPTOR);
+
+impl SecurityDescriptor {
+    pub(crate) fn from_sddl(sddl: &str) -> Result<Self, String> {
+        let text = wide(sddl);
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `text` is NUL-terminated; the descriptor is freed on drop.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(text.as_ptr()), SDDL_REVISION_1, &mut sd, None)
+        }
+        .map_err(|e| format!("security descriptor {sddl:?}: {e}"))?;
+        Ok(SecurityDescriptor(sd))
+    }
+}
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            // SAFETY: allocated with LocalAlloc by the system call that returned it.
+            unsafe { LocalFree(Some(HLOCAL(self.0.0))) };
+        }
+    }
+}
 
 /// The current QPC value.
 pub(crate) fn qpc_now() -> i64 {

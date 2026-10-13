@@ -14,6 +14,7 @@
 compile_error!("atlas-agent's Windows services support 64-bit Windows only");
 
 pub mod agent;
+pub mod datadir;
 mod expand;
 mod handles;
 mod hash;
