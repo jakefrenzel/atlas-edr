@@ -157,7 +157,7 @@ The agent's own loss, quality, housekeeping, resource and buffer figures, every 
 
 | Group | Holds |
 |---|---|
-| `loss` | ETW events and buffers lost per session, queue drops, DNS rate-limit drops, `actor_dropped` per class, buffer backlog drops, events skipped because the ETW callback panicked |
+| `loss` | ETW events and buffers lost per session, queue drops, DNS rate-limit drops, `actor_dropped` per class, events the buffer could not take (its writer's channel or backlog full), events skipped because the ETW callback panicked |
 | `quality` | late arrivals, parse errors, unknown versions, join misses, `actor_unresolved` per class, unresolved file objects and registry paths, value-read failures, invalid buffer records, enrichment misses, ambiguous registry value names, file deletes reported without a Cleanup outcome (SMB), Cleanups whose outcome could not be paired |
 | `housekeeping` | evictions from every bounded map and cache, retention evictions, dropped failed file creates and renames, seeding results, requests dropped because a service queue was full |
 | `resources` | agent CPU time in the interval (ns), working set (bytes) |

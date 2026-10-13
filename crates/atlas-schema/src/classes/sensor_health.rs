@@ -138,7 +138,7 @@ counter_group!(
         dns_rate_limit_drops: Option<u64>,
         /// Dropped because no process uid could be computed, per class.
         actor_dropped: Vec<ClassCount>,
-        /// Dropped because the buffer's in-memory backlog was full.
+        /// Dropped because the buffer could not take them (its writer's channel or backlog was full).
         buffer_backlog_drops: Option<u64>,
         /// Skipped because the ETW callback panicked on them.
         callback_panics: Option<u64>,

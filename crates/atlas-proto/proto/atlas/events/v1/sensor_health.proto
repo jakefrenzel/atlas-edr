@@ -48,7 +48,8 @@ message SensorLoss {
   optional uint64 dns_rate_limit_drops = 7;
   // Events dropped because no process uid could be computed, per class.
   repeated ClassCount actor_dropped = 8;
-  // Events dropped because the buffer's in-memory backlog was full (disk full or I/O errors).
+  // Events dropped because the buffer could not take them: the channel to its writer thread was
+  // full, or its in-memory backlog was (disk full or I/O errors).
   optional uint64 buffer_backlog_drops = 9;
   // Events skipped because the ETW callback panicked on them (caught, never unwound into ETW).
   optional uint64 callback_panics = 10;
