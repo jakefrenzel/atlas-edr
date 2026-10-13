@@ -109,6 +109,14 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/agent"
           cargo test -p atlas-agent --test live -- --ignored --test-threads=1 --nocapture
+      - name: Binary live test
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          ATLAS_AGENT_REPORT: ${{ runner.temp }}/agent/binary-report.json
+        run: |
+          mkdir -p "$RUNNER_TEMP/agent"
+          cargo test -p atlas-agent --test binary -- --ignored --test-threads=1 --nocapture
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@v7
