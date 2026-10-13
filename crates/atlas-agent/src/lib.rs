@@ -5,6 +5,7 @@ pub mod completion;
 pub mod config;
 pub mod counters;
 pub mod driver;
+pub mod dump;
 pub mod evict;
 pub mod fakes;
 pub mod health;
