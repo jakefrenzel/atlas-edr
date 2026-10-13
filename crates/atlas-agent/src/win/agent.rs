@@ -131,7 +131,7 @@ pub fn start(opts: AgentOptions, sink: impl FnMut(Event) + Send + 'static) -> Re
         Intake::new(Which::Process, &config, started.ticks, queues(), intake_counters.clone(), None, &self_keys);
 
     let sensor = Session::start(&session::Config::session_a(&opts.sensor_session)).map_err(AgentError::Etw)?;
-    for e in providers::session_a(config.network_udp) {
+    for e in providers::session_a(config.network_udp, config.file_op_end) {
         sensor.enable(&e).map_err(AgentError::Etw)?;
     }
     let process = Session::start(&session::Config::session_b(&opts.process_session)).map_err(AgentError::Etw)?;

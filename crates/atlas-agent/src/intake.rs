@@ -42,7 +42,9 @@ pub struct Intake {
     early: Option<EarlyKeys>,
     fast_read: Option<FastRead>,
     self_keys: HashSet<u64>,
-    cleanups: Cleanups,
+    /// `None` while `file.op_end` is off: no OperationEnd comes, so no
+    /// Cleanup is paired or counted as unpaired (plan 1b-4a).
+    cleanups: Option<Cleanups>,
 }
 
 impl Intake {
@@ -62,7 +64,7 @@ impl Intake {
         Intake {
             kernel: queues.kernel,
             user: queues.user,
-            cleanups: Cleanups::new(ticks, counters.clone()),
+            cleanups: cfg.file_op_end.then(|| Cleanups::new(ticks, counters.clone())),
             counters,
             dns: Buckets::new(cfg.dns_rate_per_pid, ticks.frequency),
             early,
@@ -84,31 +86,41 @@ impl Intake {
                 return;
             }
         };
-        if let Some(irp) = cleanup::op_irp(&event) {
-            self.cleanups.next_op(irp);
-        }
         let mut early_outcome = None;
-        match &event {
-            RawEvent::FileOpEnd(o) if !o.failed() => {
-                if let End::Discard = self.cleanups.end(header, o.irp, o.extra_information) {
-                    IntakeCounters::bump(&self.counters.op_end_discarded);
-                    return;
+        if let Some(cleanups) = &mut self.cleanups {
+            if let Some(irp) = cleanup::op_irp(&event) {
+                cleanups.next_op(irp);
+            }
+            match &event {
+                RawEvent::FileOpEnd(o) if !o.failed() => {
+                    if let End::Discard = cleanups.end(header, o.irp, o.extra_information) {
+                        IntakeCounters::bump(&self.counters.op_end_discarded);
+                        return;
+                    }
                 }
+                RawEvent::FileOpEnd(o) => cleanups.failed(o.irp),
+                RawEvent::FileCleanup(x) => {
+                    early_outcome = cleanups
+                        .cleanup(x.irp, x.file_object, x.file_key, header.ts)
+                        .map(|(h, info)| (h, FileOpEnd { irp: x.irp, extra_information: info, status: 0 }));
+                }
+                RawEvent::FileClose(x) => cleanups.close(x.file_object),
+                RawEvent::FileCreate(c) if c.delete_on_close() => cleanups.delete_on_close(c.file_object, header.ts),
+                RawEvent::FileDeletePath(p) => cleanups.request(p.file_key, p.irp, header.ts),
+                RawEvent::FileSetDelete(i) if i.extra_information != 0 => {
+                    cleanups.request(i.file_key, i.irp, header.ts)
+                }
+                RawEvent::FileSetDelete(i) => cleanups.clear(i.file_key, i.file_object),
+                _ => {}
             }
-            RawEvent::FileOpEnd(o) => self.cleanups.failed(o.irp),
-            RawEvent::FileCleanup(x) => {
-                early_outcome = self
-                    .cleanups
-                    .cleanup(x.irp, x.file_object, x.file_key, header.ts)
-                    .map(|(h, info)| (h, FileOpEnd { irp: x.irp, extra_information: info, status: 0 }));
-            }
-            RawEvent::FileClose(x) => self.cleanups.close(x.file_object),
-            RawEvent::FileCreate(c) if c.delete_on_close() => self.cleanups.delete_on_close(c.file_object, header.ts),
-            RawEvent::FileDeletePath(p) => self.cleanups.request(p.file_key, p.irp, header.ts),
-            RawEvent::FileSetDelete(i) if i.extra_information != 0 => {
-                self.cleanups.request(i.file_key, i.irp, header.ts)
-            }
-            RawEvent::FileSetDelete(i) => self.cleanups.clear(i.file_key, i.file_object),
+        } else if let RawEvent::FileOpEnd(o) = &event
+            && !o.failed()
+        {
+            // None is enabled; should one come, it is not needed.
+            IntakeCounters::bump(&self.counters.op_end_discarded);
+            return;
+        }
+        match &event {
             RawEvent::RegCreateKey(o) | RawEvent::RegOpenKey(o) if o.status == 0 => {
                 if let Some(m) = &mut self.early {
                     let evicted = m.open(o.key_object, o.base_object, &o.relative_name.to_string_lossy());
@@ -444,12 +456,18 @@ mod tests {
     type Reads = Arc<Mutex<Vec<(EarlyKey, ValueRead)>>>;
 
     fn intake(kernel_cap: usize) -> (Intake, Receiver<Incoming>, Receiver<Incoming>, Arc<IntakeCounters>, Reads) {
+        intake_with(kernel_cap, Config { dns_rate_per_pid: 2, ..Config::default() })
+    }
+
+    fn intake_with(
+        kernel_cap: usize,
+        cfg: Config,
+    ) -> (Intake, Receiver<Incoming>, Receiver<Incoming>, Arc<IntakeCounters>, Reads) {
         let (ktx, krx) = sync_channel(kernel_cap);
         let (utx, urx) = sync_channel(4);
         let counters = Arc::new(IntakeCounters::default());
         let reads: Reads = Arc::new(Mutex::new(Vec::new()));
         let r = reads.clone();
-        let cfg = Config { dns_rate_per_pid: 2, ..Config::default() };
         let i = Intake::new(
             Session::Sensor,
             &cfg,
@@ -614,6 +632,23 @@ mod tests {
         assert!(passed_outcomes(&krx).is_empty());
         assert_eq!(IntakeCounters::get(&c.cleanup_unpaired), 1);
         assert_eq!(IntakeCounters::get(&c.cleanup_outcome_late), 1);
+    }
+
+    /// With `file.op_end` off no OperationEnd is enabled, so a Cleanup waits
+    /// for nothing: none is counted unpaired, and every Cleanup still goes to
+    /// the pipeline (plan 1b-4a).
+    #[test]
+    fn with_op_end_off_no_cleanup_is_paired_or_counted() {
+        let (mut i, krx, _, c, _) = intake_with(64, Config { file_op_end: false, ..Config::default() });
+        ev_at(&mut i, 0, cleanup(1, 0x10, 0x20));
+        ev_at(&mut i, 1, RawEvent::FileClose(FileHandle { irp: 1, file_object: 0x10, file_key: 0x20, issuing_tid: 1 }));
+        ev_at(&mut i, 2, cleanup(2, 0x11, 0x21));
+        ev_at(&mut i, 2_000, outcome(2, cleanup::FILE_DELETED)); // none is enabled; should one come
+        let got: Vec<_> = krx.try_iter().map(|inc| inc.event).collect();
+        assert_eq!(got.iter().filter(|e| matches!(e, RawEvent::FileCleanup(_))).count(), 2);
+        assert!(!got.iter().any(|e| matches!(e, RawEvent::FileOpEnd(_))));
+        assert_eq!(IntakeCounters::get(&c.cleanup_unpaired), 0);
+        assert_eq!(IntakeCounters::get(&c.cleanup_outcome_late), 0);
     }
 
     /// A delete request's own OperationEnd is passed on, so the pipeline knows

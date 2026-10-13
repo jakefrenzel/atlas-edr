@@ -71,22 +71,26 @@ pub struct Enable {
 pub const LEVEL: u8 = 5;
 
 /// Session A's providers, keywords and event IDs (sensor spec §4.2).
-/// `udp`: the `network.udp` setting (§7.3), on by default.
-pub fn session_a(udp: bool) -> Vec<Enable> {
+/// `udp`: the `network.udp` setting (§7.3), on by default. `op_end`: the
+/// `file.op_end` setting (§5.5, §13); off leaves out Kernel-File 24 and its
+/// `OP_END` keyword (plan 1b-4a).
+pub fn session_a(udp: bool, op_end: bool) -> Vec<Enable> {
     let mut net = vec![12, 13, 15, 28, 29, 31];
     if udp {
         net.extend([42, 43, 58, 59]);
+    }
+    let mut file_ids = vec![12, 13, 14, 16, 17, 18, 24, 26, 27, 30];
+    let mut file_keywords = 0x1EE0;
+    if !op_end {
+        file_ids.retain(|&id| id != 24);
+        file_keywords &= !0x40;
     }
     vec![
         // WINEVENT_KEYWORD_PROCESS 0x10, WINEVENT_KEYWORD_IMAGE 0x40.
         Enable { provider: Provider::KernelProcess, keywords: 0x50, event_ids: vec![1, 2, 5] },
         // FILEIO 0x20, OP_END 0x40, CREATE 0x80, WRITE 0x200, DELETE_PATH 0x400,
         // RENAME_SETLINK_PATH 0x800, CREATE_NEW_FILE 0x1000.
-        Enable {
-            provider: Provider::KernelFile,
-            keywords: 0x1EE0,
-            event_ids: vec![12, 13, 14, 16, 17, 18, 24, 26, 27, 30],
-        },
+        Enable { provider: Provider::KernelFile, keywords: file_keywords, event_ids: file_ids },
         // CloseKey 0x1, SetValueKey 0x100, DeleteValueKey 0x200, CreateKey 0x1000,
         // OpenKey 0x2000, DeleteKey 0x4000.
         Enable { provider: Provider::KernelRegistry, keywords: 0x7301, event_ids: vec![1, 2, 3, 5, 6, 13] },
@@ -112,7 +116,7 @@ mod tests {
 
     #[test]
     fn every_enabled_event_has_a_parser() {
-        for e in session_a(true) {
+        for e in session_a(true, true) {
             for id in e.event_ids {
                 assert!(layout::newest(e.provider, id).is_some(), "{:?} {id}", e.provider);
             }
@@ -121,10 +125,22 @@ mod tests {
 
     #[test]
     fn udp_off_drops_only_the_datagram_events() {
-        let on = session_a(true);
-        let off = session_a(false);
+        let on = session_a(true, true);
+        let off = session_a(false, true);
         let net = |v: &[Enable]| v.iter().find(|e| e.provider == Provider::KernelNetwork).unwrap().event_ids.clone();
         assert_eq!(net(&on), [12, 13, 15, 28, 29, 31, 42, 43, 58, 59]);
         assert_eq!(net(&off), [12, 13, 15, 28, 29, 31]);
+    }
+
+    #[test]
+    fn op_end_off_drops_event_24_and_its_keyword_only() {
+        let file = |v: Vec<Enable>| v.into_iter().find(|e| e.provider == Provider::KernelFile).unwrap();
+        let on = file(session_a(true, true));
+        let off = file(session_a(true, false));
+        assert_eq!((on.keywords, off.keywords), (0x1EE0, 0x1EA0));
+        assert_eq!(on.event_ids, [12, 13, 14, 16, 17, 18, 24, 26, 27, 30]);
+        assert_eq!(off.event_ids, [12, 13, 14, 16, 17, 18, 26, 27, 30]);
+        let others = |v: Vec<Enable>| v.into_iter().filter(|e| e.provider != Provider::KernelFile).collect::<Vec<_>>();
+        assert_eq!(others(session_a(true, true)), others(session_a(true, false)));
     }
 }
