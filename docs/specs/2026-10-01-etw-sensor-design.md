@@ -1,6 +1,6 @@
 # Sub-project 1 — ETW Sensor Design (Agent Core)
 
-**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in six parts, each reviewed and approved before it runs (decision log, 2026-10-02; plan 1b-3 was split in two on 2026-10-05, and a plan 1b-3c added on 2026-10-06); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04); plan 1b-2 (`atlas-etw`) is done (2026-10-05); plan 1b-3a (the `atlas-agent` pipeline core) is done (2026-10-05); plan 1b-3b (the Windows services behind it) is done (2026-10-06); plan 1b-3c (the driver, the agent-level live test, and deletes from the Cleanup outcome) is done (2026-10-06); plan 1b-4 is next. Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
+**Status:** Approved (2026-10-02), revision 3. Revision 2 was approved on 2026-10-01; revision 3 folds the spike results (§15.3) and the decisions made during the spikes into the design sections (§17). Revision 1 had an independent review; its findings are folded in. Implementation: **plan 1a** (spikes S1–S10, §15.2) is done; **plan 1b** (the build) comes in six parts, each reviewed and approved before it runs (decision log, 2026-10-02; plan 1b-3 was split in two on 2026-10-05, and a plan 1b-3c added on 2026-10-06); plan 1b-1 (schema additions + `atlas-buffer`) is done (2026-10-04); plan 1b-2 (`atlas-etw`) is done (2026-10-05); plan 1b-3a (the `atlas-agent` pipeline core) is done (2026-10-05); plan 1b-3b (the Windows services behind it) is done (2026-10-06); plan 1b-3c (the driver, the agent-level live test, and deletes from the Cleanup outcome) is done (2026-10-06); plan 1b-4 is split in three (decision log, 2026-10-12): plan 1b-4a (a runnable agent: `run`, `dump`, `agent.toml`, the buffer as the sink, Sensor Health reports) is done (2026-10-13), and plan 1b-4b (blinding detection) is next, then 1b-4c (the service and acceptance). Brainstorm handoff: [etw-sensor-brainstorm-notes](2026-10-01-etw-sensor-brainstorm-notes.md).
 **Depends on:** 0a (event schema: domain types, `process_uid`, validating `TryFrom`), 0b (CI, nightly fuzz workflow).
 **Depended on by:** sub-project 2 (adds enrollment + gRPC on top of the buffer's read API), sub-project 3 (fills the agent-side detection hook), sub-project 6 (the driver becomes a second sensor feeding the same pipeline).
 
@@ -94,6 +94,7 @@ ETW (Session A: manifest providers; Session B: system logger, process events)
 [6] buffer writer thread → segment log (§8)
 
 [7] watchdog thread: session/provider checks, canaries, counters, restart (§9)
+      (plan 1b-4a: the counters and Sensor Health reports; 1b-4b adds the rest)
 ```
 
 **Order before state.** The stateful pipeline [3] must see events in timestamp order. Otherwise an ImageLoad that arrives before its ProcessStart misses the cache, and a Cleanup that arrives before its Write loses the Update. Stage [2] provides that order. Real-time ETW delivers per-CPU buffers at the session flush timer (250 ms, §4.1), so an event older than flush timer + scheduling slack has almost certainly arrived. The 750 ms hold is three flush periods. A late event (one older than stream time, the watermark; plan 1b-3a) is processed immediately, out of order, and counted. It is never dropped.
@@ -121,6 +122,8 @@ ETW (Session A: manifest providers; Session B: system logger, process events)
 - Stream time advances to each released event before that event is processed. Seeder snapshots, confirm windows and Launch halves that fall due by then are applied first.
 - Sweeps over whole tables (UDP idle, cache retention) run once per second of stream time.
 - A pending event's request bookkeeping is freed when the event leaves [5], whether or not its reply came; a later reply is ignored. Each request gets at most one reply.
+
+**The sink and the health thread** (plan 1b-4a, D1, D5). The sink moves each emitted event into a bounded channel (65,536 entries) to the buffer writer thread [6] and never blocks: a full channel drops the event and counts it in `loss.buffer_backlog_drops` (§10.3). [6] encodes and appends each event and calls the writer's `tick` about every 100 ms (at most about 200: a wait for the first record, then a drain as long; the writer flushes every second); `tick` may block on the disk while the channel absorbs events. Thread [7] is, for now, the health thread: every 5 s it takes a snapshot of every counter (the pipeline's through the driver's control channel, between two passes), and every 60 s, or at once when a loss counter rose, it sends [6] a Sensor Health report (§9.3). Plan 1b-4b adds the watchdog's checks to it.
 
 **Backpressure.** The ETW callback must stay fast: a slow consumer makes ETW drop events in the kernel. The callback parses, enqueues and keeps the small early registry map (a hash-map operation per CreateKey, OpenKey or CloseKey). Successful OperationEnds, about half of Kernel-File's volume, are discarded right there: they cost parse time but never reach [2]. The exceptions are a Cleanup's OperationEnd that reports a delete, and a delete request's (§5.1, plan 1b-3c): the callback remembers each Cleanup's and each request's `Irp` until its OperationEnd, one or two hash-map operations per Kernel-File event. Queues never block (kernel queue default 65,536 entries; user-mode queue 8,192); drops are counted per queue. User-mode providers get their own queue so a process flooding forged DNS-Client events (§4.4) cannot push kernel events out.
 
@@ -159,6 +162,8 @@ Each provider is enabled with the listed keywords and an `EVENT_FILTER_TYPE_EVEN
 | Microsoft-Windows-DNS-Client | the Operational channel keyword `0x8000000000000000`, the only one that delivers 3008 (S3) | 3008 |
 
 `FILEIO` is needed because Cleanup, Close and SetInformation sit under it. `OP_END` adds one OperationEnd (24) per operation of the enabled keywords, roughly doubling Kernel-File's kernel-side volume. Session A's callback forwards only those with a failure status and discards the rest on arrival (§3.2), so the extra cost stops at parsing. `OpenKey` is the largest single source (S9: about 5 600/s average, 32 000/s peaks), and `CloseKey` adds about 1 100/s (S7). The key map needs both (§7.4). S10 measured the set without `OP_END` and `CloseKey`, so DoD item 4 re-checks the §13 budget with them.
+
+With `file.op_end` off (§11.2, the second §13 fallback), Kernel-File is enabled without 24 and `OP_END` (mask `0x1EA0`), and the callback pairs no Cleanup with an outcome, so none is counted unpaired (plan 1b-4a). A Delete then comes from its request (§5.5).
 
 ### 4.3 Parsers
 
@@ -471,7 +476,7 @@ The writer stops appending, keeps events in a bounded in-memory backlog, retries
 - **`ProcessTrace` returning** on either consumer thread also means Stop.
 - **Provider state:** each provider in Session A is still enabled with our keywords and level (`EnumerateTraceGuidsEx` / `TraceGuidQueryInfo`). Missing or changed → **Disable** (with the provider name), then re-enable.
   - The event-ID filter cannot be read back: `TraceGuidQueryInfo` returns level, keywords, enable property and LoggerId only, and ETW adds bits of its own (property 0x80 reads back as 0xC0). So the check is that our bits are present, not that the values are equal (plan 1b-2, F3).
-  - `Microsoft-Windows-Kernel-EventTracing` logs every enable (event 14) and disable (15) of a provider in our session, a filter change included, with the **caller's** PID and start key in the header (F2). It is the candidate for detecting a narrowed filter and naming who changed it; plan 1b-4 decides.
+  - `Microsoft-Windows-Kernel-EventTracing` logs every enable (event 14) and disable (15) of a provider in our session, a filter change included, with the **caller's** PID and start key in the header (F2). It is the candidate for detecting a narrowed filter and naming who changed it; plan 1b-4b decides.
 - **Counters:** session events-lost and real-time-buffers-lost, plus all pipeline counters, sampled for Sensor Health.
 
 ### 9.2 Canaries
@@ -492,6 +497,13 @@ Emitted every 60 s (and immediately on a non-zero change in a loss counter):
 - **Quality:** late arrivals, parse errors, `unknown_version`, `launch_join_miss`, `actor_unresolved`, `unknown_file_object`, `registry_unresolved`, `value_read_failed`, `early_read_redone`, `reg_type_unusual`, `file_op_late_failure`, `writes_after_cleanup`, `file_object_replaced`, invalid records found on replay (§8.2), enrichment misses and errors.
 - **Housekeeping:** cache, map and flow-table evictions, `retention_evictions`, `file_op_failed` (failed creates, deletes and renames dropped, §5.5), `pending_overflow` (§3.2), seeder results (handles named, failed, timed out; stuck helpers outstanding; negative-cache size; table reads; deferred re-reads; whether seeding is on).
 - **Self-measurement:** agent CPU time and working set for the interval (`GetProcessTimes`, `GetProcessMemoryInfo`), so long runs measure themselves (§13).
+
+**How a report is made** (plan 1b-4a, D1, D5):
+- **Snapshots and differences:** the health thread [7] reads every cumulative counter into a snapshot: the pipeline's (through the driver's control channel, waiting at most 2 s), the intake's and the services' atomics, the callbacks' panics, both sessions' losses (`ControlTraceW` query), the sink's drops, and the process's CPU time and working set. A report holds the differences between two snapshots. The sessions' counters are 32-bit, so their differences wrap. A source that could not be read is absent from the report, and the next report covers its interval too.
+- **When:** every 60 s; at once when a loss counter rose (checked every 5 s); and a final report at the clean stop, taken after the sessions stopped, so everything counted during the run is reported. The intervals chain: each starts where the last ended, the first at the anchor taken at start. A report's time is the system clock at generation (`GetSystemTimePreciseAsFileTime`, the clock the anchor reads, §3.3); its id is a UUIDv7. If the pipeline thread died, the final report is still sent, without the pipeline's counters (they died with it).
+- **The buffer's figures:** [6] fills in the `buffer` group, `loss.buffer_backlog_drops`, `housekeeping.retention_evictions` and the gap as it appends the report, each since the report before; so the drops of the events queued ahead of a report, the final drain's included, are in it (review finding 3). The health thread's own reading of the drops only decides an early report; the first report of a run carries what recovery found at open. A report the writer's backlog cannot take is held (up to 16) and written before anything else once there is room.
+- **The diagnostic log** gets one line per report with its main figures, including the two parts of `quality.file_cleanup_unpaired` (another operation came first on the `Irp`; the outcome came after the window), which the schema sums.
+- **Not measured yet** (absent): `quality.buffer_invalid_records` and `buffer.corrupt_segments` (the agent never reads its own buffer back; `dump` counts both), and `housekeeping.seeder_negative_cache_size` (the seeder exposes no size).
 
 ## 10. Schema Additions (`atlas.events.v1`, additive)
 
@@ -520,6 +532,8 @@ One activity, `Report`, carrying the §9.3 counters (`u64`, all optional), the i
 **Plan 1b-3a additions:** `loss.callback_panics`, for events skipped because the ETW callback panicked on them (caught, never unwound into ETW), and `quality.reg_name_ambiguous`, for value names that could end in more than one place (§7.5).
 
 **Plan 1b-3b addition:** `housekeeping.service_queue_drops`, for requests dropped because a service lane was full (§3.2).
+
+**Plan 1b-4a:** no new field. `loss.buffer_backlog_drops` also counts events dropped because the channel to the buffer writer thread was full (§3.2).
 
 **Plan 1b-3c additions:** `quality.file_delete_outcome_unknown`, for Deletes reported from the request alone because the file system reported no Cleanup outcome, and `quality.file_cleanup_unpaired`, for Cleanups whose outcome could not be paired with them (§5.1).
 
@@ -550,25 +564,37 @@ Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9
 - **Data:** `C:\ProgramData\Atlas\` holds `buffer\` (segments and the `cursor` file), `canary\`, `agent.toml`, `device.json`, and `logs\`. `C:\ProgramData` lets ordinary users create folders, so a non-admin could pre-create `Atlas\` with their own ACL or plant a junction, turning the agent's deletes and renames into SYSTEM-level primitives. Therefore:
   - `service install` creates the directory with owner Administrators and a **protected** DACL (no inheritance): SYSTEM and Administrators full control, nothing else.
   - **On every start** the agent verifies the owner, the protected DACL, and that neither the directory nor anything it opens inside is a reparse point (files opened with `FILE_FLAG_OPEN_REPARSE_POINT` and checked). On failure it refuses to start and reports to the Windows Event Log (its own log directory is untrusted at that point).
+- **Plan 1b-4a (D2):** `run` creates the directory, `buffer\` and `logs\` with the SDDL `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`, or verifies them; `service install` (plan 1b-4c) calls the same code. Each is opened through one handle with `FILE_FLAG_OPEN_REPARSE_POINT` and refused if it is a reparse point or not a directory, its owner is not Administrators or SYSTEM, its DACL is null or not protected, or an allow entry names anyone but SYSTEM and Administrators (deny entries are accepted). Files inside are not checked one by one: in a verified directory only SYSTEM and Administrators can create them, and the buffer refuses segments that are reparse points (§8.2). Until the service exists (1b-4c), a refusal is printed on the console, which is the elevated user's own.
+- **The folders above it** (plan 1b-4a, review finding 4): a user who could rename one could swap in a directory of their own after the checks, with an `agent.toml` that turns the sensor off. So first, every folder above the directory, from the volume root down, is opened the same way and refused if it is a reparse point or not a directory, if its owner is not SYSTEM, Administrators or TrustedInstaller, or if an allow entry that applies to it gives anyone else `DELETE`, `WRITE_DAC`, `WRITE_OWNER`, `FILE_DELETE_CHILD` or `GENERIC_ALL` (inherit-only entries are skipped; deny entries accepted). The path must be absolute, without `..`. `C:\` and `C:\ProgramData` pass; a user's profile or `%TEMP%` does not, so `--data-dir` cannot point there. The default directory is unchanged.
 
 ### 11.2 `agent.toml`
 
 - Keys: buffer cap, retention/overflow policy, `transport` (`none` in this sub-project), ordering hold, completion deadline, enrichment size cap, watchlist (replace or extend the default), per-class enable, `network.udp`, UDP idle timeout, DNS per-PID rate, the failure-confirm window (§5.5), `file.op_end` (on by default; off emits Create, Delete and Rename without the window), seeding on start and on miss (two settings, both on; without `SeDebugPrivilege` both are off; with on-miss off, events on unknown handles wait only for the start-up pass), the seeder CPU budget (§7.4), `registry.value_reads` (on by default), log level.
 - Built-in defaults; the file only overrides them. Validated at start: an invalid file stops startup with a clear error in the Windows Event Log (Application, source `Atlas`). No hot reload in v1.
+- **Plan 1b-4a (D5):** the file's sections, keys and ranges are documented in `atlas-agent`'s `settings` module. Unknown keys and sections are refused, and every error names its key. Every key above exists except per-class enable, which is deferred: it is the last §13 fallback, and a later plan adds it if the fallbacks reach it. Until the service exists (1b-4c), an invalid file is reported on the console and in the diagnostic log.
 
 ### 11.3 CLI
 
 | Command | Behaviour |
 |---|---|
-| `atlas-agent run` | Console mode (admin required); Ctrl+C triggers a clean stop. Refuses to start if another instance holds `Global\Atlas-Agent` (single-instance mutex), so it cannot tear down the service's sessions. |
+| `atlas-agent run` | Console mode (admin required); Ctrl+C triggers a clean stop. Refuses to start if another instance holds the single-instance lock, so it cannot tear down the service's sessions. |
 | `atlas-agent service install \| uninstall \| start \| stop` | Install per §11.1; LocalSystem, auto-start. Recovery: restart after 5 s, then 60 s, then every 10 min, so a bad config does not loop hot. Uses the `windows-service` crate. |
 | `atlas-agent dump [--follow] [--from <cursor>] [--class <name>]` | JSON lines from the buffer; read-only (never acks); §8.5 concurrency rules. |
 
+**Plan 1b-4a (D3, D5):**
+- `run` takes `--data-dir` (default `C:\ProgramData\Atlas`) and names its sessions `Atlas-Sensor` and `Atlas-Process`. Ctrl+Break and closing the console also stop it cleanly. It exits with 0 after a clean stop, 1 when start-up is refused, and 2 when the pipeline thread or the buffer writer thread ended on its own (after the final report and the flush, as at a clean stop; a panic's message goes to the log).
+- **The single-instance lock** (review finding 1): a mutex `Atlas\Agent` inside a private namespace whose boundary holds the Administrators SID, with a DACL for SYSTEM and Administrators only. A mutex in `Global\` would not do: any user can create one there first. Only a token with Administrators enabled can create the namespace; one of the same name with another boundary is a different namespace; private namespaces are not per session, so the service in session 0 and `run` in a user's session find the same one; and it goes with its last handle, so a process that died does not block the next start. Verified on the host before it was built: squats on the old name and on the namespace's name blocked nothing, a non-admin could neither create nor open it, SYSTEM in session 0 saw a holder in session 1, and a holder that died freed it.
+- `dump` prints protobuf's standard JSON mapping, the replay snapshot's, one event per line. `--from` takes `segment:offset`, and `--class` one of `process`, `module`, `network`, `file`, `registry_key`, `registry_value`, `dns`, `event_log` and `sensor_health`. Invalid records are skipped and counted (§8.2). A summary goes to stderr at the end: events printed, invalid records, corrupt segments, and the cursor to continue from. With `--follow` there is no end: Ctrl+C ends it without the summary.
+
 ### 11.4 Lifecycle
 
-- **Start:** take the mutex → verify the data directory (§11.1) → load config → load `device.json` → compute `boot_id` → start sessions (recreating stale ones) → seed the process cache from the rundown → start threads → seed the key and file maps from the handle table (§7.4).
+- **Start:** take the single-instance lock (§11.3) → verify the data directory (§11.1) → load config → load `device.json` → compute `boot_id` → start sessions (recreating stale ones) → seed the process cache from the rundown → start threads → seed the key and file maps from the handle table (§7.4).
 - **Clean stop:** flush both sessions → wait out the hold → stop the sessions, so the consumers deliver the rest and finish → drain the ordering and completion stages → flush the buffer (plan 1b-3c: the queues close when the consumers do, which ends the pipeline loop). No in-flight event is lost on a clean stop. Pending events go out as at their deadlines, so one marked "drop at deadline" is dropped (plan 1b-3a).
 - **Diagnostic log:** `tracing` with a rolling file in `logs\`; its writes are self-filtered (§5.5).
+- **Plan 1b-4a:**
+  - **Start:** `run` checks for an elevated token first. The diagnostic log starts once the config is loaded, at its level. The buffer opens before the sessions start, so the sink is ready for the first event, and the health thread starts last. The console handler is installed just before the sessions start, so Ctrl+C during start-up waits and then stops cleanly, instead of ending the process with the sessions running (review finding 6).
+  - **Clean stop:** the health thread, then the sensor (as above), then a final Sensor Health report covering the stop, then the buffer flushed and closed. On the host it took 1.0 s (§15.3). The same stop follows when the pipeline thread or the buffer writer thread died (review findings 2 and 7): neither's panic takes `run` down with it. A console close waits for the stop and for the log file's last lines.
+  - **The log** goes to the console (stderr) and to `logs\atlas-agent.<date>.log`, rolled daily with seven files kept, through a non-blocking writer.
 
 ## 12. Testing
 
@@ -591,6 +617,7 @@ Plan 1b-1 also updates the 0a documents: the 0a spec's status line and its §5.9
 - Tests start real sessions on `windows-latest` (the runner is admin), run the scripted scenario, and assert the expected normalized events, filtered to the test's own process tree, with timeouts. The scenario: spawn a process with a known command line; create, write, overwrite, rename and delete a file; a failed delete (no event); a delete-on-close file; an undelete (disposition set, then cleared) and a delete-on-close cleared through `FileDispositionInformationEx`, which must produce no Delete (result documented either way); open a watchlisted path, also through its 8.3 name; create, set and delete a registry key and value (with the value data read after); a handle opened **before** the agent starts that is then written to (file) or created under (registry), named by seeding; open a TCP connection; send UDP; resolve a name.
 - Marked `#[ignore]` locally; CI runs them explicitly.
 - **Split by crate** (plan 1b-2): `atlas-etw`'s live test covers the ETW level of this scenario (process, files, failed operations, delete-on-close, registry including embedded NULs and the CloseKey handle test, TCP and UDP over IPv4 and IPv6, DNS), plus the session primitives and the event-ID filters. It runs the scenario in a second process (the actor), so the observer's own TDH lookups are not recorded. The agent-level parts (watchlist and 8.3, undelete, seeding, value reads) are `atlas-agent`'s live test (plan 1b-3c, D2): the real sessions, services and pipeline thread against an actor that opens a file and a key handle before the agent starts and is then told, over its stdin, to run the scenario. It also checks the real enrichment of the `cmd.exe` Launch (SHA-256, catalog signature, account, DOS path), that nothing of the agent's own (hashing, value reads, seeding) is emitted, and that no queue dropped. `atlas-etw`'s live test also checks the Cleanup outcomes of a delete, a delete-on-close, an undelete, a hard-link delete and a stream delete, and `SetDelete` on set and clear. CI's `agent-live` job runs the service tests that need `SeDebugPrivilege` or `SeBackupPrivilege` (plan 1b-3b) and the agent live test. Test sessions are named `Atlas-Test-*`.
+- **The binary-level test** (plan 1b-4a, D4), also in `agent-live`, runs the `atlas-agent` executable: `run` against an actor (a file created, renamed and deleted; a registry key and value; loopback TCP; two name lookups; a child `cmd`), then Ctrl+Break, then `dump`. It checks every class the actor produces; Sensor Health reports with no loss whose intervals chain, the first starting at the agent's start and the last after the stop; as many lines as the writer logged as written (`records=`), not only as a second read of the disk finds; the class filter; the protected directories and a log file; that a second instance, a directory with a loose ACL and one below `%TEMP%` are refused; and that Ctrl+Break while the sensor starts still stops it cleanly, with no session left and a final report. Its zero-loss check fails on a busy host (bursts of 18–36k events a minute; §13), pending the profiling before 1b-4b.
 
 ### 12.4 Known gaps
 
@@ -617,6 +644,8 @@ Late arrivals, enrichment misses and DNS rate-limit drops are reported, not gate
 - Buffer growth ceiling: 150–235 MB per hour of build plus browsing. This is the sizing input for sub-project 2.
 
 `OP_END`, `CloseKey`, seeding, the fast path and value reads were added after these measurements; DoD item 4 checks the budget with them.
+
+**Measured by plan 1b-4a's host run** (2026-10-12, 103 minutes of normal use; the agent's own Sensor Health records; §15.3). With everything above on, nothing was lost, but the agent is **over budget**: CPU averaged 10.1% of one core (3–4% in quiet minutes, 40–70% in the busiest), and the working set grew to 200 MB, then held. The cause is profiled before plan 1b-4b, ahead of any fallback (decision log, 2026-10-12).
 
 **Fallbacks if over budget** (applied in order, each one a decision-log entry): on-miss seeding off (start-up seeding stays); then `file.op_end` off (Create, Delete and Rename are emitted without failure confirmation, counted); then UDP off; then File Update and SetAttributes off (drops the `FILEIO` and `WRITE` keywords, the largest kernel-side cost; Create/Delete/Rename/Open remain); then registry value reads off (`data_unavailable` on every Value Set); then per-class disable in config as a last resort.
 
@@ -721,6 +750,13 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
 - **F6, host rates over 60 s:** `NameDelete` 2.4/s, `DeletePath` and `SetDelete` 0.7/s each.
 - **F7, 1b-3b's symbolic-link test leaked its volatile test key** on every run (`RegDeleteTreeW` follows a link instead of deleting it), and a reused PID then failed the test. The link is now deleted through its own handle.
 - **F8, key names keep their hive's case on the runner too:** the CI runner's `HKU\<SID>\SOFTWARE` is upper case, which only a case-sensitive test noticed; paths are compared ignoring case (§5.5).
+
+**Plan 1b-4a (2026-10-12): the runnable agent** (verified on the host, build 26200, unelevated, in one elevated test run and a 103-minute run of normal use; and on the CI runner, 26100):
+- **F1, `file.op_end` off left OperationEnd enabled:** only the pipeline's rule changed, and the callback still waited for every Cleanup's outcome, so with the fallback applied every Cleanup would have been counted unpaired. Session A now leaves out 24 and `OP_END`, and the callback pairs nothing (§4.2).
+- **F2, NTFS protects an explicit DACL given at creation:** a directory created with a security descriptor reads back with its DACL protected, even without the `P` flag. An inheriting directory is what a plain create makes (its owner then set), so that is how the test builds the case the check must refuse.
+- **F3, the CI runner's `%TEMP%` is an 8.3 path** (`RUNNER~1`); the agent reports paths in their long form (§7.2), so the binary test's actor works under the long path.
+- **F4, the host run** (103 minutes, normal use, `C:\ProgramData\Atlas`): 103 reports, chained without gaps; nothing lost of any kind; both unpaired-Cleanup parts 0; 447,287 records (150 MB); no invalid records or corrupt segments; the clean stop took 1.0 s. CPU averaged 10.1% of one core: 3–4% in quiet minutes, 40–70% in the busiest, which were also those with the most file activity (`housekeeping.file_op_failed` at 40,000–65,000 a minute against about 8,000 when quiet). The working set grew from 122 to 200 MB and then held, with no cache or map evictions. Over the §13 budget (§13).
+- **F5, on the CI runner:** the binary-level test wrote 851 events and two reports with nothing lost, and stopped in 0.9 s.
 
 **Plan 1b-3b (2026-10-06): building the Windows services** (verified on the host, unelevated and in four elevated runs):
 - **F1, `GetLongPathNameW` cannot expand NT paths:** it rejects `\\?\GLOBALROOT\Device\…` (`ERROR_INVALID_NAME`) and costs 1.55 ms for a path with 7 short components. Per-component `NtQueryDirectoryFile` takes about 54 µs per short component (§7.2).
@@ -856,3 +892,27 @@ Plan 1a ([2026-10-02-etw-sensor-spikes-plan](../plans/2026-10-02-etw-sensor-spik
 8. the agent-level live test, and `atlas-etw`'s checks of the outcomes; the delete rules are covered by scenario tests and the replay of the CI recording, not by a property test;
 9. known limitations: SMB and ReFS, a file replaced by a rename, a Cleanup and its outcome delivered far apart; the delete-on-close limitation is gone;
 10. the path from the request's `DeletePath`; a delete request's successful OperationEnd passed on; pairing by the next operation on the `Irp`, within 1 s, in either delivery order; `quality.file_cleanup_unpaired`; a delete-on-close clear keeps another handle's disposition; the driver's control channel (review, Review Log of plan 1b-3c).
+
+**Plan 1b-4a clarifications (2026-10-12).** Applied to §3.2, §4.2, §9.1, §9.3, §10.3, §11.1–§11.4, §12.3, §13 and §15.3:
+1. plan 1b-4 is split in three: 1b-4a, a runnable agent; 1b-4b, blinding detection; 1b-4c, the service and acceptance;
+2. the sink: a bounded channel to the writer thread, never blocking, its drops in `loss.buffer_backlog_drops`;
+3. thread [7] starts as the health thread: snapshots every 5 s, a report every 60 s, early on a loss, and at the clean stop;
+4. how a report is made: differences of snapshots, wrapping session counters, absent sources carried over, the buffer's figures filled in by the writer, chained intervals;
+5. the two unpaired-Cleanup parts in the diagnostic log; two counters not measured yet;
+6. `file.op_end` off leaves 24 and `OP_END` out of Session A, and the callback pairs no Cleanup;
+7. the data directory created or verified by `run`, through one handle, deny entries accepted, files inside covered by the directory's DACL;
+8. `agent.toml`: unknown keys refused, per-class enable deferred; errors on the console and in the log until the service exists;
+9. `run`'s options, stop signals and exit codes; `dump`'s format, cursor, classes and summary;
+10. the start and clean-stop order, and the diagnostic log's files;
+11. the binary-level test in `agent-live`;
+12. the host run's figures, over the §13 budget, and the profiling that comes before 1b-4b.
+
+**Plan 1b-4a review fixes (2026-10-13).** The plan's independent review found two major and six minor issues; each fix has a test, and each test was checked by reverting the fix. Applied to §3.2, §9.3, §11.1, §11.3, §11.4 and §12.3:
+1. the single-instance lock is a private namespace bounded by the Administrators SID, not `Global\Atlas-Agent`, which any user could take first;
+2. a panicked pipeline thread no longer panics `run`: the final report (without the pipeline's counters) and the flush still happen, and `run` exits 2;
+3. the writer fills `loss.buffer_backlog_drops`, so a report counts the drops of the events queued ahead of it, the final drain's included;
+4. the folders above the data directory are checked, so a user cannot swap one;
+5. a bad watchlist pattern is refused when `agent.toml` is read, naming its key;
+6. the console handler is installed before the sessions start;
+7. a dead buffer writer thread stops `run` (exit 2), and closing the buffer reports its panic instead of panicking;
+8. tests that could not catch their bug or would hang were fixed; the binary test's new check against the writer's count found that the `records=` logged at stop missed the last write's records (the buffer's `close` now returns its final counts).

@@ -63,8 +63,9 @@ fn close_writes_everything() {
     for t in 0..3 {
         w.append(&rec(t)).unwrap();
     }
-    w.close().unwrap();
+    let stats = w.close().unwrap();
     assert_eq!(read_times(tmp.path(), Cursor::default()), vec![0, 1, 2]);
+    assert_eq!(stats.records_written, 3, "the records written by the close are counted");
 }
 
 #[test]

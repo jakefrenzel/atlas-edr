@@ -32,7 +32,6 @@ use atlas_schema::classes::network::{NetworkAction, NetworkProtocol};
 use atlas_schema::classes::process::ProcessActivity;
 use atlas_schema::classes::registry::{RegistryKeyAction, RegistryValueAction};
 use atlas_schema::{BootId, DeviceUid, Event, EventKind, Hashes, decode_event, encode_event};
-use prost_reflect::{DescriptorPool, DynamicMessage};
 use serde_json::Value;
 
 /// The runner's QPC frequency (10 MHz on every current Windows).
@@ -233,11 +232,9 @@ fn answer(r: &Request) -> Option<Reply> {
     }
 }
 
+/// `dump`'s rendering (plan 1b-4a, D3).
 fn snapshot_line(e: &Event) -> String {
-    let pool = DescriptorPool::decode(atlas_proto::FILE_DESCRIPTOR_SET).unwrap();
-    let desc = pool.get_message_by_name("atlas.events.v1.Event").unwrap();
-    let msg = DynamicMessage::decode(desc, encode_event(e.clone()).as_slice()).unwrap();
-    serde_json::to_string(&msg).unwrap()
+    atlas_agent::dump::render(&encode_event(e.clone())).unwrap()
 }
 
 #[test]

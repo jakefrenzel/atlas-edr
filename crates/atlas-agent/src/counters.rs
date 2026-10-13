@@ -102,6 +102,38 @@ impl IntakeCounters {
     pub fn get(c: &AtomicU64) -> u64 {
         c.load(Ordering::Relaxed)
     }
+
+    /// The values now, for a Sensor Health snapshot (plan 1b-4a).
+    pub fn totals(&self) -> IntakeTotals {
+        let g = Self::get;
+        IntakeTotals {
+            kernel_queue_drops: g(&self.kernel_queue_drops),
+            user_queue_drops: g(&self.user_queue_drops),
+            dns_rate_limit_drops: g(&self.dns_rate_limit_drops),
+            parse_errors: g(&self.parse_errors),
+            unknown_version: g(&self.unknown_version),
+            early_key_map_evictions: g(&self.early_key_map_evictions),
+            op_end_discarded: g(&self.op_end_discarded),
+            fast_reads: g(&self.fast_reads),
+            cleanup_unpaired: g(&self.cleanup_unpaired),
+            cleanup_outcome_late: g(&self.cleanup_outcome_late),
+        }
+    }
+}
+
+/// [`IntakeCounters`] read at one instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntakeTotals {
+    pub kernel_queue_drops: u64,
+    pub user_queue_drops: u64,
+    pub dns_rate_limit_drops: u64,
+    pub parse_errors: u64,
+    pub unknown_version: u64,
+    pub early_key_map_evictions: u64,
+    pub op_end_discarded: u64,
+    pub fast_reads: u64,
+    pub cleanup_unpaired: u64,
+    pub cleanup_outcome_late: u64,
 }
 
 /// Counters kept by the Windows services (plan 1b-3b), shared with their
@@ -125,4 +157,35 @@ pub struct ServiceCounters {
     pub seeder_deferred_rereads: AtomicU64,
     /// Gauge, updated at the end of each snapshot.
     pub seeder_stuck_helpers: AtomicU64,
+}
+
+impl ServiceCounters {
+    /// The values now, for a Sensor Health snapshot (plan 1b-4a).
+    pub fn totals(&self) -> ServiceTotals {
+        let g = IntakeCounters::get;
+        ServiceTotals {
+            service_queue_drops: g(&self.service_queue_drops),
+            hash_cache_evictions: g(&self.hash_cache_evictions),
+            seeder_handles_named: g(&self.seeder_handles_named),
+            seeder_handles_failed: g(&self.seeder_handles_failed),
+            seeder_handles_timed_out: g(&self.seeder_handles_timed_out),
+            seeder_table_reads: g(&self.seeder_table_reads),
+            seeder_deferred_rereads: g(&self.seeder_deferred_rereads),
+            seeder_stuck_helpers: g(&self.seeder_stuck_helpers),
+        }
+    }
+}
+
+/// [`ServiceCounters`] read at one instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceTotals {
+    pub service_queue_drops: u64,
+    pub hash_cache_evictions: u64,
+    pub seeder_handles_named: u64,
+    pub seeder_handles_failed: u64,
+    pub seeder_handles_timed_out: u64,
+    pub seeder_table_reads: u64,
+    pub seeder_deferred_rereads: u64,
+    /// A gauge.
+    pub seeder_stuck_helpers: u64,
 }

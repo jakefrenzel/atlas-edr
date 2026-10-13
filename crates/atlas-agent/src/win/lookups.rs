@@ -330,61 +330,83 @@ mod tests {
         assert!(query_drives().iter().any(|(dev, d)| d.eq_ignore_ascii_case(drive) && dev.starts_with(r"\Device\")));
     }
 
+    /// A lookup that blocks until the test releases it, so no assertion
+    /// depends on how fast the helper thread is scheduled.
+    fn gated(slow: &'static str) -> (impl Fn(&str) -> Option<String> + Send + 'static, Sender<()>, Calls) {
+        let (release, gate) = channel::<()>();
+        let gate = Mutex::new(gate);
+        let calls: Calls = Arc::default();
+        let c = calls.clone();
+        let resolve = move |sid: &str| {
+            c.lock().unwrap().push(sid.to_string());
+            if sid == slow {
+                let _ = gate.lock().unwrap().recv();
+            }
+            (sid != "none").then(|| format!("D\\{sid}"))
+        };
+        (resolve, release, calls)
+    }
+
+    type Calls = Arc<Mutex<Vec<String>>>;
+
+    /// Asks until the helper's answer has arrived.
+    fn answered(a: &mut Accounts, sid: &str) -> Option<String> {
+        let t0 = Instant::now();
+        loop {
+            let n = a.name(sid);
+            if n.is_some() || t0.elapsed() > Duration::from_secs(10) {
+                return n;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn accounts_are_cached_and_never_wait_long() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let c = calls.clone();
-        let mut a = Accounts::new(
-            move |sid| {
-                c.lock().unwrap().push(sid.to_string());
-                if sid == "slow" {
-                    std::thread::sleep(Duration::from_millis(300));
-                }
-                (sid != "none").then(|| format!("D\\{sid}"))
-            },
-            Duration::from_millis(100),
-            Duration::from_secs(600),
-        );
+        let (resolve, release, calls) = gated("slow");
+        let timeout = Duration::from_secs(1);
+        let mut a = Accounts::new(resolve, timeout, Duration::from_secs(600));
         assert_eq!(a.name("S-1").as_deref(), Some(r"D\S-1"));
         assert_eq!(a.name("S-1").as_deref(), Some(r"D\S-1"));
         assert_eq!(a.name("none"), None);
         assert_eq!(a.name("none"), None, "failures are cached too");
+        // If the timeout were ignored, a timer opens the gate: the test fails
+        // on the answer or the time instead of hanging (review finding 8).
+        let timer = release.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout * 4);
+            let _ = timer.send(());
+        });
         let t = Instant::now();
         assert_eq!(a.name("slow"), None, "a slow lookup times out");
-        assert!(t.elapsed() < Duration::from_millis(250));
+        assert!(t.elapsed() < timeout * 2, "{:?}: waited past the timeout", t.elapsed());
         let t = Instant::now();
         assert_eq!(a.name("slow"), None, "still running: not asked twice");
-        assert!(t.elapsed() < Duration::from_millis(50), "and not waited for twice");
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(a.name("slow").as_deref(), Some(r"D\slow"), "finished in the background");
+        assert!(t.elapsed() < timeout / 2, "and not waited for twice");
+        release.send(()).unwrap();
+        assert_eq!(answered(&mut a, "slow").as_deref(), Some(r"D\slow"), "finished in the background");
         assert_eq!(*calls.lock().unwrap(), ["S-1", "none", "slow"]);
     }
 
     /// R-M4: behind one stuck lookup, new SIDs are not waited for one by one.
     #[test]
     fn one_stuck_lookup_does_not_make_every_new_sid_wait() {
-        let mut a = Accounts::new(
-            |sid| {
-                if sid == "stuck" {
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                Some(format!("D\\{sid}"))
-            },
-            Duration::from_millis(100),
-            Duration::from_secs(600),
-        );
+        let (resolve, release, _) = gated("stuck");
+        let timeout = Duration::from_secs(1);
+        let mut a = Accounts::new(resolve, timeout, Duration::from_secs(600));
         assert_eq!(a.name("stuck"), None);
         let t = Instant::now();
         for i in 0..10 {
             assert_eq!(a.name(&format!("S-{i}")), None);
         }
-        assert!(t.elapsed() < Duration::from_millis(50), "{:?} for ten new SIDs", t.elapsed());
-        std::thread::sleep(Duration::from_millis(600));
-        assert_eq!(a.name("S-9").as_deref(), Some(r"D\S-9"), "answered in the background");
+        assert!(t.elapsed() < timeout / 2, "{:?} for ten new SIDs", t.elapsed());
+        release.send(()).unwrap();
+        assert_eq!(answered(&mut a, "S-9").as_deref(), Some(r"D\S-9"), "answered in the background");
         assert_eq!(a.name("S-10").as_deref(), Some(r"D\S-10"), "waited for again once the helper answers");
     }
 
-    /// R-m4: a failure is retried after its TTL.
+    /// R-m4: a failure is retried after its TTL. The TTL is far longer than
+    /// the gap between the first two calls, also on a loaded machine.
     #[test]
     fn failures_are_retried_after_their_ttl() {
         let calls = Arc::new(Mutex::new(0));
@@ -394,13 +416,13 @@ mod tests {
                 *c.lock().unwrap() += 1;
                 None
             },
-            Duration::from_millis(100),
-            Duration::from_millis(50),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
         );
         assert_eq!(a.name("S-1"), None);
         assert_eq!(a.name("S-1"), None);
         assert_eq!(*calls.lock().unwrap(), 1, "cached");
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(600));
         assert_eq!(a.name("S-1"), None);
         assert_eq!(*calls.lock().unwrap(), 2, "asked again");
     }

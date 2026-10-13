@@ -162,7 +162,6 @@ fn drain<L: Lookups>(rx: &Receiver<Incoming>, p: &mut Pipeline<L>, max: usize) -
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{SyncSender, channel, sync_channel};
     use std::sync::{Arc, Mutex};
 
@@ -268,22 +267,33 @@ mod tests {
 
     #[test]
     fn the_anchor_is_retaken_on_its_period() {
-        let taken = Arc::new(AtomicUsize::new(0));
-        let n = taken.clone();
-        let cfg = DriverConfig { anchor_every: Duration::from_millis(20), ..DriverConfig::default() };
+        let calls = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let c = calls.clone();
+        let every = Duration::from_millis(50);
+        let cfg = DriverConfig { anchor_every: every, ..DriverConfig::default() };
+        let slack = cfg.cadence;
         let r = start(
             cfg,
             Box::new(move || {
-                n.fetch_add(1, Ordering::Relaxed);
+                c.lock().unwrap().push(Instant::now());
                 Anchor { qpc: 0, unix_ns: 1_790_000_000_000_000_000 }
             }),
         );
-        std::thread::sleep(Duration::from_millis(250));
+        // Retaken: wait for a few refreshes, however slowly the thread starts.
+        let t0 = Instant::now();
+        while calls.lock().unwrap().len() < 4 && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(r.kernel);
         drop(r.user);
         r.thread.join().unwrap();
-        let n = taken.load(Ordering::Relaxed);
-        assert!((1..=13).contains(&n), "{n} refreshes in 250 ms");
+        let calls = calls.lock().unwrap();
+        assert!(calls.len() >= 4, "{} refreshes in 10 s", calls.len());
+        // On its period, measured between the refreshes themselves, so a slow
+        // thread start cannot hide refreshes that come too often (review
+        // finding 8). A refresh follows its pass, hence one cadence of slack.
+        let gaps: Vec<Duration> = calls.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.iter().all(|g| *g + slack >= every), "{gaps:?}");
     }
 
     #[test]

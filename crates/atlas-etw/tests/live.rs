@@ -664,7 +664,7 @@ fn live_scenario() {
         ca.qpc_frequency() == freq && cb.qpc_frequency() == freq,
         format!("A {} B {} system {freq}", ca.qpc_frequency(), cb.qpc_frequency()),
     );
-    let enables = session_a(true);
+    let enables = session_a(true, true);
     steps.run("enable_a", || {
         for e in &enables {
             sa.enable(e).unwrap_or_else(|err| panic!("enable {:?}: {err}", e.provider));

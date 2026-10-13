@@ -348,7 +348,8 @@ mod tests {
 
     #[test]
     fn disk_files_are_named_and_others_are_not() {
-        let mut namer = FileNamer::new(Duration::from_millis(200), 2);
+        // A timeout no answer comes near, even with the helper thread starting under load.
+        let mut namer = FileNamer::new(Duration::from_secs(5), 2);
         let exe = std::env::current_exe().unwrap();
         let f = std::fs::File::open(&exe).unwrap();
         let FileName::Named(n, _) = namer.name(dup_own(HANDLE(f.as_raw_handle()))) else { panic!("not named") };
@@ -386,19 +387,32 @@ mod tests {
         lock(&holder);
         let waiter_raw = HANDLE(waiter.as_raw_handle());
         let mut namer = FileNamer::new(Duration::from_millis(100), 1);
-        let d = dup_own(waiter_raw);
         let t = std::thread::spawn(move || {
             lock(&waiter);
             waiter
         });
-        std::thread::sleep(Duration::from_millis(100)); // the lock request is pending
-        assert_eq!(namer.name(d), FileName::TimedOut);
+        // Until the lock request is pending the query is answered (or, on a
+        // loaded machine, merely late: a time-out whose helper still answers
+        // is not stuck). Ask until a helper is stuck, rather than guessing how
+        // long the thread takes to start.
+        let t0 = std::time::Instant::now();
+        let got = loop {
+            let got = namer.name(dup_own(waiter_raw));
+            if (got == FileName::TimedOut && namer.stuck() == 1) || t0.elapsed() > Duration::from_secs(10) {
+                break got;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(got, FileName::TimedOut);
         assert_eq!(namer.stuck(), 1);
         assert!(namer.paused());
         // SAFETY: test-only; releasing the first lock grants the second.
         unsafe { UnlockFile(HANDLE(holder.as_raw_handle()), 0, 0, 1, 0) }.unwrap();
         drop(t.join().unwrap());
-        std::thread::sleep(Duration::from_millis(100));
+        let t0 = std::time::Instant::now();
+        while namer.stuck() != 0 && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(namer.stuck(), 0, "the helper returned");
         assert!(!namer.paused());
         drop(holder);
