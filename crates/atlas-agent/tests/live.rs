@@ -351,7 +351,7 @@ fn live_agent() {
     assert!(actor.wait().unwrap().success(), "the actor failed");
 
     analyse(&mut report, &events, &result, actor_pid, me);
-    let c = &stopped.pipeline;
+    let c = stopped.pipeline.as_ref().expect("the pipeline thread ended cleanly");
     let i = &stopped.intake;
     let s = &stopped.services;
     let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);

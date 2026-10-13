@@ -3,18 +3,19 @@
 //! callbacks' intakes, the Windows services, and the pipeline thread running
 //! [`crate::driver::Driver`] into a sink.
 //!
-//! Plan 1b-4 adds the buffer writer as the sink, the watchdog, Sensor Health,
-//! the service and the CLI around this.
+//! Plan 1b-4a runs it from `atlas-agent run` with the buffer writer as the
+//! sink and the health thread reading its counters ([`Running::health_sources`]).
 
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use atlas_etw::providers;
-use atlas_etw::session::{self, Consumer, EtwError, EventRecord, Session, VersionGate};
+use atlas_etw::session::{self, Consumer, EtwError, EventRecord, Session, SessionInfo, VersionGate};
 use atlas_schema::{Event, EventId};
 
 use super::identity::{self, IdentityError, Started};
@@ -83,16 +84,36 @@ pub struct Running {
     /// The pipeline's settings as started (seeding turned off without
     /// `SeDebugPrivilege`): what a replacement `Intake` needs (plan 1b-4).
     config: Config,
+    names: [String; 2],
 }
 
 /// What a stopped sensor counted.
 #[derive(Debug)]
 pub struct Stopped {
-    pub pipeline: Counters,
+    /// The pipeline's counters, or the message of the panic that ended its
+    /// thread (its counters died with it).
+    pub pipeline: Result<Counters, String>,
     pub intake: Arc<IntakeCounters>,
     pub services: Arc<ServiceCounters>,
     /// Callbacks that panicked, both sessions (`loss.callback_panics`).
     pub callback_panics: u64,
+    /// The sessions as they stopped: their final loss counters.
+    pub sensor_session: Option<SessionInfo>,
+    pub process_session: Option<SessionInfo>,
+}
+
+/// What the health thread reads while the sensor runs (plan 1b-4a, D1).
+#[derive(Clone)]
+pub struct HealthSources {
+    /// The pipeline's counters are read through it, between two passes.
+    pub control: Sender<Control<WinLookups>>,
+    pub intake: Arc<IntakeCounters>,
+    pub services: Arc<ServiceCounters>,
+    /// Both consumers' callback panics.
+    pub panics: Vec<Arc<AtomicU64>>,
+    /// Session A's and Session B's names, for their loss counters.
+    pub sessions: [String; 2],
+    pub seeding: bool,
 }
 
 /// Starts the sensor (§11.4): identity, the services, both sessions and their
@@ -162,6 +183,7 @@ pub fn start(opts: AgentOptions, sink: impl FnMut(Event) + Send + 'static) -> Re
         seeding,
         started,
         config,
+        names: [opts.sensor_session, opts.process_session],
     })
 }
 
@@ -204,6 +226,18 @@ impl Running {
         self.control.clone()
     }
 
+    /// The sources of the Sensor Health reports.
+    pub fn health_sources(&self) -> HealthSources {
+        HealthSources {
+            control: self.control.clone(),
+            intake: self.intake.clone(),
+            services: self.services.clone(),
+            panics: self.consumers.iter().map(Consumer::panic_counter).collect(),
+            sessions: self.names.clone(),
+            seeding: self.seeding,
+        }
+    }
+
     /// Whether the pipeline thread still runs: if it panicked, the callbacks'
     /// sends fail and nothing is emitted (the watchdog's check, plan 1b-4).
     pub fn pipeline_running(&self) -> bool {
@@ -222,9 +256,7 @@ impl Running {
     }
 
     fn finish(&mut self) -> Stopped {
-        for s in [self.sensor.take(), self.process.take()].into_iter().flatten() {
-            let _ = s.stop();
-        }
+        let mut last = [self.sensor.take(), self.process.take()].map(|s| s.and_then(|s| s.stop().ok()));
         // A stopped session's consumer delivers what is left and finishes; its
         // panic count is read after that (review R-m7).
         let t0 = std::time::Instant::now();
@@ -238,8 +270,21 @@ impl Running {
             c.close();
         }
         self.spare = None;
-        let pipeline = self.pipeline.take().map(|t| t.join().expect("the pipeline thread")).unwrap_or_default();
-        Stopped { pipeline, intake: self.intake.clone(), services: self.services.clone(), callback_panics }
+        // A panicked pipeline thread must not take the caller down with it:
+        // `run` still sends the final report and flushes the buffer.
+        let pipeline = match self.pipeline.take().map(JoinHandle::join) {
+            Some(Ok(c)) => Ok(c),
+            Some(Err(p)) => Err(crate::panic_message(p.as_ref())),
+            None => Ok(Counters::default()),
+        };
+        Stopped {
+            pipeline,
+            intake: self.intake.clone(),
+            services: self.services.clone(),
+            callback_panics,
+            sensor_session: last[0].take(),
+            process_session: last[1].take(),
+        }
     }
 }
 

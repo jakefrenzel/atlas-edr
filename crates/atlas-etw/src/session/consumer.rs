@@ -198,6 +198,12 @@ impl Consumer {
         self.panics.load(Ordering::Relaxed)
     }
 
+    /// The counter behind [`Consumer::panics`], for a thread that reports it
+    /// while the consumer runs (the agent's Sensor Health, plan 1b-4a).
+    pub fn panic_counter(&self) -> Arc<AtomicU64> {
+        self.panics.clone()
+    }
+
     /// `ProcessTrace` has returned: the session stopped or was destroyed (§9.1).
     pub fn is_finished(&self) -> bool {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
