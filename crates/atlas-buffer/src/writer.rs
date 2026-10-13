@@ -183,9 +183,11 @@ impl Writer {
         }
     }
 
-    /// Clean stop: writes and flushes everything queued.
-    pub fn close(mut self) -> io::Result<()> {
-        self.flush_now()
+    /// Clean stop: writes and flushes everything queued. Returns the final
+    /// counts, this last write's records included.
+    pub fn close(mut self) -> io::Result<Stats> {
+        self.flush_now()?;
+        Ok(self.stats)
     }
 
     /// Persists `cursor` as delivered and deletes the segments wholly before it (§8.5).
