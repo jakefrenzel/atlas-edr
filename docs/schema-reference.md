@@ -151,8 +151,8 @@ Tampering seen on the agent's own ETW sessions (sensor spec §9).
 
 ### Sensor Health
 
-The agent's own loss, quality, housekeeping, resource and buffer figures, every 60 s (sensor spec §9.3). No actor.
-`interval_start` (i64 ns) starts the interval; the event's `time` ends it. One activity, Report, with five groups
+The agent's own loss, quality, housekeeping, resource, buffer and throughput figures, every 60 s (sensor spec §9.3). No actor.
+`interval_start` (i64 ns) starts the interval; the event's `time` ends it. One activity, Report, with six groups
 (field lists in `sensor_health.proto`) and an optional gap:
 
 | Group | Holds |
@@ -161,6 +161,7 @@ The agent's own loss, quality, housekeeping, resource and buffer figures, every 
 | `quality` | late arrivals, parse errors, unknown versions, join misses, `actor_unresolved` per class, unresolved file objects and registry paths, value-read failures, invalid buffer records, enrichment misses, ambiguous registry value names, file deletes reported without a Cleanup outcome (SMB), Cleanups whose outcome could not be paired |
 | `housekeeping` | evictions from every bounded map and cache, retention evictions, dropped failed file creates and renames, seeding results, requests dropped because a service queue was full |
 | `resources` | agent CPU time in the interval (ns), working set (bytes) |
+| `throughput` | ETW events each session delivered to the agent, counted before parsing |
 | `buffer` | write errors, recoveries, `failing`, rejected records, segments that could not be deleted, startup recovery (truncated bytes, cursor reset, foreign segments), corrupt segments, disk bytes |
 | `gap` | events deleted from the buffer before delivery: `events`, and `first_time` / `last_time` (both or neither, ordered) |
 
