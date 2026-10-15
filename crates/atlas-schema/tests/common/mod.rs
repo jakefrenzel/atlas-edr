@@ -16,7 +16,7 @@ use atlas_schema::classes::registry::{
 };
 use atlas_schema::classes::sensor_health::{
     ClassCount, HealthReport, SensorBuffer, SensorGap, SensorHealthAction, SensorHealthActivity, SensorHousekeeping,
-    SensorLoss, SensorQuality, SensorResources,
+    SensorLoss, SensorQuality, SensorResources, SensorThroughput,
 };
 use atlas_schema::*;
 use proptest::prelude::*;
@@ -257,6 +257,10 @@ pub fn samples() -> Vec<(&'static str, Event)> {
                         disk_bytes: Some(734_003_200),
                         ..Default::default()
                     },
+                    throughput: SensorThroughput {
+                        sensor_session_events_received: Some(612_408),
+                        process_session_events_received: Some(1_120),
+                    },
                 })),
             })),
         ),
@@ -439,6 +443,10 @@ fn arb_health_report() -> BoxedStrategy<HealthReport> {
         });
     let resources =
         (counter(), counter()).prop_map(|(cpu_time, working_set)| SensorResources { cpu_time, working_set });
+    let throughput =
+        (counter(), counter()).prop_map(|(sensor_session_events_received, process_session_events_received)| {
+            SensorThroughput { sensor_session_events_received, process_session_events_received }
+        });
     // Gap times are both present (and ordered) or both absent.
     let times = prop::option::of((any::<i64>(), any::<i64>())).prop_map(|t| match t {
         Some((a, b)) => (Some(a.min(b)), Some(a.max(b))),
@@ -465,14 +473,15 @@ fn arb_health_report() -> BoxedStrategy<HealthReport> {
             corrupt_segments: b.3,
             disk_bytes: b.4,
         });
-    (loss, quality, housekeeping, resources, gap, buffer)
-        .prop_map(|(loss, quality, housekeeping, resources, gap, buffer)| HealthReport {
+    (loss, quality, housekeeping, resources, gap, buffer, throughput)
+        .prop_map(|(loss, quality, housekeeping, resources, gap, buffer, throughput)| HealthReport {
             loss,
             quality,
             housekeeping,
             resources,
             gap,
             buffer,
+            throughput,
         })
         .boxed()
 }

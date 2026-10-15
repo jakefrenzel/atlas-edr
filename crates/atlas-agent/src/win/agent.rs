@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use atlas_etw::providers;
-use atlas_etw::session::{self, Consumer, EtwError, EventRecord, Session, SessionInfo, VersionGate};
+use atlas_etw::session::{self, Consumer, ConsumerCounters, EtwError, EventRecord, Session, SessionInfo, VersionGate};
 use atlas_schema::{Event, EventId};
 
 use super::identity::{self, IdentityError, Started};
@@ -25,6 +25,7 @@ use super::util::qpc_now;
 use crate::config::{Config, ServiceConfig};
 use crate::counters::{Counters, IntakeCounters, ServiceCounters};
 use crate::driver::{Control, Driver, DriverConfig};
+use crate::health::ThreadList;
 use crate::input::{Header, Session as Which};
 use crate::intake::{Intake, Queues};
 use crate::pipeline::{Pipeline, Setup};
@@ -72,6 +73,9 @@ pub struct Running {
     sensor: Option<Session>,
     process: Option<Session>,
     consumers: Vec<Consumer>,
+    /// Each session's callback counters, Session A's then B's: owned here, so
+    /// a restarted session's consumer counts on into the same ones (review M1).
+    counters: [ConsumerCounters; 2],
     /// Senders kept so the queues stay open while a session is restarted
     /// (plan 1b-4's watchdog); dropped at stop, which ends the pipeline loop.
     spare: Option<Queues>,
@@ -97,6 +101,8 @@ pub struct Stopped {
     pub services: Arc<ServiceCounters>,
     /// Callbacks that panicked, both sessions (`loss.callback_panics`).
     pub callback_panics: u64,
+    /// Events each consumer was delivered, Session A's then B's (`throughput`).
+    pub received: [u64; 2],
     /// The sessions as they stopped: their final loss counters.
     pub sensor_session: Option<SessionInfo>,
     pub process_session: Option<SessionInfo>,
@@ -109,11 +115,16 @@ pub struct HealthSources {
     pub control: Sender<Control<WinLookups>>,
     pub intake: Arc<IntakeCounters>,
     pub services: Arc<ServiceCounters>,
-    /// Both consumers' callback panics.
-    pub panics: Vec<Arc<AtomicU64>>,
+    /// Each session's callback counters (panics, events delivered), Session
+    /// A's then B's: the agent's, so they survive a session restart.
+    pub counters: [ConsumerCounters; 2],
     /// Session A's and Session B's names, for their loss counters.
     pub sessions: [String; 2],
     pub seeding: bool,
+    /// Lists the agent's threads with their CPU time (`win::health::threads`;
+    /// a test counts its calls). It costs ~45 ms, so it runs at most once a
+    /// report period, for a report (plan 1b-4a-p1, Q7, review m3).
+    pub threads: Arc<dyn Fn() -> Option<ThreadList> + Send + Sync>,
 }
 
 /// Starts the sensor (§11.4): identity, the services, both sessions and their
@@ -156,9 +167,12 @@ pub fn start(opts: AgentOptions, sink: impl FnMut(Event) + Send + 'static) -> Re
         sensor.enable(&e).map_err(AgentError::Etw)?;
     }
     let process = Session::start(&session::Config::session_b(&opts.process_session)).map_err(AgentError::Etw)?;
+    let counters = [ConsumerCounters::default(), ConsumerCounters::default()];
     let consumers = vec![
-        session::consume(&opts.sensor_session, callback(Which::Sensor, sensor_intake)).map_err(AgentError::Etw)?,
-        session::consume(&opts.process_session, callback(Which::Process, process_intake)).map_err(AgentError::Etw)?,
+        session::consume_with(&opts.sensor_session, callback(Which::Sensor, sensor_intake), counters[0].clone())
+            .map_err(AgentError::Etw)?,
+        session::consume_with(&opts.process_session, callback(Which::Process, process_intake), counters[1].clone())
+            .map_err(AgentError::Etw)?,
     ];
 
     let service_counters = services.counters();
@@ -175,6 +189,7 @@ pub fn start(opts: AgentOptions, sink: impl FnMut(Event) + Send + 'static) -> Re
         sensor: Some(sensor),
         process: Some(process),
         consumers,
+        counters,
         spare: Some(queues()),
         pipeline: Some(pipeline),
         control,
@@ -232,9 +247,10 @@ impl Running {
             control: self.control.clone(),
             intake: self.intake.clone(),
             services: self.services.clone(),
-            panics: self.consumers.iter().map(Consumer::panic_counter).collect(),
+            counters: self.counters.clone(),
             sessions: self.names.clone(),
             seeding: self.seeding,
+            threads: Arc::new(super::health::threads),
         }
     }
 
@@ -263,7 +279,9 @@ impl Running {
         while self.consumers.iter().any(|c| !c.is_finished()) && t0.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let callback_panics = self.consumers.iter().map(Consumer::panics).sum();
+        let load = |a: &AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        let callback_panics = self.counters.iter().map(|c| load(&c.panics)).sum();
+        let received = [0, 1].map(|i| load(&self.counters[i].received));
         // Closing a consumer drops its callback, and with it the intake's senders
         // and Session A's `FastRead`: before the services go (R-m11).
         for c in self.consumers.drain(..) {
@@ -282,6 +300,7 @@ impl Running {
             intake: self.intake.clone(),
             services: self.services.clone(),
             callback_panics,
+            received,
             sensor_session: last[0].take(),
             process_session: last[1].take(),
         }

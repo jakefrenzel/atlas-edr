@@ -12,10 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use atlas_schema::File;
+use atlas_schema::{EventKind, File};
 
 use super::Pipeline;
-use super::file::{Fill, fill_file_event};
+use super::file::{Fill, fill_file_event, forgets_cached};
 use crate::completion::Reason;
 use crate::config::Ticks;
 use crate::process::file_name;
@@ -244,9 +244,17 @@ impl<L: Lookups> Pipeline<L> {
                 continue; // left to its deadline
             }
             let (f, a) = (file.clone(), opener.clone());
-            self.completion.update(id, |e| fill_file_event(e, fill, f, a));
+            let mut forget = true;
+            self.completion.update(id, |e| {
+                if let EventKind::File(x) = &e.kind {
+                    forget = forgets_cached(&x.action);
+                }
+                fill_file_event(e, fill, f, a)
+            });
             self.completion.resolve(id, Reason::Seeder);
-            self.requests.push(Request::InvalidateHash { nt_path: nt.to_string() });
+            if forget {
+                self.requests.push(Request::InvalidateHash { nt_path: nt.to_string() });
+            }
         }
     }
 

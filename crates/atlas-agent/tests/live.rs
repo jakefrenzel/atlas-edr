@@ -358,6 +358,11 @@ fn live_agent() {
     report.check("no_queue_drops", get(&i.kernel_queue_drops) == 0 && get(&i.user_queue_drops) == 0, "");
     report.check("no_service_queue_drops", get(&s.service_queue_drops) == 0, "");
     report.check("no_callback_panics", stopped.callback_panics == 0, "");
+    report.check(
+        "both_sessions_delivered_events",
+        stopped.received[0] > stopped.received[1] && stopped.received[1] > 0,
+        format!("{:?}", stopped.received),
+    );
     // The agent's own hashing, value reads and seeding make events; the
     // self-filter must have dropped some, or the check above proves nothing
     // (review R-m6).
@@ -379,6 +384,9 @@ fn live_agent() {
             "op_end_discarded": get(&i.op_end_discarded),
             "seeder_handles_named": get(&s.seeder_handles_named),
             "seeder_table_reads": get(&s.seeder_table_reads),
+            // A launch without a hash: past its deadline, or an error.
+            "enrichment_misses": c.enrichment_misses,
+            "enrichment_errors": c.enrichment_errors,
         }),
     );
     finish(report);

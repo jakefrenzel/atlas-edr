@@ -173,7 +173,7 @@ where
         device: Device { uid: started.identity.device, boot_id: started.identity.boot },
         buffer_drops: store.drops(),
     };
-    let first = Interval { from: Snapshot::at_start(seeding), start: started.anchor.unix_ns };
+    let first = Interval { from: Snapshot::at_start(seeding, started.anchor.unix_ns), start: started.anchor.unix_ns };
     let health = HealthThread::start(running.health_sources(), reporting.clone(), first, opts.health);
 
     tracing::info!("running; Ctrl+C stops");
@@ -199,12 +199,14 @@ where
     let t0 = Instant::now();
     let at = health.stop();
     let drops = store.drops();
+    // Listed before the sensor stops, while its threads still run (review m2).
+    let listing = health::threads();
     let stopped = running.stop();
     if let Err(panic) = &stopped.pipeline {
         // The default hook printed it to stderr only; a service has none.
         tracing::error!("the pipeline thread panicked: {panic}");
     }
-    let last = health::final_snapshot(&stopped, &drops, seeding);
+    let last = health::final_snapshot(&stopped, &drops, seeding, listing);
     health::send(&reporting, at, &last);
     drop(reporting);
     match store.close() {

@@ -3,6 +3,7 @@
 //! loss counter rose, it sends a Sensor Health report to the buffer writer and
 //! logs its figures. Plan 1b-4b adds the watchdog's checks to this thread.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel};
@@ -11,14 +12,21 @@ use std::time::{Duration, Instant};
 
 use atlas_etw::session::{SessionInfo, query_by_name};
 use atlas_schema::{Device, EventId};
-use windows::Win32::Foundation::FILETIME;
+use windows::Win32::Foundation::{FILETIME, HLOCAL, LocalFree};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, GetProcessIdOfThread, GetProcessTimes, GetThreadDescription,
+    GetThreadTimes, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+};
 
 use super::agent::{HealthSources, Stopped};
 use super::identity;
+use super::util::Owned;
 use crate::counters::Counters;
-use crate::health::{self, Diagnostics, SessionLoss, Snapshot};
+use crate::health::{self, Diagnostics, SessionLoss, Snapshot, ThreadList};
 use crate::store::Record;
 
 #[derive(Debug, Clone, Copy)]
@@ -81,13 +89,21 @@ impl HealthThread {
 fn run(src: &HealthSources, out: &Reporting, first: Interval, cfg: HealthConfig, stop: &Receiver<()>) -> Interval {
     let mut at = first;
     let mut next_report = Instant::now() + cfg.report_every;
+    let mut next_listing = next_report;
     loop {
         match stop.recv_timeout(cfg.check_every) {
             Err(RecvTimeoutError::Timeout) => {}
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return at,
         }
-        let now = snapshot(src, &out.buffer_drops, pipeline_counters(src, cfg.pipeline_timeout));
+        let mut now = snapshot(src, &out.buffer_drops, pipeline_counters(src, cfg.pipeline_timeout));
         if Instant::now() >= next_report || health::loss_rose(&at.from, &now) {
+            // Listing the threads costs ~45 ms (Q7): at most once a period,
+            // for a report of either kind (review m3). A report without them
+            // leaves them to the next listing, which covers the time since.
+            if Instant::now() >= next_listing {
+                now.threads = (src.threads)();
+                next_listing = Instant::now() + cfg.report_every;
+            }
             at = send(out, at, &now);
             next_report = Instant::now() + cfg.report_every;
         }
@@ -129,10 +145,20 @@ fn log(r: &atlas_schema::classes::sensor_health::HealthReport, d: &Diagnostics, 
         service_queue_drops = n(r.housekeeping.service_queue_drops),
         pending_overflow = n(r.housekeeping.pending_overflow),
         self_filtered = n(d.self_filtered),
+        sensor_events_received = n(r.throughput.sensor_session_events_received),
+        process_events_received = n(r.throughput.process_session_events_received),
         cpu_ms = n(r.resources.cpu_time.map(|ns| ns / 1_000_000)),
         working_set_mb = n(r.resources.working_set.map(|b| b >> 20)),
+        threads_ms = d.threads_interval.map_or(-1, |ns| ns / 1_000_000),
+        threads = d.threads.as_deref().map_or_else(|| "-".to_owned(), thread_line),
         "health report"
     );
+}
+
+/// `name=ms` for each thread name, most first, as the log line carries them.
+fn thread_line(threads: &[(String, u64)]) -> String {
+    let parts: Vec<String> = threads.iter().map(|(name, ns)| format!("{name}={}", ns / 1_000_000)).collect();
+    parts.join(" ")
 }
 
 /// The pipeline's counters, read on its thread between two passes; `None` if
@@ -147,16 +173,19 @@ fn session_loss(info: Option<SessionInfo>) -> Option<SessionLoss> {
     info.map(|i| SessionLoss { events_lost: i.events_lost, buffers_lost: i.realtime_buffers_lost })
 }
 
-/// Every source now. `pipeline` is read by the caller: through the control
-/// channel while running, from `Stopped` at the end.
+/// Every source now but the threads (the caller lists them when due).
+/// `pipeline` is read by the caller: through the control channel while
+/// running, from `Stopped` at the end.
 pub fn snapshot(src: &HealthSources, buffer_drops: &AtomicU64, pipeline: Option<Counters>) -> Snapshot {
     let query = |name: &str| session_loss(query_by_name(name).ok().flatten());
     let (cpu_time, working_set) = resources();
     Snapshot {
+        threads: None,
         pipeline,
         intake: src.intake.totals(),
         services: src.services.totals(),
-        callback_panics: src.panics.iter().map(|p| p.load(Ordering::Relaxed)).sum(),
+        callback_panics: src.counters.iter().map(|c| c.panics.load(Ordering::Relaxed)).sum(),
+        received: [0, 1].map(|i| src.counters[i].received.load(Ordering::Relaxed)),
         sensor_session: query(&src.sessions[0]),
         process_session: query(&src.sessions[1]),
         buffer_drops: buffer_drops.load(Ordering::Relaxed),
@@ -168,14 +197,22 @@ pub fn snapshot(src: &HealthSources, buffer_drops: &AtomicU64, pipeline: Option<
 
 /// The snapshot for the final report, after the stop: the sessions' last
 /// counters come from their stop; the pipeline's are absent if its thread
-/// panicked.
-pub fn final_snapshot(stopped: &Stopped, buffer_drops: &AtomicU64, seeding: bool) -> Snapshot {
+/// panicked. `threads` was listed just before the stop, while the sensor's
+/// threads still ran (review m2).
+pub fn final_snapshot(
+    stopped: &Stopped,
+    buffer_drops: &AtomicU64,
+    seeding: bool,
+    threads: Option<ThreadList>,
+) -> Snapshot {
     let (cpu_time, working_set) = resources();
     Snapshot {
+        threads,
         pipeline: stopped.pipeline.as_ref().ok().cloned(),
         intake: stopped.intake.totals(),
         services: stopped.services.totals(),
         callback_panics: stopped.callback_panics,
+        received: stopped.received,
         sensor_session: session_loss(stopped.sensor_session),
         process_session: session_loss(stopped.process_session),
         buffer_drops: buffer_drops.load(Ordering::Relaxed),
@@ -199,6 +236,59 @@ fn resources() -> (Option<u64>, Option<u64>) {
     (cpu, ws)
 }
 
+/// This process's threads: each one's name (`(unnamed)` when empty) and CPU
+/// time (user + kernel, ns), by thread id and creation time. `None` if the
+/// threads could not be listed; a thread that cannot be opened, or whose id
+/// now belongs to another process, is left out. It takes a snapshot of every
+/// thread in the system: ~45 ms on the host.
+pub(crate) fn threads() -> Option<ThreadList> {
+    let at = identity::anchor().unix_ns;
+    // SAFETY: a snapshot of every thread in the system; closed by `Owned`.
+    let snap = Owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }.ok()?);
+    // SAFETY: reads the calling process's id.
+    let me = unsafe { GetCurrentProcessId() };
+    let mut threads = BTreeMap::new();
+    let mut te = THREADENTRY32 { dwSize: size_of::<THREADENTRY32>() as u32, ..Default::default() };
+    // SAFETY: `te` is a THREADENTRY32 with its size set.
+    let mut more = unsafe { Thread32First(snap.raw(), &mut te) }.is_ok();
+    while more {
+        if te.th32OwnerProcessID == me
+            && let Some((key, entry)) = thread(te.th32ThreadID, me)
+        {
+            threads.insert(key, entry);
+        }
+        // SAFETY: as for Thread32First.
+        more = unsafe { Thread32Next(snap.raw(), &mut te) }.is_ok();
+    }
+    Some(ThreadList { at, threads })
+}
+
+/// One of `me`'s threads: (id, creation time) and (name, CPU time); `None` if
+/// it cannot be opened or its id now belongs to another process's thread.
+fn thread(tid: u32, me: u32) -> Option<((u32, u64), (String, u64))> {
+    let ft = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) * 100;
+    // SAFETY: opens a thread for querying; closed by `Owned`.
+    let h = Owned(unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, tid) }.ok()?);
+    // SAFETY: an open thread handle. The id may have been reused since the snapshot.
+    if unsafe { GetProcessIdOfThread(h.raw()) } != me {
+        return None;
+    }
+    // SAFETY: the returned string is ours to free with LocalFree.
+    let name = unsafe { GetThreadDescription(h.raw()) }.ok().map(|p| {
+        // SAFETY: a NUL-terminated string from GetThreadDescription.
+        let s = unsafe { p.to_string() }.unwrap_or_default();
+        // SAFETY: frees the string GetThreadDescription allocated.
+        unsafe { LocalFree(Some(HLOCAL(p.0.cast()))) };
+        s
+    });
+    let name = name.filter(|n| !n.is_empty()).unwrap_or_else(|| "(unnamed)".to_owned());
+    let (mut c, mut e, mut k, mut u) =
+        (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: an open thread handle and four out-structures.
+    unsafe { GetThreadTimes(h.raw(), &mut c, &mut e, &mut k, &mut u) }.ok()?;
+    Some(((tid, ft(c)), (name, ft(k) + ft(u))))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::sync_channel;
@@ -207,20 +297,36 @@ mod tests {
     use atlas_schema::{BootId, DeviceUid, EventKind};
 
     use super::*;
+    use windows::Win32::System::Threading::GetCurrentThread;
+
     use crate::counters::{IntakeCounters, ServiceCounters};
 
-    /// Sources with no pipeline (its channel is closed) and no sessions.
-    fn sources(intake: &Arc<IntakeCounters>) -> HealthSources {
+    /// Sources with no pipeline (its channel is closed) and no sessions; the
+    /// threads' lister counts its calls in `lists`.
+    fn sources(intake: &Arc<IntakeCounters>, lists: &Arc<AtomicU64>) -> HealthSources {
         let (control, _) = channel();
         let pid = std::process::id();
+        let lists = lists.clone();
         HealthSources {
             control,
             intake: intake.clone(),
             services: Arc::new(ServiceCounters::default()),
-            panics: Vec::new(),
+            counters: Default::default(),
             sessions: [format!("Atlas-Test-None-A-{pid}"), format!("Atlas-Test-None-B-{pid}")],
             seeding: false,
+            threads: Arc::new(move || {
+                lists.fetch_add(1, Ordering::Relaxed);
+                Some(ThreadList::default())
+            }),
         }
+    }
+
+    fn reporting() -> (Reporting, Receiver<Record>) {
+        // Room for a report at every check of a test (a loss at each one):
+        // a full channel would block the health thread and hang the test.
+        let (to, rx) = sync_channel(4_096);
+        let device = Device { uid: DeviceUid::from_bytes([1; 16]), boot_id: BootId::from_bytes([2; 16]) };
+        (Reporting { to, device, buffer_drops: Arc::new(AtomicU64::new(0)) }, rx)
     }
 
     /// The next report's time and `loss.kernel_queue_drops`.
@@ -236,32 +342,146 @@ mod tests {
     /// ended.
     #[test]
     fn a_loss_is_reported_at_once_and_restarts_the_period() {
-        let intake = Arc::new(IntakeCounters::default());
-        let (to, rx) = sync_channel(64);
-        let device = Device { uid: DeviceUid::from_bytes([1; 16]), boot_id: BootId::from_bytes([2; 16]) };
-        let out = Reporting { to, device, buffer_drops: Arc::new(AtomicU64::new(0)) };
+        let (intake, lists) = (Arc::new(IntakeCounters::default()), Arc::new(AtomicU64::new(0)));
+        let (out, rx) = reporting();
         let period = Duration::from_millis(1_000);
         let cfg = HealthConfig {
             check_every: Duration::from_millis(20),
             report_every: period,
             pipeline_timeout: Duration::from_millis(1),
         };
-        let first = Interval { from: Snapshot::at_start(false), start: identity::anchor().unix_ns };
-        let health = HealthThread::start(sources(&intake), out, first, cfg);
+        let first =
+            Interval { from: Snapshot::at_start(false, identity::anchor().unix_ns), start: identity::anchor().unix_ns };
+        let health = HealthThread::start(sources(&intake, &lists), out, first, cfg);
 
         std::thread::sleep(Duration::from_millis(400));
         assert!(rx.try_recv().is_err(), "no report before the period without a loss");
         intake.kernel_queue_drops.fetch_add(1, Ordering::Relaxed);
         let (t1, drops) = next_report(&rx, Duration::from_millis(500)).expect("the loss reported at once");
         assert_eq!(drops, Some(1));
+        // Threads are listed at most once a period, for a report (plan
+        // 1b-4a-p1, Q7): none for the ~20 checks and the early loss report.
+        assert_eq!(lists.load(Ordering::Relaxed), 0, "threads listed at a check or too soon");
         // Times are taken as each report is sent: a slow test thread does not
         // shorten the gap.
         let (t2, drops) = next_report(&rx, Duration::from_secs(5)).expect("the periodic report");
         let gap = Duration::from_nanos((t2 - t1) as u64);
         assert!(gap + Duration::from_millis(50) >= period, "{gap:?}: the period did not restart at the loss");
         assert_eq!(drops, Some(0), "counted since the report before");
+        assert_eq!(lists.load(Ordering::Relaxed), 1, "listed once, for the periodic report");
         let at = health.stop();
         assert_eq!(at.start, t2, "the final report starts where the last one ended");
+    }
+
+    /// Review m3: under a loss at every check (a report each time), the
+    /// threads are still listed about once a period, not at every report.
+    #[test]
+    fn threads_are_listed_under_sustained_loss() {
+        let (intake, lists) = (Arc::new(IntakeCounters::default()), Arc::new(AtomicU64::new(0)));
+        let (out, rx) = reporting();
+        let cfg = HealthConfig {
+            check_every: Duration::from_millis(20),
+            report_every: Duration::from_millis(300),
+            pipeline_timeout: Duration::from_millis(1),
+        };
+        let start = identity::anchor().unix_ns;
+        let first = Interval { from: Snapshot::at_start(false, start), start };
+        let health = HealthThread::start(sources(&intake, &lists), out, first, cfg);
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(1_500) {
+            intake.kernel_queue_drops.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        health.stop();
+        let reports = rx.try_iter().count() as u64;
+        let listed = lists.load(Ordering::Relaxed);
+        assert!(listed >= 2, "{listed} listings in 1.5 s of loss ({reports} reports)");
+        assert!(reports >= 2 * listed, "{listed} listings for {reports} reports: listed at every report");
+    }
+
+    /// Each session's delivered count goes to its own place (plan 1b-4a-p1).
+    #[test]
+    fn each_sessions_received_count_is_read_into_its_place() {
+        let intake = Arc::new(IntakeCounters::default());
+        let src = sources(&intake, &Arc::new(AtomicU64::new(0)));
+        src.counters[0].received.store(5, Ordering::Relaxed);
+        src.counters[1].received.store(7, Ordering::Relaxed);
+        assert_eq!(snapshot(&src, &AtomicU64::new(0), None).received, [5, 7]);
+    }
+
+    /// The calling thread's CPU time (user + kernel), ns.
+    fn own_cpu() -> u64 {
+        let ft = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) * 100;
+        let (mut c, mut e, mut k, mut u) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        // SAFETY: the current-thread pseudo-handle and four out-structures.
+        unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) }.expect("GetThreadTimes");
+        ft(k) + ft(u)
+    }
+
+    /// Burns CPU until this thread used `ns` more: CPU time, not wall time,
+    /// so a busy machine only makes it slower.
+    fn burn(ns: u64) {
+        let end = own_cpu() + ns;
+        let mut x = 0u64;
+        while own_cpu() < end {
+            for _ in 0..10_000 {
+                x = std::hint::black_box(x.wrapping_add(1));
+            }
+        }
+    }
+
+    /// Each thread is listed on its own (two sharing a name are two entries),
+    /// only this process's threads are listed, and ended ones are gone (plan
+    /// 1b-4a-p1, review m1).
+    #[test]
+    fn threads_are_listed_one_by_one() {
+        let name = format!("atlas-test-burn-{}", std::process::id());
+        let (done, burnt) = channel::<()>();
+        let (mut go, mut handles) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            let (g, wait) = channel::<()>();
+            let done = done.clone();
+            go.push(g);
+            let t = std::thread::Builder::new().name(name.clone()).spawn(move || {
+                burn(60_000_000);
+                done.send(()).unwrap();
+                wait.recv().unwrap();
+                burn(60_000_000);
+                done.send(()).unwrap();
+                wait.recv().unwrap(); // stays until read
+            });
+            handles.push(t.unwrap());
+        }
+        let step = |go: &[Sender<()>]| {
+            for _ in 0..2 {
+                burnt.recv().unwrap();
+            }
+            let all = threads().expect("listed");
+            let process = resources().0.expect("the process's CPU");
+            assert!(all.threads.values().map(|(_, c)| c).sum::<u64>() <= process, "only this process's threads");
+            for g in go {
+                g.send(()).unwrap();
+            }
+            let ours: Vec<u64> = all.threads.values().filter(|(n, _)| *n == name).map(|(_, c)| *c).collect();
+            assert_eq!(ours.len(), 2, "two threads, two entries");
+            assert!(ours.iter().all(|&c| c >= 60_000_000), "{ours:?}");
+            ours.iter().sum::<u64>()
+        };
+        let first = step(&go);
+        assert!(first >= 120_000_000, "{first} ns: both threads");
+        let second = step(&go);
+        assert!(second >= first + 120_000_000, "{first} then {second} ns");
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(!threads().expect("listed").threads.values().any(|(n, _)| *n == name), "ended threads are gone");
+    }
+
+    #[test]
+    fn the_thread_line_is_name_equals_ms() {
+        let line = thread_line(&[("atlas-hash-0".into(), 1_234_000_000), ("atlas-pipeline".into(), 999_999)]);
+        assert_eq!(line, "atlas-hash-0=1234 atlas-pipeline=0");
     }
 
     #[test]

@@ -303,7 +303,9 @@ fn binary_run_and_dump() {
     let actor_pid = result["pid"].as_u64().unwrap() as u32;
 
     // ---- a periodic report, then the clean stop ----
-    let periodic = wait_for(&lines, "health report", Duration::from_secs(75));
+    // A report that lists the threads: the first one after a minute, a loss
+    // report included (review m6).
+    let periodic = wait_for(&lines, "atlas-pipeline=", Duration::from_secs(75));
     report.check("a_periodic_report_while_running", periodic, "");
     std::thread::sleep(Duration::from_secs(3));
     let stop_ns = unix_now();
@@ -351,6 +353,18 @@ fn binary_run_and_dump() {
         })
         .unwrap_or(false);
     report.check("the_log_file_has_the_reports", logged, "");
+    // A periodic report's line names the agent's threads with their CPU (plan 1b-4a-p1).
+    let log_text: String = std::fs::read_dir(data.join("logs"))
+        .map(|r| r.filter_map(Result::ok).filter_map(|e| std::fs::read_to_string(e.path()).ok()).collect())
+        .unwrap_or_default();
+    let thread_line = log_text.lines().find(|l| l.contains("health report") && l.contains("atlas-pipeline="));
+    report.check("a_report_logs_cpu_per_thread", thread_line.is_some(), thread_line.unwrap_or("").trim());
+    // The final report's threads are listed before the sensor stops (review
+    // m2). Not a check: a thread shows only if it used a clock tick (~15.6 ms)
+    // since the last listing, a few seconds before; its line is kept instead.
+    let last = log_text.lines().rfind(|l| l.contains("health report")).unwrap_or("");
+    let threads = last.split("threads=").nth(1).unwrap_or("").trim();
+    report.note("final_report_threads", json!(threads));
 
     // ---- the buffer: through dump, and directly ----
     let (code, out, err) = run_to_end(&["dump", "--data-dir", &data.to_string_lossy()], Duration::from_secs(60));
@@ -642,6 +656,27 @@ fn analyse_health(r: &mut Report, reports: &[(&Event, &HealthReport, i64)]) {
         "",
     );
     r.check("seeding_reported", reports.iter().all(|(_, h, _)| h.housekeeping.seeding_enabled == Some(true)), "");
+    // Every report measures what each session delivered; the actor's launches
+    // reach Session B, its files Session A.
+    let received =
+        |f: fn(&HealthReport) -> Option<u64>| reports.iter().map(|(_, h, _)| f(h)).collect::<Option<Vec<_>>>();
+    let sensor = received(|h| h.throughput.sensor_session_events_received);
+    let process = received(|h| h.throughput.process_session_events_received);
+    let sums = (sensor.as_ref().map(|v| v.iter().sum::<u64>()), process.as_ref().map(|v| v.iter().sum::<u64>()));
+    // Session A (files, registry, network) delivers far more than Session B
+    // (processes): a swap of the two shows (review m5). The final report,
+    // made after the stop, counts too.
+    r.check(
+        "events_received_measured",
+        matches!(sums, (Some(s), Some(p)) if s > p && p > 0),
+        format!("{sensor:?} {process:?}"),
+    );
+    r.check(
+        "the_final_report_counts_events_received",
+        sensor.as_ref().and_then(|v| v.last()).is_some_and(|&n| n > 0),
+        format!("{sensor:?}"),
+    );
+    r.note("events_received", json!({ "sensor": sums.0, "process": sums.1 }));
     let unpaired: u64 = reports.iter().filter_map(|(_, h, _)| h.quality.file_cleanup_unpaired).sum();
     r.note("file_cleanup_unpaired", json!(unpaired));
     let cpu: u64 = reports.iter().filter_map(|(_, h, _)| h.resources.cpu_time).sum();

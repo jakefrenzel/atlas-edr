@@ -587,6 +587,91 @@ fn one_update_per_written_handle_with_the_opener_as_actor() {
     valid(&out);
 }
 
+/// The paths the hash and 8.3 caches were told to forget, in order.
+fn forgotten(t: &mut T) -> Vec<String> {
+    t.requests()
+        .into_iter()
+        .filter_map(|r| match r {
+            Request::InvalidateHash { nt_path } => Some(nt_path),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D6: the System process sets the basic information of the DLLs starting
+/// processes load; forgetting their hashes then re-hashed them on every launch.
+#[test]
+fn a_set_attributes_leaves_the_caches_alone_and_an_update_does_not() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\Windows\System32\kernel32.dll";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, f, 0));
+    t.ev(6, 100, Some(key(10)), set_info(0xA, 4));
+    t.ev(7, 100, Some(key(10)), write(0xA));
+    t.ev(8, 100, Some(key(10)), RawEvent::FileCleanup(handle(0xA)));
+    let out = t.settle();
+    assert_eq!(
+        files(&out),
+        [
+            ("setattr", r"C:\Windows\System32\kernel32.dll".into(), 100),
+            ("update", r"C:\Windows\System32\kernel32.dll".into(), 100)
+        ]
+    );
+    assert_eq!(forgotten(&mut t), [f], "the Update only");
+    valid(&out);
+}
+
+/// The same for a handle the seeder names: the waiting SetAttributes is
+/// answered without forgetting, the waiting Update forgets.
+#[test]
+fn a_set_attributes_the_seeder_answers_leaves_the_caches_alone() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\Windows\System32\kernel32.dll";
+    t.ev(5, 100, Some(key(10)), set_info(0xB, 4)); // a handle from before the agent
+    t.ev(6, 100, Some(key(10)), write(0xB));
+    t.ev(7, 4, None, RawEvent::FileCleanup(handle(0xB)));
+    t.at(1_000);
+    assert_eq!(seed_asks(&mut t, HandleKind::File), [vec![0xB]]);
+    t.reply(Reply::Snapshot(Snapshot {
+        kind: HandleKind::File,
+        taken: ms(1_000),
+        asked: vec![0xB],
+        named: vec![Named { address: 0xB, owner_pid: 100, name: f.into() }],
+        unnamable: vec![],
+    }));
+    let out = t.settle();
+    assert_eq!(
+        files(&out),
+        [
+            ("setattr", r"C:\Windows\System32\kernel32.dll".into(), 100),
+            ("update", r"C:\Windows\System32\kernel32.dll".into(), 100)
+        ]
+    );
+    assert_eq!(forgotten(&mut t), [f], "the Update only");
+    valid(&out);
+}
+
+/// Review m4: every action but SetAttributes makes the caches forget, Delete
+/// and Rename included (a Delete on a known handle, or at a delete-on-close
+/// Cleanup, asks `forgets_cached`).
+#[test]
+fn only_a_set_attributes_leaves_the_caches_alone() {
+    let file_result = atlas_schema::File { name: String::new(), path: String::new(), hashes: None, signature: None };
+    let actions = [
+        (FileAction::Create, true),
+        (FileAction::Read, true),
+        (FileAction::Update, true),
+        (FileAction::Delete, true),
+        (FileAction::Rename { file_result }, true),
+        (FileAction::Open, true),
+        (FileAction::SetAttributes, false),
+    ];
+    for (action, forgets) in actions {
+        assert_eq!(super::file::forgets_cached(&action), forgets, "{action:?}");
+    }
+}
+
 /// The renames' results, the only part a rename of an unknown handle carries.
 fn rename_results(events: &[Event]) -> Vec<String> {
     events

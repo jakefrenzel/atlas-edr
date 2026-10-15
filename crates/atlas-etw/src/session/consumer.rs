@@ -110,11 +110,22 @@ impl<'a> EventRecord<'a> {
 
 type Callback = Box<dyn FnMut(&EventRecord) + Send>;
 
+/// A consumer's counters, owned by the caller so they outlive one consumer: a
+/// restarted session's new consumer takes the same ones, and the counts never
+/// go back (plan 1b-4a-p1, review M1).
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerCounters {
+    /// Callbacks that panicked (each was caught and the event skipped).
+    pub panics: Arc<AtomicU64>,
+    /// Events delivered, counted before the callback runs.
+    pub received: Arc<AtomicU64>,
+}
+
 /// A consumer thread. Close it after stopping its session; dropping it closes it too.
 pub struct Consumer {
     handle: PROCESSTRACE_HANDLE,
     thread: Option<JoinHandle<u32>>,
-    panics: Arc<AtomicU64>,
+    counters: ConsumerCounters,
     qpc_frequency: i64,
     closed: bool,
 }
@@ -124,7 +135,11 @@ const INVALID: u64 = u64::MAX;
 
 struct Context {
     callback: Callback,
-    panics: Arc<AtomicU64>,
+    counters: ConsumerCounters,
+}
+
+fn context(callback: Callback, counters: &ConsumerCounters) -> Context {
+    Context { callback, counters: counters.clone() }
 }
 
 unsafe extern "system" fn trampoline(rec: *mut EVENT_RECORD) {
@@ -134,9 +149,10 @@ unsafe extern "system" fn trampoline(rec: *mut EVENT_RECORD) {
     unsafe {
         let rec = &*rec;
         let ctx = &mut *rec.UserContext.cast::<Context>();
+        ctx.counters.received.fetch_add(1, Ordering::Relaxed);
         let cb = &mut ctx.callback;
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(&EventRecord { rec }))).is_err() {
-            ctx.panics.fetch_add(1, Ordering::Relaxed);
+            ctx.counters.panics.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -144,9 +160,18 @@ unsafe extern "system" fn trampoline(rec: *mut EVENT_RECORD) {
 /// Opens a real-time consumer on the session `name` and runs `ProcessTrace` on
 /// a new thread, calling `callback` for every event, the session's own header
 /// event included (its `meta()` is `None`). The callback must stay fast (§3.2).
+/// Its counters start at 0; see [`consume_with`] for counters that outlive it.
 pub fn consume(name: &str, callback: impl FnMut(&EventRecord) + Send + 'static) -> Result<Consumer, EtwError> {
-    let panics = Arc::new(AtomicU64::new(0));
-    let ctx = Box::into_raw(Box::new(Context { callback: Box::new(callback), panics: panics.clone() }));
+    consume_with(name, callback, ConsumerCounters::default())
+}
+
+/// [`consume`], counting into the caller's `counters` (review M1).
+pub fn consume_with(
+    name: &str,
+    callback: impl FnMut(&EventRecord) + Send + 'static,
+    counters: ConsumerCounters,
+) -> Result<Consumer, EtwError> {
+    let ctx = Box::into_raw(Box::new(context(Box::new(callback), &counters)));
     let mut name_w: Vec<u16> = name.encode_utf16().chain([0]).collect();
     // SAFETY: an all-zero EVENT_TRACE_LOGFILEW is valid; the fields set below are
     // the ones a real-time EVENT_RECORD consumer needs.
@@ -183,7 +208,7 @@ pub fn consume(name: &str, callback: impl FnMut(&EventRecord) + Send + 'static) 
             }
             EtwError { op: "spawn consumer thread", code: 0 }
         })?;
-    Ok(Consumer { handle, thread: Some(thread), panics, qpc_frequency, closed: false })
+    Ok(Consumer { handle, thread: Some(thread), counters, qpc_frequency, closed: false })
 }
 
 impl Consumer {
@@ -195,13 +220,26 @@ impl Consumer {
 
     /// Callbacks that panicked (each was caught and the event skipped).
     pub fn panics(&self) -> u64 {
-        self.panics.load(Ordering::Relaxed)
+        self.counters.panics.load(Ordering::Relaxed)
     }
 
     /// The counter behind [`Consumer::panics`], for a thread that reports it
     /// while the consumer runs (the agent's Sensor Health, plan 1b-4a).
     pub fn panic_counter(&self) -> Arc<AtomicU64> {
-        self.panics.clone()
+        self.counters.panics.clone()
+    }
+
+    /// Events delivered to the callback, counted before it runs: every event
+    /// the session delivered, the session's header event and any the callback
+    /// discards or panics on included.
+    pub fn received(&self) -> u64 {
+        self.counters.received.load(Ordering::Relaxed)
+    }
+
+    /// The counter behind [`Consumer::received`], for a thread that reports it
+    /// while the consumer runs (the agent's Sensor Health, plan 1b-4a-p1).
+    pub fn received_counter(&self) -> Arc<AtomicU64> {
+        self.counters.received.clone()
     }
 
     /// `ProcessTrace` has returned: the session stopped or was destroyed (§9.1).
@@ -228,5 +266,42 @@ impl Consumer {
 impl Drop for Consumer {
     fn drop(&mut self) {
         self.close_inner();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trampoline counts every event before the callback runs (the
+    /// callback sees its own event counted), those the callback panics on as
+    /// well, into the caller's counters (plan 1b-4a-p1, review M1).
+    #[test]
+    fn the_trampoline_counts_every_event_and_every_panic() {
+        let counters = ConsumerCounters::default();
+        let (calls, before) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let (c, b, r) = (calls.clone(), before.clone(), counters.received.clone());
+        let mut ctx = context(
+            Box::new(move |_| {
+                let n = c.fetch_add(1, Ordering::Relaxed);
+                if r.load(Ordering::Relaxed) == n + 1 {
+                    b.fetch_add(1, Ordering::Relaxed);
+                }
+                if n == 1 {
+                    panic!("the second event");
+                }
+            }),
+            &counters,
+        );
+        // SAFETY: an all-zero EVENT_RECORD is valid; the callback never reads it.
+        let mut rec: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        rec.UserContext = (&raw mut ctx).cast();
+        for _ in 0..3 {
+            // SAFETY: `rec` is valid and its UserContext is the live `ctx`.
+            unsafe { trampoline(&mut rec) };
+        }
+        let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        assert_eq!((n(&counters.received), n(&calls), n(&counters.panics)), (3, 3, 1));
+        assert_eq!(n(&before), 3, "each event counted before its callback");
     }
 }
