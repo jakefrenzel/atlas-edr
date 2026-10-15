@@ -160,7 +160,7 @@ mod tests {
     use std::time::Instant;
 
     fn health(time: i64) -> Event {
-        let (r, _) = report(&Snapshot::at_start(true), &Snapshot::at_start(true));
+        let (r, _) = report(&Snapshot::at_start(true, 0), &Snapshot::at_start(true, 0));
         let device = Device { uid: DeviceUid::from_bytes([1; 16]), boot_id: BootId::from_bytes([2; 16]) };
         event(EventId::new_v7(), time, device, 0, r)
     }

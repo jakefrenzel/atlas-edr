@@ -34,6 +34,7 @@ pub struct HealthReport {
     /// Set when buffered events were deleted before delivery (overflow).
     pub gap: Option<SensorGap>,
     pub buffer: SensorBuffer,
+    pub throughput: SensorThroughput,
 }
 
 /// A count for one event class.
@@ -205,6 +206,17 @@ counter_group!(
 );
 
 counter_group!(
+    /// What the agent's ETW sessions delivered to it.
+    SensorThroughput, "throughput" {
+        /// ETW events the `Atlas-Sensor` session delivered, counted before
+        /// parsing: those the agent discards at once included.
+        sensor_session_events_received: Option<u64>,
+        /// The same for the `Atlas-Process` session.
+        process_session_events_received: Option<u64>,
+    }
+);
+
+counter_group!(
     /// The agent's own resource use.
     SensorResources, "resources" {
         /// Process CPU time (user + kernel) during the interval, in nanoseconds.
@@ -263,6 +275,7 @@ impl From<SensorHealthActivity> for wire::SensorHealth {
                 resources: r.resources.into_wire(),
                 gap: r.gap.map(Into::into),
                 buffer: r.buffer.into_wire(),
+                throughput: r.throughput.into_wire(),
             }),
         };
         Self { interval_start: v.interval_start, activity: Some(activity) }
@@ -283,6 +296,7 @@ impl SensorHealthActivity {
                     None => None,
                 },
                 buffer: SensorBuffer::from_wire(r.buffer)?,
+                throughput: SensorThroughput::from_wire(r.throughput)?,
             })),
         };
         Ok(Self { interval_start: w.interval_start, action })
@@ -340,6 +354,10 @@ mod tests {
             resources: SensorResources { cpu_time: Some(250_000_000), working_set: Some(40 << 20) },
             gap: Some(SensorGap { first_time: Some(1), last_time: Some(2), events: 9 }),
             buffer: SensorBuffer { failing: Some(true), write_errors: Some(3), ..Default::default() },
+            throughput: SensorThroughput {
+                sensor_session_events_received: Some(600_000),
+                process_session_events_received: Some(0),
+            },
         });
         assert_eq!(SensorHealthActivity::from_wire(a.clone().into()).unwrap(), a);
     }

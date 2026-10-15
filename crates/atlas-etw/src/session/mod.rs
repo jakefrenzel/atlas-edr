@@ -7,7 +7,7 @@ mod consumer;
 mod gate;
 pub mod tdh;
 
-pub use consumer::{Consumer, EventRecord, consume};
+pub use consumer::{Consumer, ConsumerCounters, EventRecord, consume, consume_with};
 pub use gate::{Verdict, VersionGate, verdict};
 
 use crate::Provider;

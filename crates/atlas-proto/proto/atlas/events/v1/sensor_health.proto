@@ -24,6 +24,7 @@ message SensorHealthReport {
   // Set when buffered events were deleted before delivery (overflow).
   SensorGap gap = 5;
   SensorBuffer buffer = 6;
+  SensorThroughput throughput = 7;
 }
 
 // A count for one event class.
@@ -111,6 +112,15 @@ message SensorHousekeeping {
   // Requests to the agent's service threads dropped because their queue was full. A dropped
   // work request costs its event's deadline; a dropped invalidation clears the 8.3 name cache.
   optional uint64 service_queue_drops = 18;
+}
+
+// What the agent's ETW sessions delivered to it.
+message SensorThroughput {
+  // ETW events the `Atlas-Sensor` session delivered to the agent during the interval, counted
+  // before parsing: every event, those the agent discards at once included.
+  optional uint64 sensor_session_events_received = 1;
+  // The same for the `Atlas-Process` session.
+  optional uint64 process_session_events_received = 2;
 }
 
 // The agent's own resource use.

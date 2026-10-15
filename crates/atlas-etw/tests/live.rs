@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::os::windows::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -654,7 +655,17 @@ fn live_scenario() {
 
     let sa = Session::start(&Config::session_a(SA)).expect("start A");
     let sb = Session::start(&Config::session_b(SB)).expect("start B");
-    let ca = session::consume(SA, tree_callback(tree.clone(), sink.clone(), unrequested.clone())).expect("consume A");
+    // Session A's callback counts its calls, for the consumer's own count.
+    let delivered_a = Arc::new(AtomicU64::new(0));
+    let ca = {
+        let (delivered, mut inner) =
+            (delivered_a.clone(), tree_callback(tree.clone(), sink.clone(), unrequested.clone()));
+        session::consume(SA, move |rec: &EventRecord| {
+            delivered.fetch_add(1, Ordering::Relaxed);
+            inner(rec);
+        })
+        .expect("consume A")
+    };
     let cb = session::consume(SB, tree_callback(tree.clone(), sink.clone(), unrequested.clone())).expect("consume B");
     let mut freq = 0;
     // SAFETY: writes one i64.
@@ -741,7 +752,16 @@ fn live_scenario() {
     let info_a = sa.stop().expect("stop A");
     report.check("no_events_lost", info_a.events_lost == 0 && info_a.realtime_buffers_lost == 0, format!("{info_a:?}"));
     let panics = ca.panics();
+    // Both counts after `close`: a stopped session's consumer delivers the
+    // rest of its buffers until then.
+    let received = ca.received_counter();
     report.note("process_trace_status_after_stop", json!(ca.close()));
+    let (received, delivered) = (received.load(Ordering::Relaxed), delivered_a.load(Ordering::Relaxed));
+    report.check(
+        "received_counts_every_delivered_event",
+        received > 0 && received == delivered,
+        format!("received {received}, the callback called {delivered} times"),
+    );
     let _ = sw.stop();
     let _ = cw.close();
     report.check("no_callback_panics", panics == 0, format!("{panics} panics"));

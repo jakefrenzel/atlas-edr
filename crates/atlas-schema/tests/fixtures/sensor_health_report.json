@@ -46,6 +46,10 @@
         "writeErrors": "0",
         "failing": false,
         "diskBytes": "734003200"
+      },
+      "throughput": {
+        "sensorSessionEventsReceived": "612408",
+        "processSessionEventsReceived": "1120"
       }
     }
   }
