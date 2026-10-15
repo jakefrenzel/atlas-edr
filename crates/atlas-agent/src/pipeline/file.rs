@@ -380,7 +380,9 @@ impl<L: Lookups> Pipeline<L> {
         let known = self.files.touch(fo).and_then(|e| e.nt.clone());
         match known {
             Some(nt) => {
-                self.requests.push(Request::InvalidateHash { nt_path: nt.clone() });
+                if forgets_cached(&action) {
+                    self.requests.push(Request::InvalidateHash { nt_path: nt.clone() });
+                }
                 let (file, expand) = self.emit_file(&nt, Some(fo));
                 let ev = self.file_event(ts, actor, file, action);
                 self.push_with(ev, vec![], expansion(expand, Expansion::file(Some(fo))));
@@ -680,6 +682,15 @@ impl<L: Lookups> Pipeline<L> {
 /// An entry named by the seeder for a handle opened before we watched (§7.4).
 pub(crate) fn seeded_entry(nt: &str, opener: Option<ProcessRef>, taken: i64) -> FileEntry {
     entry(Some(nt.to_string()), opener, taken)
+}
+
+/// Whether an action makes the hash and 8.3 caches forget the file's path
+/// (§6.3, §7.2): a change of content or of names. A SetAttributes changes
+/// neither, and the System process sets the basic information of the DLLs
+/// that starting processes load, so forgetting there re-hashed them on
+/// every launch (plan 1b-4a-p1, D6).
+pub(super) fn forgets_cached(action: &FileAction) -> bool {
+    !matches!(action, FileAction::SetAttributes)
 }
 
 /// Fills a file event waiting for a seeded name.
