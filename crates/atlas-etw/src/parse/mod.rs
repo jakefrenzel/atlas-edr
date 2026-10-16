@@ -94,8 +94,17 @@ impl WStr {
         self.0.is_empty()
     }
 
+    /// As `String::from_utf16_lossy`, faster for the usual all-ASCII name
+    /// (plan 1b-4a-p2, R3): narrowed in one allocation, not decoded a char at
+    /// a time into a growing string.
     pub fn to_string_lossy(&self) -> String {
-        String::from_utf16_lossy(&self.0)
+        if self.0.iter().all(|&u| u < 0x80) {
+            let bytes: Vec<u8> = self.0.iter().map(|&u| u as u8).collect();
+            return String::from_utf8(bytes).expect("ASCII is UTF-8");
+        }
+        let mut s = String::with_capacity(self.0.len());
+        s.extend(char::decode_utf16(self.0.iter().copied()).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)));
+        s
     }
 }
 
