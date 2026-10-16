@@ -22,7 +22,7 @@ use atlas_agent::input::{Header, Incoming, Session};
 use atlas_agent::intake::{Intake, Queues};
 use atlas_agent::pipeline::{Pipeline, Setup};
 use atlas_agent::process::Identity;
-use atlas_agent::services::{LiveProcess, Reply, Request, ValueData};
+use atlas_agent::services::{LiveProcess, Reply, Request, Snapshot, ValueData};
 use atlas_agent::time::Anchor;
 use atlas_etw::Provider;
 use atlas_etw::parse::{EventMeta, PointerSize, RawEvent, parse};
@@ -406,7 +406,9 @@ fn the_replay_is_deterministic() {
 /// The pipeline thread's cost per event (plan 1b-4a-p2, R3), the yardstick for
 /// its fixes: the recording, its time squeezed 10 times (about 4,500 events/s,
 /// normal use's order), replayed `ROUNDS` times through one pipeline with the
-/// driver's 10 ms ticks and the fake workers' answers. The best of `RUNS`.
+/// kernel objects moved each round (so its maps grow as on a host), the
+/// driver's 10 ms ticks, and the fake workers' answers (the start-up seeding
+/// passes answered with an empty table). The best of `RUNS`.
 /// Run it in release:
 /// `cargo test --release -p atlas-agent --test replay -- --ignored --nocapture bench`
 #[test]
@@ -414,7 +416,7 @@ fn the_replay_is_deterministic() {
 fn bench_pipeline_per_event() {
     const ROUNDS: i64 = 300;
     const SQUEEZE: i64 = 10;
-    const RUNS: usize = 5;
+    const RUNS: usize = 10;
     let (mut best, mut events, mut emitted) = (f64::MAX, 0, 0);
     for _ in 0..RUNS {
         let Replay { mut p, intake, krx, urx, first, last, .. } = replay();
@@ -427,6 +429,7 @@ fn bench_pipeline_per_event() {
             for inc in &one {
                 let mut inc = inc.clone();
                 inc.header.ts = first + (inc.header.ts - first) / SQUEEZE + r * span;
+                shift(&mut inc.event, r as u64 * 0x10_0000);
                 all.push(inc);
             }
         }
@@ -442,7 +445,19 @@ fn bench_pipeline_per_event() {
             }
             out += p.tick(now).len();
             for r in p.take_requests() {
-                if let Some(reply) = answer(&r) {
+                // The seeder answers the start-up passes with an empty table, as
+                // on a host whose earlier handles all closed.
+                let reply = match r {
+                    Request::Seed { kind, addresses } => Some(Reply::Snapshot(Snapshot {
+                        kind,
+                        taken: now,
+                        asked: addresses,
+                        named: vec![],
+                        unnamable: vec![],
+                    })),
+                    r => answer(&r),
+                };
+                if let Some(reply) = reply {
                     p.reply(reply);
                 }
             }
@@ -456,4 +471,32 @@ fn bench_pipeline_per_event() {
         emitted = out;
     }
     println!("pipeline: {best:.3} us per event, best of {RUNS} ({events} events in, {emitted} out)");
+}
+
+/// Moves every kernel object address (file objects, IRPs, key objects) by `k`,
+/// so a replayed round names other objects than the last; a base of 0 (an
+/// absolute registry path) stays 0.
+fn shift(e: &mut RawEvent, k: u64) {
+    match e {
+        RawEvent::FileCreate(f) | RawEvent::FileCreateNew(f) => (f.irp, f.file_object) = (f.irp + k, f.file_object + k),
+        RawEvent::FileCleanup(f) | RawEvent::FileClose(f) => (f.irp, f.file_object) = (f.irp + k, f.file_object + k),
+        RawEvent::FileWrite(f) => (f.irp, f.file_object) = (f.irp + k, f.file_object + k),
+        RawEvent::FileSetInfo(f) | RawEvent::FileSetDelete(f) => {
+            (f.irp, f.file_object) = (f.irp + k, f.file_object + k)
+        }
+        RawEvent::FileOpEnd(f) => f.irp += k,
+        RawEvent::FileDeletePath(f) | RawEvent::FileRenamePath(f) => {
+            (f.irp, f.file_object) = (f.irp + k, f.file_object + k)
+        }
+        RawEvent::RegCreateKey(r) | RawEvent::RegOpenKey(r) => {
+            r.key_object += k;
+            if r.base_object != 0 {
+                r.base_object += k;
+            }
+        }
+        RawEvent::RegDeleteKey(r) | RawEvent::RegCloseKey(r) => r.key_object += k,
+        RawEvent::RegSetValue(r) => r.key_object += k,
+        RawEvent::RegDeleteValue(r) => r.key_object += k,
+        _ => {}
+    }
 }
