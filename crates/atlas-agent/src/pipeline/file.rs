@@ -9,7 +9,7 @@
 //! reports no outcome (SMB), a Cleanup of a file with a delete outstanding is
 //! taken as the delete (`file_delete_outcome_unknown`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use atlas_etw::parse::{FileCreate, FileHandle, FileOpEnd, FilePath, FileSetInfo};
 use atlas_schema::classes::file::{FileAction, FileSystemActivity};
@@ -20,6 +20,7 @@ use super::expand::{Expansion, Slot};
 use crate::cleanup;
 use crate::completion::{PendingId, Reason, Wait};
 use crate::counters::Class;
+use crate::fast::FastMap;
 use crate::input::Header;
 use crate::paths::has_short_name;
 use crate::process::{empty_file, file_name};
@@ -85,7 +86,7 @@ enum Held {
 }
 
 pub struct Files {
-    pub(crate) map: HashMap<u64, FileEntry>,
+    pub(crate) map: FastMap<u64, FileEntry>,
     cap: usize,
     clock: u64,
     evictions: u64,
@@ -96,7 +97,7 @@ pub struct Files {
     /// The position of `held`'s front, counted since the start.
     held_base: u64,
     /// Irp → position of the latest held operation with it (Irps are recycled).
-    held_by_irp: HashMap<u64, u64>,
+    held_by_irp: FastMap<u64, u64>,
     /// Failed OperationEnds no held operation claimed yet (a late operation): Irp → QPC.
     failed: Recent<u64>,
     /// Recently confirmed operations, to recognise a failure that comes too late.
@@ -104,7 +105,7 @@ pub struct Files {
     /// Watchlist Opens → when last emitted, for the 60 s coalescing.
     opened: Recent<OpenKey>,
     /// Pending id → the handle it waits on, to forget it when it leaves.
-    waiter_fo: HashMap<PendingId, u64>,
+    waiter_fo: FastMap<PendingId, u64>,
     /// Cleanups whose outcome may follow: Irp → (FileObject, FileKey). The next
     /// operation on the Irp ends the wait (Irps are per thread and reused).
     cleanups: RecentMap<u64, (u64, u64)>,
@@ -134,18 +135,18 @@ enum Requester {
 impl Files {
     pub fn new(cap: usize, window_ticks: i64) -> Self {
         Files {
-            map: HashMap::new(),
+            map: FastMap::default(),
             cap,
             clock: 0,
             evictions: 0,
             window: window_ticks,
             held: VecDeque::new(),
             held_base: 0,
-            held_by_irp: HashMap::new(),
+            held_by_irp: FastMap::default(),
             failed: Recent::new(FAILED_CAP),
             confirmed: Recent::new(CONFIRMED_CAP),
             opened: Recent::new(OPENED_CAP),
-            waiter_fo: HashMap::new(),
+            waiter_fo: FastMap::default(),
             cleanups: RecentMap::new(CLEANUPS_CAP),
             requests: RecentMap::new(REQUESTS_CAP),
             early_outcomes: RecentMap::new(REQUESTS_CAP),

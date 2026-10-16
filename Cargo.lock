@@ -98,6 +98,7 @@ dependencies = [
  "atlas-schema",
  "blake3",
  "clap",
+ "foldhash",
  "globset",
  "proptest",
  "prost",

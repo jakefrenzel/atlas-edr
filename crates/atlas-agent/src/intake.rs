@@ -9,7 +9,7 @@
 //! - DNS-Client events pass a per-PID token bucket, then go to the user-mode
 //!   queue; everything else goes to the kernel queue. Full queues drop and count.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, TrySendError};
 
@@ -18,6 +18,7 @@ use atlas_etw::parse::{FileOpEnd, ParseError, RawEvent};
 use crate::cleanup;
 use crate::config::{Config, Ticks};
 use crate::counters::IntakeCounters;
+use crate::fast::{FastMap, FastSet};
 use crate::input::{Header, Incoming, Session};
 use crate::recent::Recent;
 use crate::services::{EarlyKey, ValueRead};
@@ -41,7 +42,7 @@ pub struct Intake {
     dns: Buckets,
     early: Option<EarlyKeys>,
     fast_read: Option<FastRead>,
-    self_keys: HashSet<u64>,
+    self_keys: FastSet<u64>,
     /// `None` while `file.op_end` is off: no OperationEnd comes, so no
     /// Cleanup is paired or counted as unpaired (plan 1b-4a).
     cleanups: Option<Cleanups>,
@@ -186,17 +187,17 @@ impl Intake {
 /// oldest.
 pub(crate) struct Cleanups {
     /// Cleanup Irp → (FileObject, FileKey, QPC).
-    irps: HashMap<u64, (u64, u64, i64)>,
+    irps: FastMap<u64, (u64, u64, i64)>,
     /// A successful OperationEnd that reports a removed name and found no
     /// Cleanup: Irp → its header and outcome.
-    early: HashMap<u64, (Header, u64)>,
+    early: FastMap<u64, (Header, u64)>,
     /// FileKeys with a delete requested (`DeletePath`, `SetDelete` set, or a
     /// delete-on-close handle's Cleanup) and not cleared or reported since.
     requested: Recent<u64>,
     /// A request's Irp → its FileKey, until the request's OperationEnd: a
     /// failed one takes the request back, a successful one is passed on so the
     /// pipeline knows the request stood (R-M1).
-    request_irps: HashMap<u64, u64>,
+    request_irps: FastMap<u64, u64>,
     /// Handles opened delete-on-close and not closed yet.
     on_close: Recent<u64>,
     /// An outcome comes within this many ticks of its Cleanup (1 s). The rules
@@ -219,10 +220,10 @@ const DELETE_REQUESTS_CAP: usize = 4096;
 impl Cleanups {
     fn new(ticks: Ticks, counters: Arc<IntakeCounters>) -> Self {
         Cleanups {
-            irps: HashMap::new(),
-            early: HashMap::new(),
+            irps: FastMap::default(),
+            early: FastMap::default(),
             requested: Recent::new(DELETE_REQUESTS_CAP),
-            request_irps: HashMap::new(),
+            request_irps: FastMap::default(),
             on_close: Recent::new(DELETE_REQUESTS_CAP),
             window: ticks.frequency.max(1),
             counters,
@@ -337,7 +338,7 @@ impl Cleanups {
 /// A relative open whose base is unknown is simply not cached; a miss costs
 /// only a fall back to the ordered path. Bounded, evicting the oldest.
 pub struct EarlyKeys {
-    names: HashMap<u64, (String, u64)>,
+    names: FastMap<u64, (String, u64)>,
     order: VecDeque<(u64, u64)>,
     generation: u64,
     cap: usize,
@@ -345,7 +346,7 @@ pub struct EarlyKeys {
 
 impl EarlyKeys {
     pub fn new(cap: usize) -> Self {
-        EarlyKeys { names: HashMap::new(), order: VecDeque::new(), generation: 0, cap }
+        EarlyKeys { names: FastMap::default(), order: VecDeque::new(), generation: 0, cap }
     }
 
     /// Returns how many entries were evicted to make room.
@@ -408,12 +409,12 @@ struct Buckets {
     /// Tokens are kept in millitokens.
     rate: u64,
     frequency: i64,
-    by_pid: HashMap<u32, (u64, i64)>,
+    by_pid: FastMap<u32, (u64, i64)>,
 }
 
 impl Buckets {
     fn new(rate: u32, frequency: i64) -> Self {
-        Buckets { rate: u64::from(rate) * 1000, frequency, by_pid: HashMap::new() }
+        Buckets { rate: u64::from(rate) * 1000, frequency, by_pid: FastMap::default() }
     }
 
     fn take(&mut self, pid: u32, ts: i64) -> bool {

@@ -17,13 +17,12 @@ mod proc;
 mod reg;
 mod seed;
 
-use std::collections::{HashMap, HashSet};
-
 use atlas_schema::{Device, Event, EventId, EventKind, EventMeta, ProcessRef, ProcessUid, Sensor};
 
 use crate::completion::{Completion, Expired, PendingId, Reason, Wait};
 use crate::config::{Config, Ticks};
 use crate::counters::{Class, Counters};
+use crate::fast::{FastMap, FastSet};
 use crate::input::{Header, Incoming};
 use crate::keymap::KeyMap;
 use crate::ordering::{Ordering, Pushed};
@@ -63,8 +62,8 @@ pub struct Pipeline<L> {
     pub(crate) clock: Clock,
     pub(crate) id: Identity,
     pub(crate) ccs: u32,
-    pub(crate) self_keys: HashSet<u64>,
-    pub(crate) self_uids: HashSet<ProcessUid>,
+    pub(crate) self_keys: FastSet<u64>,
+    pub(crate) self_uids: FastSet<ProcessUid>,
     pub(crate) started: i64,
     pub(crate) lookups: L,
     pub(crate) ids: IdGen,
@@ -466,12 +465,12 @@ pub(crate) fn alive<E>(c: &Completion<E>, id: PendingId, reason: Reason) -> bool
 
 /// Request bookkeeping shared by the domain modules.
 pub(crate) struct Pending<T> {
-    pub(crate) by_id: HashMap<PendingId, T>,
+    pub(crate) by_id: FastMap<PendingId, T>,
 }
 
 impl<T> Default for Pending<T> {
     fn default() -> Self {
-        Pending { by_id: HashMap::new() }
+        Pending { by_id: FastMap::default() }
     }
 }
 

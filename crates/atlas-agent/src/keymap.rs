@@ -13,7 +13,7 @@
 //! The same holds when an unknown base closes, and when the seeder names a
 //! tombstone's address after the tombstone closed (plan 1b-3a review B3).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast::{FastMap, FastSet};
 
 /// What the map knows about a key handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,9 +51,9 @@ pub enum Resolved {
 }
 
 pub struct KeyMap {
-    map: HashMap<u64, Entry>,
+    map: FastMap<u64, Entry>,
     /// base → children waiting for it.
-    waiting: HashMap<u64, HashSet<u64>>,
+    waiting: FastMap<u64, FastSet<u64>>,
     cap: usize,
     clock: u64,
     evictions: u64,
@@ -63,7 +63,7 @@ const MAX_DEPTH: usize = 64;
 
 impl KeyMap {
     pub fn new(cap: usize) -> Self {
-        KeyMap { map: HashMap::new(), waiting: HashMap::new(), cap, clock: 0, evictions: 0 }
+        KeyMap { map: FastMap::default(), waiting: FastMap::default(), cap, clock: 0, evictions: 0 }
     }
 
     /// A successful CreateKey or OpenKey (§7.4).

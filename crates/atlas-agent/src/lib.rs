@@ -8,6 +8,7 @@ pub mod driver;
 pub mod dump;
 pub mod evict;
 pub mod fakes;
+pub mod fast;
 pub mod health;
 pub mod input;
 pub mod intake;

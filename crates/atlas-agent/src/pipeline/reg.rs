@@ -2,8 +2,6 @@
 //! the key map, the seeder for unknown handles, the `path_unresolved` floor,
 //! and value reads after the event.
 
-use std::collections::HashMap;
-
 use atlas_etw::parse::{RegDeleteValue, RegKey, RegOpen, RegSetValue, WStr};
 use atlas_schema::classes::registry::{
     RegType, RegistryKeyAction, RegistryKeyActivity, RegistryValueAction, RegistryValueActivity,
@@ -14,6 +12,7 @@ use atlas_schema::{Event, EventKind, ProcessRef};
 use super::{Pending, Pipeline, alive};
 use crate::completion::{PendingId, Reason};
 use crate::counters::Class;
+use crate::fast::FastMap;
 use crate::input::Header;
 use crate::keymap::Resolved;
 use crate::paths;
@@ -41,12 +40,12 @@ pub(crate) struct KeyWaiter {
 #[derive(Default)]
 pub struct Registry {
     /// Fast-path read results (§7.5), until their event is processed.
-    early: HashMap<EarlyKey, (ValueRead, Option<ValueData>)>,
+    early: FastMap<EarlyKey, (ValueRead, Option<ValueData>)>,
     reads: Pending<Expected>,
     /// Unnamed root address → events waiting for it.
-    pub(crate) waiting: HashMap<u64, Vec<KeyWaiter>>,
+    pub(crate) waiting: FastMap<u64, Vec<KeyWaiter>>,
     /// Pending id → the root it waits on, to forget it when it leaves.
-    waiter_root: HashMap<PendingId, u64>,
+    waiter_root: FastMap<PendingId, u64>,
 }
 
 impl Registry {
