@@ -17,6 +17,7 @@ pub mod ordering;
 pub mod paths;
 pub mod pipeline;
 pub mod process;
+pub mod queue;
 pub mod recent;
 pub mod services;
 pub mod settings;

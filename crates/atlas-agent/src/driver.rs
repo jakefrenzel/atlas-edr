@@ -21,6 +21,8 @@
 //! (`win::agent`); the tests use fakes.
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
+
+use crate::queue::QueueReceiver;
 use std::time::{Duration, Instant};
 
 use atlas_schema::Event;
@@ -77,8 +79,8 @@ pub type Control<L> = Box<dyn FnOnce(&mut Pipeline<L>) + Send>;
 pub struct Driver<L, S> {
     pipeline: Pipeline<L>,
     lanes: S,
-    kernel: Receiver<Incoming>,
-    user: Receiver<Incoming>,
+    kernel: QueueReceiver<Incoming>,
+    user: QueueReceiver<Incoming>,
     control: Receiver<Control<L>>,
     clock: Clock,
     anchor: AnchorSource,
@@ -89,8 +91,8 @@ impl<L: Lookups, S: Lanes> Driver<L, S> {
     pub fn new(
         pipeline: Pipeline<L>,
         lanes: S,
-        kernel: Receiver<Incoming>,
-        user: Receiver<Incoming>,
+        kernel: QueueReceiver<Incoming>,
+        user: QueueReceiver<Incoming>,
         clock: Clock,
         anchor: AnchorSource,
         cfg: DriverConfig,
@@ -160,7 +162,7 @@ fn next_wait(cfg: &DriverConfig, pushed: usize) -> Duration {
 
 /// Pushes what is queued, at most `max` events. Returns whether the queue is
 /// still open, and how many it pushed.
-fn drain<L: Lookups>(rx: &Receiver<Incoming>, p: &mut Pipeline<L>, max: usize) -> (bool, usize) {
+fn drain<L: Lookups>(rx: &QueueReceiver<Incoming>, p: &mut Pipeline<L>, max: usize) -> (bool, usize) {
     let mut n = 0;
     for _ in 0..max.max(1) {
         match rx.try_recv() {
@@ -178,7 +180,9 @@ fn drain<L: Lookups>(rx: &Receiver<Incoming>, p: &mut Pipeline<L>, max: usize) -
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::mpsc::{SyncSender, channel, sync_channel};
+    use std::sync::mpsc::channel;
+
+    use crate::queue::{QueueSender, bounded};
     use std::sync::{Arc, Mutex};
 
     use atlas_etw::parse::{FileCreate, RawEvent};
@@ -195,8 +199,8 @@ mod tests {
 
     /// A driver on its own thread with a real clock; the sink sends events back.
     struct Running {
-        kernel: Option<SyncSender<Incoming>>,
-        user: Option<SyncSender<Incoming>>,
+        kernel: Option<QueueSender<Incoming>>,
+        user: Option<QueueSender<Incoming>>,
         events: std::sync::mpsc::Receiver<Event>,
         thread: std::thread::JoinHandle<Counters>,
         t0: Instant,
@@ -209,8 +213,8 @@ mod tests {
     fn start(cfg: DriverConfig, anchor: AnchorSource) -> Running {
         let t0 = Instant::now();
         let p = pipeline();
-        let (ktx, krx) = sync_channel(cfg.kernel_queue_cap);
-        let (utx, urx) = sync_channel(cfg.user_queue_cap);
+        let (ktx, krx) = bounded(cfg.kernel_queue_cap);
+        let (utx, urx) = bounded(cfg.user_queue_cap);
         let (etx, events) = channel();
         let driver = Driver::new(p, FakeLanes::new(|_| None), krx, urx, Box::new(move || qpc(t0)), anchor, cfg);
         let thread = std::thread::spawn(move || driver.run(|e| etx.send(e).unwrap()));
@@ -245,7 +249,7 @@ mod tests {
     #[test]
     fn drain_counts_what_it_pushed() {
         let mut p = pipeline();
-        let (tx, rx) = sync_channel(8);
+        let (tx, rx) = bounded(8);
         for i in 0..3 {
             tx.send(created(i, r"\Device\HarddiskVolume3\a.txt")).unwrap();
         }
@@ -267,8 +271,8 @@ mod tests {
             n.fetch_add(1, AtomicOrdering::Relaxed);
             qpc(t0)
         });
-        let (ktx, krx) = sync_channel(1);
-        let (utx, urx) = sync_channel(1);
+        let (ktx, krx) = bounded(1);
+        let (utx, urx) = bounded(1);
         let driver =
             Driver::new(pipeline(), FakeLanes::new(|_| None), krx, urx, clock, no_anchor(), DriverConfig::default());
         let thread = std::thread::spawn(move || driver.run(|_| {}));
@@ -392,8 +396,8 @@ mod tests {
             started: 0,
         };
         let p = Pipeline::new(setup, FakeLookups::default(), sequential_ids()).unwrap();
-        let (ktx, krx) = sync_channel(4);
-        let (utx, urx) = sync_channel(4);
+        let (ktx, krx) = bounded(4);
+        let (utx, urx) = bounded(4);
         drop((ktx, utx));
         let cfg = DriverConfig { cadence: Duration::ZERO, idle_cadence: Duration::ZERO, ..DriverConfig::default() };
         Driver::new(p, Counting(s), krx, urx, Box::new(|| 0), no_anchor(), cfg).run(|_| {});
@@ -417,8 +421,8 @@ mod tests {
             started: 0,
         };
         let p = Pipeline::new(setup, FakeLookups::default(), sequential_ids()).unwrap();
-        let (ktx, krx) = sync_channel(4);
-        let (_utx, urx) = sync_channel(4);
+        let (ktx, krx) = bounded(4);
+        let (_utx, urx) = bounded(4);
         let (ctx, crx) = channel::<Control<FakeLookups>>();
         let t0 = Instant::now();
         let driver = Driver::new(

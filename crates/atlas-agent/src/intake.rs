@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::TrySendError;
 
 use atlas_etw::parse::{FileOpEnd, ParseError, RawEvent};
 
@@ -20,6 +20,7 @@ use crate::config::{Config, Ticks};
 use crate::counters::IntakeCounters;
 use crate::fast::{FastMap, FastSet};
 use crate::input::{Header, Incoming, Session};
+use crate::queue::QueueSender;
 use crate::recent::Recent;
 use crate::services::{EarlyKey, ValueRead};
 
@@ -29,15 +30,15 @@ pub type FastRead = Box<dyn FnMut(EarlyKey, ValueRead) + Send>;
 /// The two queues into the pipeline (§3.2): bounded, never blocking.
 pub struct Queues {
     /// Kernel providers and Session B (default 65,536 entries).
-    pub kernel: SyncSender<Incoming>,
+    pub kernel: QueueSender<Incoming>,
     /// User-mode providers, DNS-Client (default 8,192), so a forger cannot
     /// push kernel events out (§4.4).
-    pub user: SyncSender<Incoming>,
+    pub user: QueueSender<Incoming>,
 }
 
 pub struct Intake {
-    kernel: SyncSender<Incoming>,
-    user: SyncSender<Incoming>,
+    kernel: QueueSender<Incoming>,
+    user: QueueSender<Incoming>,
     counters: Arc<IntakeCounters>,
     dns: Buckets,
     early: Option<EarlyKeys>,
@@ -451,11 +452,11 @@ impl Buckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::{QueueReceiver, bounded};
     use atlas_etw::parse::{
         DnsQuery, FileCreate, FileHandle, FileOpEnd, FileSetInfo, RegKey, RegOpen, RegSetValue, WStr,
     };
     use std::sync::Mutex;
-    use std::sync::mpsc::{Receiver, sync_channel};
 
     fn header(pid: u32, ts: i64) -> Header {
         Header { session: Session::Sensor, pid, tid: 9, ts, start_key: Some(77) }
@@ -463,16 +464,18 @@ mod tests {
 
     type Reads = Arc<Mutex<Vec<(EarlyKey, ValueRead)>>>;
 
-    fn intake(kernel_cap: usize) -> (Intake, Receiver<Incoming>, Receiver<Incoming>, Arc<IntakeCounters>, Reads) {
+    fn intake(
+        kernel_cap: usize,
+    ) -> (Intake, QueueReceiver<Incoming>, QueueReceiver<Incoming>, Arc<IntakeCounters>, Reads) {
         intake_with(kernel_cap, Config { dns_rate_per_pid: 2, ..Config::default() })
     }
 
     fn intake_with(
         kernel_cap: usize,
         cfg: Config,
-    ) -> (Intake, Receiver<Incoming>, Receiver<Incoming>, Arc<IntakeCounters>, Reads) {
-        let (ktx, krx) = sync_channel(kernel_cap);
-        let (utx, urx) = sync_channel(4);
+    ) -> (Intake, QueueReceiver<Incoming>, QueueReceiver<Incoming>, Arc<IntakeCounters>, Reads) {
+        let (ktx, krx) = bounded(kernel_cap);
+        let (utx, urx) = bounded(4);
         let counters = Arc::new(IntakeCounters::default());
         let reads: Reads = Arc::new(Mutex::new(Vec::new()));
         let r = reads.clone();
@@ -524,7 +527,7 @@ mod tests {
         RawEvent::FileOpEnd(FileOpEnd { irp, extra_information: info, status: 0 })
     }
 
-    fn passed_outcomes(krx: &Receiver<Incoming>) -> Vec<(u64, u64)> {
+    fn passed_outcomes(krx: &QueueReceiver<Incoming>) -> Vec<(u64, u64)> {
         krx.try_iter()
             .filter_map(|inc| match inc.event {
                 RawEvent::FileOpEnd(o) if !o.failed() => Some((o.irp, o.extra_information)),

@@ -10,7 +10,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::mpsc::{Sender, channel, sync_channel};
+use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -151,8 +151,8 @@ pub fn start(opts: AgentOptions, sink: impl FnMut(Event) + Send + 'static) -> Re
     let pipeline =
         Pipeline::new(setup, WinLookups::new(), Box::new(|_| EventId::new_v7())).map_err(AgentError::Watchlist)?;
 
-    let (ktx, krx) = sync_channel(opts.driver.kernel_queue_cap);
-    let (utx, urx) = sync_channel(opts.driver.user_queue_cap);
+    let (ktx, krx) = crate::queue::bounded(opts.driver.kernel_queue_cap);
+    let (utx, urx) = crate::queue::bounded(opts.driver.user_queue_cap);
     let queues = || Queues { kernel: ktx.clone(), user: utx.clone() };
     let intake_counters = Arc::new(IntakeCounters::default());
     let self_keys = [started.self_key];
