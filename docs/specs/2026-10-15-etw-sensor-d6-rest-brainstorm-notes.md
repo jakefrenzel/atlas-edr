@@ -1,0 +1,45 @@
+# Sub-project 1, the rest of the profiling step (D6): brainstorm notes
+
+**Status:** brainstorm done (2026-10-15): R1–R7 decided. Handoff notes: the decisions, the facts behind them, next steps. The plan these feed is **1b-4a-p2**.
+
+**Context:** plan 1b-4a-p1 is built (main `45eac1d`). On its final code (spec §15.3, F10) the agent is still over §13's budget (workday average < 2% of one core, heavy load < 5%, working set < 150 MB). Plan 1b-4a-p1's "Interfaces for later plans" lists the remaining items.
+
+## Facts (2026-10-15; the final-code trace `spikes/results/d6-trace/20261015-120226-d6-target-p1`)
+
+Source: the trace by function (`cpu-by-function.txt`, made with `spikes/d6trace` this session), `compare.py` and the run's Sensor Health reports.
+
+| Phase | Events/s | Agent CPU (trace) | Seeder | Pipeline | Hash workers | Other |
+|---|---|---|---|---|---|---|
+| quiet (30 s) | 2,355 | 3.0% | 1.30 | 0.87 | 0.42 | 0.4 |
+| synthetic (121 s) | 15,934 | 12.0% | 1.25 | 3.07 | 6.07 | 1.6 |
+| normal (301 s) | 6,521 | 5.0% | 1.07 | 1.25 | 2.17 | 0.5 |
+
+- The trace's own stack walks (on every context switch) are charged to the agent's threads, so its figures run a little high; the reports' quiet minutes read 2.2%.
+- **Seeder:** after start-up, on-miss seeding spends its whole budget (600 ms per 60 s = 1.0%) every minute, 16–18 table reads a minute (two per snapshot, ~70 ms each), 68% of it inside the kernel's `ExpSnapShotHandleTables`. It named about 20 handles in the 9 minutes after start, against about 1,500 file events dropped (`unknown_file_object`) and 180 registry events flagged (`registry_unresolved`): about 1% yield.
+- **Pipeline (quiet):** `tick` 49%, the 10 ms loop's `sleep` 29% (`CreateWaitableTimerExW` each time), `process` 27%, `on_reg_open` 16%, `Ordering::release_until` 12%.
+- **Hash workers (normal):** `WinVerifyTrust` 63%, of which the Authenticode digest (Windows' own SHA-256 of the file) 37%; the agent's own SHA-256 7%; file opens and reads about 20%.
+- **The loop's sleep, unelevated probe without the trace** (QueryThreadCycleTime, 20 s each; scratchpad `sleepprobe`): `std::thread::sleep(10 ms)` 0.17% of one core (18 µs per wake), a reused high-resolution waitable timer at 10 ms 0.10%, `sleep(50 ms)` 0.05%. GetThreadTimes is too coarse for this (15.6 ms ticks).
+- **Pipeline (synthetic) shares:** allocation and freeing about 25%, `release_until` 16%, waking a service worker per request (`SyncWaker::notify` → `NtAlertThreadByThreadIdEx`) about 10%, the sleep 7%, watchlist globs 7%, SipHash 4–6%, the seeding address history (`Seeding::changed`, `Recent::pop_front`) about 5%, the trace's stack walks about 10%. About 1.9 µs per event live in every phase.
+- **Hash workers are first-time checks:** in the final run's dump, image files first seen in the run: settle 121, quiet 19, synthetic 602 (600 of them `d6load`'s freshly copied `whoami.exe`), normal 384 of 4,679 loads. Normal use's hash CPU (6.5 s) over 384 new files is about 15 ms each; hits cost about 0.1 ms. One FIFO lane (`HashJob`) feeds both workers, with Launch and Module jobs mixed and no in-flight de-duplication. The cache holds 65,536 entries.
+- **The kernel's own signature verdict** (MOF `Image_Load`, system-logger `EVENT_TRACE_FLAG_IMAGE_LOAD`, has `SignatureLevel` and `SignatureType`; the manifest Kernel-Process 5 v0 the agent uses has neither) cannot replace `WinVerifyTrust`: the schema needs the signer's name.
+- **SetAttributes events** (final run's dump, 81,761 events in about 9.5 minutes): 4,827 SetAttributes (5.9% of events, 4% of bytes). 2,433 from the System process: DLLs 992, `Amcache.hve` 729, `.nls` 139, the volume root 27; in bursts of up to 800 in a second as apps start, the same ~20 system files each time (`ntdll.dll`, `kernel32.dll`, the `.nls` tables 27–28 times each). About 2,100 from two `svchost` processes writing `Amcache.hve` and its logs. Since plan 1b-4a-p1 they cost about 2 µs of pipeline each (about 0.001% of one core). Windows' SMB server (`srv2.sys`) works in the System process, so a remote client's changes on this machine's shares also show as PID 4.
+- **Working set:** 106 → 153 MB over the 10-minute run, still rising (plan 1b-4a's hour run: 200 MB, then held).
+
+## Decisions
+
+| # | Question | Chosen | Rejected |
+|---|---|---|---|
+| R1 | How to run the rest of the step | **A:** analyse every item from the kept final-code trace and the dumps (no new host run), decide them one at a time, then one plan (1b-4a-p2) with all chosen fixes, one re-measure with the trace script, then the hour run | B: one plan per item, re-measured after each (4–5 plan cycles); C: §13's fallbacks in order until under budget (trades telemetry without looking for a real fix) |
+| R2 | On-miss seeding | **A:** off by default (§13's first fallback; `seed_on_miss = false`, still settable in `agent.toml`): saves about 1.0% of one core at all times for about 1% of the recoveries; events on unknown handles no longer wait for an answer; start-up seeding stays | B: keep with a 0.1% budget (answers come after the 2 s wait; effectively off, still paid); C: keep as is |
+| R3 | The pipeline | **A:** a measured set of fixes, each kept only if a deterministic unelevated replay benchmark shows a gain: the loop wakes every 50 ms when a pass found little, 10 ms under load; one worker wake per pass, not per request; a fast hasher (foldhash) for the internal maps; the seeding address history stopped once start-up seeding is applied (R2); fewer allocations and a cheaper watchlist pre-check where the bench points. Estimate: a quarter to a third of the pipeline (about 0.3–0.4% of one core in normal use, 0.2% idle) | B: only the adaptive loop and the seeding history (0.15–0.3%); C: leave the pipeline to sub-project 8 |
+| R4 | The hash workers and F9 | **A:** Launch images jump ahead of module loads (a second, priority lane the workers check first), so a Launch waits at most for the jobs already running; and a longer enrichment deadline (5 s) for the first 5 minutes after start, as the seeder has, so start-up module loads keep their hashes too. CPU unchanged; the start-up quality gap (F9) closes | B: A plus the hash cache saved across restarts (~10–15 s of CPU per boot, ~0.05% of a workday; but a file modified offline from an OS that does not update the USN would keep its old hash and signature, a known evasion the in-memory cache is immune to); C: Launch priority only (start-up module loads can still miss) |
+| R5 | The SetAttributes events (plan 1b-4a-p1's Q6.7) | **A:** keep them all, no filter; Q6.7 closed with the finding recorded in the spec. Their CPU no longer matters, and a filter on PID 4 would also hide SMB clients' timestomping on this machine's shares (T1070.006) | B: drop the System process's SetAttributes on image files (about 1.5% of volume; blinds SMB); C: an elevated probe of what they set first (a host run for a decision that does not move the budget) |
+| R6 | The working set | **A:** measure, then right-size: every bounded structure's entry count in the diagnostic log at every report (the pipeline's test-only `sizes()` made real, plus the services' caches and the channels); caps or shrink-after-peak then set from the verify-first runs' figures, each a decision in the plan | B: lower the largest caps by estimate (may hit the wrong structure; too low means evictions and lost context); C: raise the budget to about 200 MB (§13 is provisional; nobody knows what holds the memory) |
+| R7 | The defaults (accepted together) | 1. p1's method (verify-first in a scratch worktree, the scratch branch pushed for CI, per-task commits, independent review, every fix checked by reverting it, the round trip, approval); 2. task order R2, R3, R4, R6's size line, then caps from its data; 3. R3's benchmark checked in as an `#[ignore]`d `atlas-agent` test replaying the CI recording many times and printing µs per event; 4. R6's line `sizes="…"` in the log only, next to `threads=`; 5. re-measure with Task 3's trace script against F10, then the hour run of normal use judged against §13 from the Sensor Health reports, which ends the profiling step; 6. if still over budget, the next §13 fallbacks come back as decisions; 7. docs: spec §3.2, §6.3, §7.4, §9.3, §11.2, §13, §15.3, §17, the decision log, the roadmap | — |
+
+## Next steps
+
+1. **Verify-first** in a scratch worktree of `main` (`45eac1d` or later), in R7's task order: R2, R3 (benchmark first, then each change measured), R4, R6's size line; push the scratch branch for CI (no PR).
+2. A host run of the trace script on the scratch build (the user, elevated) for R6's figures and the first re-measure; caps from the data, each a decision.
+3. Write plan 1b-4a-p2 from the verified code (skeleton, tasks, verification, review, reverts), round-trip it, independent review, user approval, plan PR, build PR.
+4. Then the hour run, which ends the profiling step; then the 1b-4b brainstorm.
