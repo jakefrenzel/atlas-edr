@@ -103,7 +103,7 @@ impl<L: Lookups> Pipeline<L> {
             keys: KeyMap::new(config.key_map_cap),
             reg: Registry::default(),
             net: Network::new(config.flow_cap, t(config.udp_idle)),
-            seeding: Seeding::new(),
+            seeding: Seeding::new(config.seed_on_miss),
             expands: Expands::default(),
             self_uids: self_keys.iter().map(|k| identity.uid(*k)).collect(),
             self_keys: self_keys.into_iter().collect(),

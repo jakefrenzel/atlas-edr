@@ -1571,6 +1571,32 @@ fn without_on_miss_seeding_only_the_start_up_pass_is_waited_for() {
 }
 
 #[test]
+fn without_on_miss_seeding_the_address_history_ends_with_the_start_up_passes() {
+    // Plan 1b-4a-p2, R3: with on-miss seeding off no snapshot comes after the
+    // start-up passes, so the reuse rule's address history goes with them.
+    let history = |t: &T| t.p.bookkeeping().into_iter().find(|(n, _)| *n == "address history").unwrap().1;
+    for on_miss in [false, true] {
+        let mut t = T::with(Config { seed_on_miss: on_miss, ..Config::default() }, FakeLookups::default());
+        running(&mut t, 100, 10, EXPLORER);
+        t.ev(5, 100, Some(key(10)), create(0x1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+        t.at(1_000);
+        assert_eq!(history(&t), 1, "kept while a start-up pass is to come (on_miss {on_miss})");
+        for kind in [HandleKind::Key, HandleKind::File] {
+            t.reply(Reply::Snapshot(Snapshot {
+                kind,
+                taken: ms(1_000),
+                asked: vec![],
+                named: vec![],
+                unnamable: vec![],
+            }));
+        }
+        t.ev(1_100, 100, Some(key(10)), create(0x2, 0xB, r"\Device\HarddiskVolume3\b.txt", 0));
+        t.at(2_000);
+        assert_eq!(history(&t), if on_miss { 2 } else { 0 }, "on_miss {on_miss}");
+    }
+}
+
+#[test]
 fn a_clean_stop_drops_what_a_deadline_would() {
     let mut t = T::new();
     running(&mut t, 100, 10, EXPLORER);
