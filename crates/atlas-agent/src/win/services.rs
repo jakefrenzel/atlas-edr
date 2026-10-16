@@ -1,7 +1,9 @@
 //! The services' threads and the routing of [`Request`]s to them (sensor spec
 //! §3.2 [4] and [8]; plan 1b-3b, D5).
 //!
-//! - **Hash workers** (2, below normal): `Enrich`.
+//! - **Hash workers** (2, below normal): `Enrich`, Launch images first (plan
+//!   1b-4a-p2, R4): while the cache is cold a Launch would otherwise wait
+//!   behind dozens of module loads and miss its 1 s deadline (F9).
 //! - **Reader lane** (1): value reads, on the ordered path and the fast path.
 //!   It does no file I/O, so a slow directory never delays a value read (R-M2).
 //! - **Expander lane** (1): 8.3 expansion (D4).
@@ -21,9 +23,10 @@
 //! (R-M3). Neither is a dropped request. Replies come back on one channel,
 //! which the driver (plan 1b-3c) feeds to `Pipeline::reply`.
 
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
@@ -36,10 +39,65 @@ use crate::completion::PendingId;
 use crate::config::ServiceConfig;
 use crate::counters::ServiceCounters;
 use crate::intake::FastRead;
-use crate::services::{EarlyKey, HandleKind, Reply, Request, ValueRead};
+use crate::services::{EarlyKey, EnrichTarget, HandleKind, Reply, Request, ValueRead};
 
 /// An `Enrich`: the event waiting for it, and the file's NT path.
 type HashJob = (PendingId, String);
+
+/// The hash workers' lane: two bounded queues, Launch images taken first.
+struct HashLane {
+    queues: Mutex<HashQueues>,
+    ready: Condvar,
+    /// The most jobs each queue holds.
+    cap: usize,
+}
+
+#[derive(Default)]
+struct HashQueues {
+    launches: VecDeque<HashJob>,
+    modules: VecDeque<HashJob>,
+    closed: bool,
+}
+
+impl HashLane {
+    fn new(cap: usize) -> Self {
+        HashLane { queues: Mutex::new(HashQueues::default()), ready: Condvar::new(), cap: cap.max(1) }
+    }
+
+    /// Queues a job; false if its queue is full.
+    fn push(&self, launch: bool, job: HashJob) -> bool {
+        let mut q = self.queues.lock().expect("hash lane");
+        let queue = if launch { &mut q.launches } else { &mut q.modules };
+        if queue.len() >= self.cap {
+            return false;
+        }
+        queue.push_back(job);
+        drop(q);
+        self.ready.notify_one();
+        true
+    }
+
+    /// The next job, a Launch image's first; `None` once closed and empty.
+    fn pop(&self) -> Option<HashJob> {
+        let mut q = self.queues.lock().expect("hash lane");
+        loop {
+            if let Some(job) = q.launches.pop_front().or_else(|| q.modules.pop_front()) {
+                return Some(job);
+            }
+            if q.closed {
+                return None;
+            }
+            q = self.ready.wait(q).expect("hash lane");
+        }
+    }
+
+    /// The workers finish what is queued, then end.
+    fn close(&self) {
+        // Also on a poisoned lock: this runs on drop, perhaps while unwinding.
+        self.queues.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        self.ready.notify_all();
+    }
+}
 
 enum ReaderJob {
     Read(PendingId, ValueRead),
@@ -58,7 +116,7 @@ struct Invalidations {
 }
 
 pub struct Services {
-    hash: SyncSender<HashJob>,
+    hash: Arc<HashLane>,
     reader: SyncSender<ReaderJob>,
     expander: SyncSender<ExpandJob>,
     cache: Arc<Mutex<HashCache>>,
@@ -95,14 +153,13 @@ impl Services {
         let (reply_tx, replies) = channel();
 
         let cache = Arc::new(Mutex::new(HashCache::new(cfg.hash_cache_cap)));
-        let (hash, hash_rx) = sync_channel::<HashJob>(cfg.lane_cap);
-        let hash_rx = Arc::new(Mutex::new(hash_rx));
+        let hash = Arc::new(HashLane::new(cfg.lane_cap));
         for i in 0..cfg.hash_workers.max(1) {
-            let (rx, tx, cache, counters, cap) =
-                (hash_rx.clone(), reply_tx.clone(), cache.clone(), counters.clone(), cfg.hash_size_cap);
+            let (lane, tx, cache, counters, cap) =
+                (hash.clone(), reply_tx.clone(), cache.clone(), counters.clone(), cfg.hash_size_cap);
             std::thread::Builder::new()
                 .name(format!("atlas-hash-{i}"))
-                .spawn(move || hash_worker(&rx, &tx, &cache, &counters, cap))
+                .spawn(move || hash_worker(&lane, &tx, &cache, &counters, cap))
                 .expect("spawn a hash worker");
         }
 
@@ -164,7 +221,11 @@ impl Services {
     /// short locks and wakes no thread (R3a).
     pub fn submit(&self, r: Request) {
         match r {
-            Request::Enrich { id, nt_path, .. } => self.count(self.hash.try_send((id, nt_path))),
+            Request::Enrich { id, target, nt_path } => {
+                if !self.hash.push(target == EnrichTarget::LaunchImage, (id, nt_path)) {
+                    self.counters.service_queue_drops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             Request::InvalidateHash { nt_path } => {
                 self.cache.lock().expect("hash cache").invalidate(&nt_path);
                 let mut q = self.invalidations.lock().expect("invalidations");
@@ -203,8 +264,16 @@ impl Services {
     }
 }
 
+impl Drop for Services {
+    /// The hash workers end once their lane is empty (the other lanes end when
+    /// their senders go).
+    fn drop(&mut self) {
+        self.hash.close();
+    }
+}
+
 fn hash_worker(
-    jobs: &Mutex<Receiver<HashJob>>,
+    jobs: &HashLane,
     replies: &Sender<Reply>,
     cache: &Mutex<HashCache>,
     counters: &ServiceCounters,
@@ -215,11 +284,7 @@ fn hash_worker(
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
     let enricher = Enricher::new(size_cap);
-    loop {
-        let (id, nt_path) = match jobs.lock().expect("hash lane").recv() {
-            Ok(j) => j,
-            Err(_) => return,
-        };
+    while let Some((id, nt_path)) = jobs.pop() {
         let r = enricher.enrich(&nt_path, cache);
         counters.hash_cache_evictions.store(cache.lock().expect("hash cache").evictions, Ordering::Relaxed);
         let reply = Reply::Enriched { id, hashes: r.hashes, signature: r.signature, error: r.error };
@@ -328,6 +393,54 @@ mod tests {
             }
         }
         assert_eq!(s.counters().service_queue_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn launch_images_are_taken_before_module_loads() {
+        // R4: a Launch queued behind module loads is hashed next.
+        let lane = HashLane::new(8);
+        for id in 1..=3 {
+            assert!(lane.push(false, (id, format!("m{id}"))));
+        }
+        assert!(lane.push(true, (9, "launch".into())));
+        let order: Vec<PendingId> = (0..4).map(|_| lane.pop().unwrap().0).collect();
+        assert_eq!(order, [9, 1, 2, 3]);
+    }
+
+    #[test]
+    fn each_hash_queue_is_bounded_and_a_closed_lane_drains_then_ends() {
+        let lane = HashLane::new(2);
+        assert!(lane.push(false, (1, "a".into())) && lane.push(false, (2, "b".into())));
+        assert!(!lane.push(false, (3, "c".into())), "the module queue is full");
+        assert!(lane.push(true, (4, "d".into())), "the Launch queue has its own room");
+        lane.close();
+        let left: Vec<PendingId> = std::iter::from_fn(|| lane.pop()).map(|j| j.0).collect();
+        assert_eq!(left, [4, 1, 2]);
+    }
+
+    #[test]
+    fn closing_the_lane_wakes_a_parked_worker_once_it_is_empty() {
+        let lane = Arc::new(HashLane::new(4));
+        let (l, (tx, rx)) = (lane.clone(), channel());
+        std::thread::spawn(move || tx.send(std::iter::from_fn(|| l.pop()).count()));
+        std::thread::sleep(Duration::from_millis(50)); // parked in pop, nothing queued
+        lane.close();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("the worker ended"), 0);
+    }
+
+    #[test]
+    fn launch_images_go_to_the_priority_queue() {
+        let s = Services::start(&ServiceConfig::default());
+        s.hash.close();
+        std::thread::sleep(Duration::from_millis(200)); // the idle workers end
+        s.submit(Request::Enrich { id: 1, target: EnrichTarget::Module, nt_path: "m".into() });
+        s.submit(Request::Enrich { id: 2, target: EnrichTarget::LaunchImage, nt_path: "l".into() });
+        let ids = |d: &VecDeque<HashJob>| d.iter().map(|j| j.0).collect::<Vec<_>>();
+        let queued = {
+            let q = s.hash.queues.lock().unwrap();
+            (ids(&q.launches), ids(&q.modules))
+        };
+        assert_eq!(queued, (vec![2], vec![1]));
     }
 
     #[test]
