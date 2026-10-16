@@ -5,12 +5,17 @@
 //!
 //! The heap holds keys only (timestamp, arrival order, slot), so sifting moves
 //! 24 bytes rather than a whole event; events wait in reusable slots and leave
-//! one at a time (plan 1b-4a-p2, R3).
+//! one at a time (plan 1b-4a-p2, R3). After a burst the slots are compacted
+//! once fewer than an eighth hold an event, so a peak's memory is given back
+//! (R6b).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::input::Incoming;
+
+/// The fewest slots compaction leaves (about 1.4 MB).
+const SLOTS_FLOOR: usize = 8_192;
 
 /// A held event's key: its timestamp, its arrival order (so equal timestamps
 /// keep their order) and the slot it waits in.
@@ -83,7 +88,26 @@ impl Ordering {
         self.heap.pop();
         self.last_released = self.last_released.max(ts);
         self.free.push(slot);
-        Some(self.slots[slot as usize].take().expect("a held key has its event"))
+        let inc = self.slots[slot as usize].take().expect("a held key has its event");
+        if self.slots.capacity() > SLOTS_FLOOR && self.heap.len() * 8 < self.slots.capacity() {
+            self.compact();
+        }
+        Some(inc)
+    }
+
+    /// Moves the held events into slots sized for them (twice their number,
+    /// at least `SLOTS_FLOOR`) and rebuilds the keys; their order is kept.
+    fn compact(&mut self) {
+        let keys = std::mem::take(&mut self.heap).into_vec();
+        let mut slots = Vec::with_capacity((keys.len() * 2).max(SLOTS_FLOOR));
+        let mut heap = Vec::with_capacity(keys.len());
+        for Reverse((ts, seq, slot)) in keys {
+            heap.push(Reverse((ts, seq, slots.len() as u32)));
+            slots.push(self.slots[slot as usize].take());
+        }
+        self.heap = BinaryHeap::from(heap);
+        self.slots = slots;
+        self.free = Vec::new();
     }
 
     /// Every held event whose hold has passed at `now`, in timestamp order.
@@ -170,6 +194,32 @@ mod tests {
             assert_eq!(o.release(round * 1000 + 200).len(), 4);
         }
         assert_eq!((o.slots.len(), o.free.len()), (4, 4));
+    }
+
+    #[test]
+    fn after_a_burst_the_slots_shrink_and_the_order_holds() {
+        // R6b: 40,000 held, then all but 300 released.
+        let mut o = Ordering::new(0);
+        for i in 0..40_000 {
+            o.push(inc(i, i as u64));
+        }
+        assert!(o.capacity() >= 40_000);
+        assert_eq!(o.release(39_699).len(), 39_700);
+        assert_eq!(o.len(), 300);
+        assert!(o.capacity() <= 2 * SLOTS_FLOOR, "{} slots kept", o.capacity());
+        // What stays comes out in order, and pushes after it slot in.
+        o.push(inc(50_000, 99));
+        let rest: Vec<u64> = o.drain().iter().map(tag).collect();
+        assert_eq!(rest.len(), 301);
+        assert!(rest[..300].iter().copied().eq(39_700..40_000));
+        assert_eq!(rest[300], 99);
+        // Small ones are left alone.
+        let mut o = Ordering::new(0);
+        for i in 0..100 {
+            o.push(inc(i, 0));
+        }
+        o.release(98);
+        assert_eq!(o.capacity(), 128, "under the floor: no compaction");
     }
 
     #[test]
