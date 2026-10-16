@@ -163,7 +163,7 @@ fn run_driven() -> Vec<Event> {
         now
     });
     let anchor = Box::new(|| panic!("no anchor refresh within a replay"));
-    let cfg = DriverConfig { cadence: Duration::ZERO, ..DriverConfig::default() };
+    let cfg = DriverConfig { cadence: Duration::ZERO, idle_cadence: Duration::ZERO, ..DriverConfig::default() };
     let driver = Driver::new(p, FakeLanes::new(answer), krx, urx, clock, anchor, cfg);
     let mut out = Vec::new();
     driver.run(|e| out.push(e));
