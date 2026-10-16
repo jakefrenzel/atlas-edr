@@ -1,23 +1,27 @@
 //! The services' threads and the routing of [`Request`]s to them (sensor spec
 //! §3.2 [4] and [8]; plan 1b-3b, D5).
 //!
-//! - **Hash workers** (2, below normal): `Enrich`, and the hash cache's
-//!   invalidations, so the pipeline thread never takes the cache's lock.
+//! - **Hash workers** (2, below normal): `Enrich`.
 //! - **Reader lane** (1): value reads, on the ordered path and the fast path.
 //!   It does no file I/O, so a slow directory never delays a value read (R-M2).
-//! - **Expander lane** (1): 8.3 expansion, and the expansion cache's
-//!   invalidations in arrival order (D4).
+//! - **Expander lane** (1): 8.3 expansion (D4).
 //! - **Seeder** (1, below normal): `Seed`, when `SeDebugPrivilege` is available.
 //!
 //! Lanes are bounded and never block the caller. A full lane drops the request
 //! and counts it: a dropped `Enrich`, `ReadValue`, `Expand` or `Seed` costs its
-//! event's deadline (clarification 25). A dropped invalidation of the
-//! expansion cache sets a flag, and the expander clears its whole cache before
-//! its next job (R-M3). The hash cache needs no such care: its key holds the USN.
-//! Replies come back on one channel, which the driver (plan 1b-3c) feeds to
-//! `Pipeline::reply`.
+//! event's deadline (clarification 25).
+//!
+//! **Invalidations wake no thread** (plan 1b-4a-p2, R3a): handing a job to a
+//! parked worker costs about 22 µs of CPU, and every file Update, Rename and
+//! Delete invalidates both caches. The caller removes the hash cache's entries
+//! itself, under the cache's lock, which the workers hold only to look up and
+//! to insert, never while hashing. The expansion cache's invalidations wait in
+//! a list the expander applies before its next expansion, so none is applied
+//! late; if the list fills first, the expander clears its whole cache instead
+//! (R-M3). Neither is a dropped request. Replies come back on one channel,
+//! which the driver (plan 1b-3c) feeds to `Pipeline::reply`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -34,27 +38,33 @@ use crate::counters::ServiceCounters;
 use crate::intake::FastRead;
 use crate::services::{EarlyKey, HandleKind, Reply, Request, ValueRead};
 
-enum HashJob {
-    Enrich(PendingId, String),
-    Invalidate(String),
-}
+/// An `Enrich`: the event waiting for it, and the file's NT path.
+type HashJob = (PendingId, String);
 
 enum ReaderJob {
     Read(PendingId, ValueRead),
     Early(EarlyKey, ValueRead),
 }
 
-enum ExpandJob {
-    Expand(PendingId, u8, String),
-    Invalidate(String),
+/// An `Expand`: the event, its path slot, and the NT path.
+type ExpandJob = (PendingId, u8, String);
+
+/// The expansion cache's invalidations, waiting for the expander's next job.
+#[derive(Default)]
+struct Invalidations {
+    paths: Vec<String>,
+    /// Too many waited: the expander clears its whole cache instead.
+    lost: bool,
 }
 
 pub struct Services {
     hash: SyncSender<HashJob>,
     reader: SyncSender<ReaderJob>,
     expander: SyncSender<ExpandJob>,
-    /// Set when an expansion-cache invalidation was dropped (R-M3).
-    invalidation_lost: Arc<AtomicBool>,
+    cache: Arc<Mutex<HashCache>>,
+    invalidations: Arc<Mutex<Invalidations>>,
+    /// The most invalidations that wait for the expander (the lane's capacity).
+    invalidations_cap: usize,
     seeder: Option<SyncSender<(HandleKind, Vec<u64>)>>,
     replies: Receiver<Reply>,
     counters: Arc<ServiceCounters>,
@@ -104,12 +114,12 @@ impl Services {
             .spawn(move || reader_lane(reader_rx, &tx, backup))
             .expect("spawn the reader lane");
 
-        let invalidation_lost = Arc::new(AtomicBool::new(false));
+        let invalidations = Arc::new(Mutex::new(Invalidations::default()));
         let (expander, expand_rx) = sync_channel::<ExpandJob>(cfg.lane_cap);
-        let (tx, lost) = (reply_tx.clone(), invalidation_lost.clone());
+        let (tx, pending) = (reply_tx.clone(), invalidations.clone());
         std::thread::Builder::new()
             .name("atlas-expander".into())
-            .spawn(move || expander_lane(expand_rx, &tx, Expander::new(dir), &lost))
+            .spawn(move || expander_lane(expand_rx, &tx, Expander::new(dir), &pending))
             .expect("spawn the expander lane");
 
         let seeder = Seeder::new(cfg, counters.clone()).map(|s| {
@@ -122,7 +132,17 @@ impl Services {
             seed_tx
         });
 
-        Services { hash, reader, expander, invalidation_lost, seeder, replies, counters }
+        Services {
+            hash,
+            reader,
+            expander,
+            cache,
+            invalidations,
+            invalidations_cap: cfg.lane_cap,
+            seeder,
+            replies,
+            counters,
+        }
     }
 
     /// Whether the seeder runs. If not, the driver sets `Config::seed_on_start`
@@ -140,21 +160,23 @@ impl Services {
         self.replies.try_iter()
     }
 
-    /// Hands a request to its lane. Never blocks, and takes no lock.
+    /// Hands a request to its lane. Never blocks; an invalidation takes two
+    /// short locks and wakes no thread (R3a).
     pub fn submit(&self, r: Request) {
         match r {
-            Request::Enrich { id, nt_path, .. } => self.count(self.hash.try_send(HashJob::Enrich(id, nt_path))),
+            Request::Enrich { id, nt_path, .. } => self.count(self.hash.try_send((id, nt_path))),
             Request::InvalidateHash { nt_path } => {
-                self.count(self.hash.try_send(HashJob::Invalidate(nt_path.clone())));
-                if self.expander.try_send(ExpandJob::Invalidate(nt_path)).is_err() {
-                    self.invalidation_lost.store(true, Ordering::Release);
-                    self.counters.service_queue_drops.fetch_add(1, Ordering::Relaxed);
+                self.cache.lock().expect("hash cache").invalidate(&nt_path);
+                let mut q = self.invalidations.lock().expect("invalidations");
+                if q.paths.len() >= self.invalidations_cap {
+                    q.paths.clear();
+                    q.lost = true;
+                } else {
+                    q.paths.push(nt_path);
                 }
             }
             Request::ReadValue { id, read } => self.count(self.reader.try_send(ReaderJob::Read(id, read))),
-            Request::Expand { id, slot, nt_path } => {
-                self.count(self.expander.try_send(ExpandJob::Expand(id, slot, nt_path)))
-            }
+            Request::Expand { id, slot, nt_path } => self.count(self.expander.try_send((id, slot, nt_path))),
             Request::Seed { kind, addresses } => {
                 if let Some(s) = &self.seeder {
                     self.count(s.try_send((kind, addresses)));
@@ -194,16 +216,9 @@ fn hash_worker(
     }
     let enricher = Enricher::new(size_cap);
     loop {
-        let job = match jobs.lock().expect("hash lane").recv() {
+        let (id, nt_path) = match jobs.lock().expect("hash lane").recv() {
             Ok(j) => j,
             Err(_) => return,
-        };
-        let (id, nt_path) = match job {
-            HashJob::Enrich(id, p) => (id, p),
-            HashJob::Invalidate(p) => {
-                cache.lock().expect("hash cache").invalidate(&p);
-                continue;
-            }
         };
         let r = enricher.enrich(&nt_path, cache);
         counters.hash_cache_evictions.store(cache.lock().expect("hash cache").evictions, Ordering::Relaxed);
@@ -233,20 +248,19 @@ fn expander_lane<D: Dir>(
     jobs: Receiver<ExpandJob>,
     replies: &Sender<Reply>,
     mut expander: Expander<D>,
-    lost: &AtomicBool,
+    pending: &Mutex<Invalidations>,
 ) {
-    for job in jobs {
-        if lost.swap(false, Ordering::Acquire) {
+    for (id, slot, nt) in jobs {
+        let waiting = std::mem::take(&mut *pending.lock().expect("invalidations"));
+        if waiting.lost {
             expander.clear();
         }
-        match job {
-            ExpandJob::Expand(id, slot, nt) => {
-                let reply = Reply::Expanded { id, slot, long_path: expander.expand(&nt, Instant::now()) };
-                if replies.send(reply).is_err() {
-                    return;
-                }
-            }
-            ExpandJob::Invalidate(nt) => expander.invalidate(&nt),
+        for p in &waiting.paths {
+            expander.invalidate(p);
+        }
+        let reply = Reply::Expanded { id, slot, long_path: expander.expand(&nt, Instant::now()) };
+        if replies.send(reply).is_err() {
+            return;
         }
     }
 }
@@ -398,27 +412,62 @@ mod tests {
         assert!(expanded(&wait(&s, 1), 1).is_some(), "the expansion still completes");
     }
 
-    /// R-M3: when the expander lane is full, a dropped invalidation clears the
-    /// expansion cache before the next job, so a reused short name is not
-    /// answered from the cache.
-    #[test]
-    fn a_lost_invalidation_clears_the_expansion_cache() {
+    /// The expander's cache answers SECRET~1 with SecretStuffAAA, then its
+    /// lane blocks on an expansion of OTHER~1 and a second SECRET~1 waits.
+    fn blocked_after_caching_secret(lane_cap: usize) -> (GateDir, Services) {
         let dir = GateDir::default();
         dir.set("SECRET~1", "SecretStuffAAA");
-        let cfg = ServiceConfig { lane_cap: 1, ..ServiceConfig::default() };
+        let cfg = ServiceConfig { lane_cap, ..ServiceConfig::default() };
         let s = Services::start_with(&cfg, dir.clone());
         s.submit(Request::Expand { id: 1, slot: 0, nt_path: format!(r"{V}\SECRET~1") });
         assert_eq!(expanded(&wait(&s, 1), 1), Some(Some(format!(r"{V}\SecretStuffAAA"))));
-
         dir.close();
         s.submit(Request::Expand { id: 2, slot: 0, nt_path: format!(r"{V}\OTHER~1") }); // the lane blocks on it
         std::thread::sleep(Duration::from_millis(100));
-        s.submit(Request::Expand { id: 3, slot: 0, nt_path: format!(r"{V}\SECRET~1") }); // fills the queue
-        s.submit(Request::InvalidateHash { nt_path: format!(r"{V}\SecretStuffAAA") }); // dropped
-        assert!(s.counters().service_queue_drops.load(Ordering::Relaxed) >= 1);
+        s.submit(Request::Expand { id: 3, slot: 0, nt_path: format!(r"{V}\SECRET~1") });
+        (dir, s)
+    }
+
+    /// R3a: an invalidation reaches the expander without a job of its own,
+    /// before the next expansion, even while its lane is full.
+    #[test]
+    fn an_invalidation_waits_for_the_expanders_next_job() {
+        let (dir, s) = blocked_after_caching_secret(1);
+        // The lane (one job) is full; the list holds one path: it fits there.
+        s.submit(Request::InvalidateHash { nt_path: format!(r"{V}\SecretStuffAAA") });
         dir.set("SECRET~1", "SecretStuffBBB"); // the short name now belongs to another directory
         dir.open();
         let got = wait(&s, 2);
         assert_eq!(expanded(&got, 3), Some(Some(format!(r"{V}\SecretStuffBBB"))), "{got:?}");
+        assert_eq!(s.counters().service_queue_drops.load(Ordering::Relaxed), 0, "nothing was dropped");
+    }
+
+    /// R-M3, R3a: when more invalidations wait than the list holds, the
+    /// expander clears its whole cache before its next job, so a reused short
+    /// name is not answered from the cache.
+    #[test]
+    fn too_many_waiting_invalidations_clear_the_expansion_cache() {
+        let (dir, s) = blocked_after_caching_secret(2);
+        s.submit(Request::InvalidateHash { nt_path: format!(r"{V}\SecretStuffAAA") });
+        for i in 0..2 {
+            s.submit(Request::InvalidateHash { nt_path: format!(r"{V}\Unrelated{i}") }); // the second overflows
+        }
+        dir.set("SECRET~1", "SecretStuffBBB");
+        dir.open();
+        let got = wait(&s, 2);
+        assert_eq!(expanded(&got, 3), Some(Some(format!(r"{V}\SecretStuffBBB"))), "{got:?}");
+        assert_eq!(s.counters().service_queue_drops.load(Ordering::Relaxed), 0);
+    }
+
+    /// R3a: the caller removes the hash cache's entries itself, at once.
+    #[test]
+    fn an_invalidation_empties_the_hash_cache_at_once() {
+        let s = Services::start(&ServiceConfig::default());
+        let notepad = nt(&format!(r"{}\System32\notepad.exe", std::env::var("SystemRoot").unwrap()));
+        s.submit(Request::Enrich { id: 1, target: EnrichTarget::LaunchImage, nt_path: notepad.clone() });
+        assert_eq!(wait(&s, 1).len(), 1);
+        assert_eq!(s.cache.lock().unwrap().len(), 1, "notepad.exe is cached");
+        s.submit(Request::InvalidateHash { nt_path: notepad.to_uppercase() });
+        assert_eq!(s.cache.lock().unwrap().len(), 0, "gone before submit returned");
     }
 }
