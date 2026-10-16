@@ -363,7 +363,7 @@ fn binary_run_and_dump() {
     // m2). Not a check: a thread shows only if it used a clock tick (~15.6 ms)
     // since the last listing, a few seconds before; its line is kept instead.
     let last = log_text.lines().rfind(|l| l.contains("health report")).unwrap_or("");
-    let threads = last.split("threads=").nth(1).unwrap_or("").trim();
+    let threads = last.split("threads=").nth(1).and_then(|t| t.split(" sizes=").next()).unwrap_or("").trim();
     report.note("final_report_threads", json!(threads));
     // A periodic report's line gives each bounded structure's entries and
     // capacity (plan 1b-4a-p2, R6); the pipeline's only while it runs.
