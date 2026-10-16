@@ -67,6 +67,10 @@ impl<K: Hash + Eq + Clone> Recent<K> {
         self.map.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -123,6 +127,10 @@ impl<K: Hash + Eq + Clone, V> RecentMap<K, V> {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
     }
 
     pub fn is_empty(&self) -> bool {

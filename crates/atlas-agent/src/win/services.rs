@@ -176,7 +176,10 @@ impl Services {
         let (tx, pending) = (reply_tx.clone(), invalidations.clone());
         std::thread::Builder::new()
             .name("atlas-expander".into())
-            .spawn(move || expander_lane(expand_rx, &tx, Expander::new(dir), &pending))
+            .spawn({
+                let counters = counters.clone();
+                move || expander_lane(expand_rx, &tx, Expander::new(dir), &pending, &counters)
+            })
             .expect("spawn the expander lane");
 
         let seeder = Seeder::new(cfg, counters.clone()).map(|s| {
@@ -286,7 +289,12 @@ fn hash_worker(
     let enricher = Enricher::new(size_cap);
     while let Some((id, nt_path)) = jobs.pop() {
         let r = enricher.enrich(&nt_path, cache);
-        counters.hash_cache_evictions.store(cache.lock().expect("hash cache").evictions, Ordering::Relaxed);
+        {
+            let c = cache.lock().expect("hash cache");
+            counters.hash_cache_evictions.store(c.evictions, Ordering::Relaxed);
+            counters.hash_cache_entries.store(c.len() as u64, Ordering::Relaxed);
+            counters.hash_cache_capacity.store(c.capacity() as u64, Ordering::Relaxed);
+        }
         let reply = Reply::Enriched { id, hashes: r.hashes, signature: r.signature, error: r.error };
         if replies.send(reply).is_err() {
             return;
@@ -314,6 +322,7 @@ fn expander_lane<D: Dir>(
     replies: &Sender<Reply>,
     mut expander: Expander<D>,
     pending: &Mutex<Invalidations>,
+    counters: &ServiceCounters,
 ) {
     for (id, slot, nt) in jobs {
         let waiting = std::mem::take(&mut *pending.lock().expect("invalidations"));
@@ -324,6 +333,7 @@ fn expander_lane<D: Dir>(
             expander.invalidate(p);
         }
         let reply = Reply::Expanded { id, slot, long_path: expander.expand(&nt, Instant::now()) };
+        counters.expand_cache_entries.store(expander.len() as u64, Ordering::Relaxed);
         if replies.send(reply).is_err() {
             return;
         }
@@ -534,6 +544,7 @@ mod tests {
         let s = Services::start_with(&cfg, dir.clone());
         s.submit(Request::Expand { id: 1, slot: 0, nt_path: format!(r"{V}\SECRET~1") });
         assert_eq!(expanded(&wait(&s, 1), 1), Some(Some(format!(r"{V}\SecretStuffAAA"))));
+        assert_eq!(s.counters.expand_cache_entries.load(Ordering::Relaxed), 1, "R6: one short name cached");
         dir.close();
         s.submit(Request::Expand { id: 2, slot: 0, nt_path: format!(r"{V}\OTHER~1") }); // the lane blocks on it
         std::thread::sleep(Duration::from_millis(100));
@@ -580,6 +591,9 @@ mod tests {
         s.submit(Request::Enrich { id: 1, target: EnrichTarget::LaunchImage, nt_path: notepad.clone() });
         assert_eq!(wait(&s, 1).len(), 1);
         assert_eq!(s.cache.lock().unwrap().len(), 1, "notepad.exe is cached");
+        let gauge = |g: &std::sync::atomic::AtomicU64| g.load(Ordering::Relaxed);
+        assert_eq!(gauge(&s.counters.hash_cache_entries), 1, "R6: the gauge is set before the reply");
+        assert!(gauge(&s.counters.hash_cache_capacity) >= 1);
         s.submit(Request::InvalidateHash { nt_path: notepad.to_uppercase() });
         assert_eq!(s.cache.lock().unwrap().len(), 0, "gone before submit returned");
     }

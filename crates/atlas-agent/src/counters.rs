@@ -92,6 +92,9 @@ pub struct IntakeCounters {
     /// review R-M4).
     pub cleanup_unpaired: AtomicU64,
     pub cleanup_outcome_late: AtomicU64,
+    /// Gauges: the early key map's entries and capacity (R6).
+    pub early_keys: AtomicU64,
+    pub early_keys_capacity: AtomicU64,
 }
 
 impl IntakeCounters {
@@ -101,6 +104,12 @@ impl IntakeCounters {
 
     pub fn get(c: &AtomicU64) -> u64 {
         c.load(Ordering::Relaxed)
+    }
+
+    /// The early key map's (entries, capacity), gauges (R6).
+    pub fn set_early_keys(&self, (len, cap): (usize, usize)) {
+        self.early_keys.store(len as u64, Ordering::Relaxed);
+        self.early_keys_capacity.store(cap as u64, Ordering::Relaxed);
     }
 
     /// The values now, for a Sensor Health snapshot (plan 1b-4a).
@@ -117,6 +126,8 @@ impl IntakeCounters {
             fast_reads: g(&self.fast_reads),
             cleanup_unpaired: g(&self.cleanup_unpaired),
             cleanup_outcome_late: g(&self.cleanup_outcome_late),
+            early_keys: g(&self.early_keys),
+            early_keys_capacity: g(&self.early_keys_capacity),
         }
     }
 }
@@ -134,6 +145,9 @@ pub struct IntakeTotals {
     pub fast_reads: u64,
     pub cleanup_unpaired: u64,
     pub cleanup_outcome_late: u64,
+    /// Gauges: the early key map's entries and capacity (R6).
+    pub early_keys: u64,
+    pub early_keys_capacity: u64,
 }
 
 /// Counters kept by the Windows services (plan 1b-3b), shared with their
@@ -157,6 +171,12 @@ pub struct ServiceCounters {
     pub seeder_deferred_rereads: AtomicU64,
     /// Gauge, updated at the end of each snapshot.
     pub seeder_stuck_helpers: AtomicU64,
+    /// Gauges for the diagnostic log (R6): the hash cache's entries and
+    /// capacity after each hash job, the expansion cache's entries after each
+    /// expansion.
+    pub hash_cache_entries: AtomicU64,
+    pub hash_cache_capacity: AtomicU64,
+    pub expand_cache_entries: AtomicU64,
 }
 
 impl ServiceCounters {
@@ -172,6 +192,9 @@ impl ServiceCounters {
             seeder_table_reads: g(&self.seeder_table_reads),
             seeder_deferred_rereads: g(&self.seeder_deferred_rereads),
             seeder_stuck_helpers: g(&self.seeder_stuck_helpers),
+            hash_cache_entries: g(&self.hash_cache_entries),
+            hash_cache_capacity: g(&self.hash_cache_capacity),
+            expand_cache_entries: g(&self.expand_cache_entries),
         }
     }
 }
@@ -188,4 +211,8 @@ pub struct ServiceTotals {
     pub seeder_deferred_rereads: u64,
     /// A gauge.
     pub seeder_stuck_helpers: u64,
+    /// Gauges (R6).
+    pub hash_cache_entries: u64,
+    pub hash_cache_capacity: u64,
+    pub expand_cache_entries: u64,
 }

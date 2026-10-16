@@ -128,6 +128,7 @@ impl Intake {
                     if evicted > 0 {
                         self.counters.early_key_map_evictions.fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
                     }
+                    self.counters.set_early_keys(m.sizes());
                 }
             }
             RawEvent::RegCloseKey(k) => {
@@ -136,6 +137,7 @@ impl Intake {
                     && !header.start_key.is_some_and(|s| self.self_keys.contains(&s))
                 {
                     m.close(k.key_object);
+                    self.counters.set_early_keys(m.sizes());
                 }
             }
             RawEvent::RegSetValue(v) if v.status == 0 => {
@@ -372,6 +374,11 @@ impl EarlyKeys {
 
     pub fn close(&mut self, key: u64) {
         self.names.remove(&key);
+    }
+
+    /// (entries, capacity) (R6).
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.names.len(), self.names.capacity())
     }
 
     pub fn name(&self, key: u64) -> Option<&str> {
@@ -798,6 +805,20 @@ mod tests {
         i.on_event(header(1, 4), Ok(close));
         i.on_event(header(1, 5), Ok(set(10, "v")));
         assert_eq!(reads.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_early_maps_size_is_a_gauge() {
+        // R6: entries and capacity after each open and close.
+        let (mut i, _, _, c, _) = intake(64);
+        i.on_event(header(1, 1), Ok(open(10, 0, r"\REGISTRY\MACHINE\X")));
+        i.on_event(header(1, 2), Ok(open(11, 10, "Y")));
+        assert_eq!(IntakeCounters::get(&c.early_keys), 2);
+        assert!(IntakeCounters::get(&c.early_keys_capacity) >= 2);
+        let close = RawEvent::RegCloseKey(RegKey { key_object: 10, status: 0, key_name: WStr::default() });
+        i.on_event(header(1, 3), Ok(close));
+        assert_eq!(IntakeCounters::get(&c.early_keys), 1);
+        assert_eq!(c.totals().early_keys, 1);
     }
 
     #[test]

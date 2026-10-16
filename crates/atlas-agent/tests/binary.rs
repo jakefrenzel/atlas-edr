@@ -365,6 +365,12 @@ fn binary_run_and_dump() {
     let last = log_text.lines().rfind(|l| l.contains("health report")).unwrap_or("");
     let threads = last.split("threads=").nth(1).unwrap_or("").trim();
     report.note("final_report_threads", json!(threads));
+    // A periodic report's line gives each bounded structure's entries and
+    // capacity (plan 1b-4a-p2, R6); the pipeline's only while it runs.
+    let sizes = log_text.lines().find(|l| l.contains("health report") && l.contains("file_map="));
+    report.check("a_report_logs_structure_sizes", sizes.is_some(), sizes.unwrap_or("").trim());
+    let sizes = sizes.and_then(|l| l.split("sizes=").nth(1)).unwrap_or("").trim();
+    report.note("a_reports_sizes", json!(sizes));
 
     // ---- the buffer: through dump, and directly ----
     let (code, out, err) = run_to_end(&["dump", "--data-dir", &data.to_string_lossy()], Duration::from_secs(60));

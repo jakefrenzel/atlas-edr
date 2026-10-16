@@ -238,6 +238,11 @@ impl<E> Completion<E> {
         self.pending.len()
     }
 
+    /// (events in line, their capacity, pending entries, their capacity) (R6).
+    pub fn sizes(&self) -> (usize, usize, usize, usize) {
+        (self.queue.len(), self.queue.capacity(), self.pending.len(), self.pending.capacity())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
