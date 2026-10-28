@@ -174,7 +174,9 @@ where
         buffer_drops: store.drops(),
     };
     let first = Interval { from: Snapshot::at_start(seeding, started.anchor.unix_ns), start: started.anchor.unix_ns };
-    let health = HealthThread::start(running.health_sources(), reporting.clone(), first, opts.health);
+    let mut sources = running.health_sources();
+    sources.queues.push(("sink", store.health().gauge()));
+    let health = HealthThread::start(sources, reporting.clone(), first, opts.health);
 
     tracing::info!("running; Ctrl+C stops");
     let mut code = EXIT_OK;

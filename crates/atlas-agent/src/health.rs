@@ -61,6 +61,8 @@ pub struct Snapshot {
     /// The pipeline's structures (R6), read with its counters; empty when not
     /// read.
     pub pipeline_sizes: Sizes,
+    /// The kernel, user and sink queues' fill and cap (review 7).
+    pub queues: Sizes,
 }
 
 /// One listing of the agent's threads (plan 1b-4a-p1).
@@ -262,6 +264,7 @@ fn sizes(now: &Snapshot) -> Sizes {
     // A BTreeMap allocates per entry, with no spare room: its capacity is its
     // entries (review 7).
     v.push(("expand_cache", s.expand_cache_entries, s.expand_cache_entries));
+    v.extend(now.queues.iter().copied());
     v
 }
 
@@ -323,6 +326,7 @@ mod tests {
             threads: Some(listing(1_000, &[(1, 10, "atlas-hash-0", 900), (2, 10, "atlas-pipeline", 100)])),
             seeding: true,
             pipeline_sizes: vec![("file_map", 3, 16)],
+            queues: vec![("kernel_queue", 4, 65_536)],
         }
     }
 
@@ -338,14 +342,21 @@ mod tests {
         now.services.expand_cache_entries = 2;
         let mut prev = busy();
         prev.pipeline_sizes = vec![("file_map", 99, 99)];
+        prev.queues = vec![("kernel_queue", 99, 99)];
         let (_, diag) = report(&prev, &now);
         assert_eq!(
             diag.sizes,
-            vec![("file_map", 3, 16), ("early_key_map", 7, 14), ("hash_cache", 5, 28), ("expand_cache", 2, 2)]
+            vec![
+                ("file_map", 3, 16),
+                ("early_key_map", 7, 14),
+                ("hash_cache", 5, 28),
+                ("expand_cache", 2, 2),
+                ("kernel_queue", 4, 65_536)
+            ]
         );
         // The pipeline not read: its part is absent, the rest still there.
         now.pipeline_sizes = vec![];
-        assert_eq!(report(&prev, &now).1.sizes.len(), 3);
+        assert_eq!(report(&prev, &now).1.sizes.len(), 4);
     }
 
     /// A thread listing: (thread id, creation time, name, CPU ns).

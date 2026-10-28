@@ -8,10 +8,10 @@
 //!   `ATLAS_UPDATE_SNAPSHOT=1 cargo test -p atlas-agent --test replay` and review
 //!   the diff against the assertions.
 
+use atlas_agent::queue::{QueueReceiver, bounded};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
 use atlas_agent::config::{Config, Ticks};
@@ -114,8 +114,8 @@ fn live_processes(lines: &[Line]) -> HashMap<u32, LiveProcess> {
 struct Replay {
     p: Pipeline<FakeLookups>,
     intake: Intake,
-    krx: Receiver<Incoming>,
-    urx: Receiver<Incoming>,
+    krx: QueueReceiver<Incoming>,
+    urx: QueueReceiver<Incoming>,
     counters: Arc<IntakeCounters>,
     first: i64,
     last: i64,
@@ -194,8 +194,8 @@ fn replay() -> Replay {
         started: first,
     };
     let p = Pipeline::new(setup, lookups, sequential_ids()).unwrap();
-    let (ktx, krx) = sync_channel(65_536);
-    let (utx, urx) = sync_channel(8_192);
+    let (ktx, krx) = bounded(65_536);
+    let (utx, urx) = bounded(8_192);
     let counters = Arc::new(IntakeCounters::default());
     let mut intake =
         Intake::new(Session::Sensor, &config, ticks, Queues { kernel: ktx, user: utx }, counters.clone(), None, &[]);

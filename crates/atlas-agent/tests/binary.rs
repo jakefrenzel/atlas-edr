@@ -366,8 +366,12 @@ fn binary_run_and_dump() {
     let threads = last.split("threads=").nth(1).and_then(|t| t.split(" sizes=").next()).unwrap_or("").trim();
     report.note("final_report_threads", json!(threads));
     // A periodic report's line gives each bounded structure's entries and
-    // capacity (plan 1b-4a-p2, R6); the pipeline's only while it runs.
-    let sizes = log_text.lines().find(|l| l.contains("health report") && l.contains("file_map="));
+    // capacity (plan 1b-4a-p2, R6); the pipeline's only while it runs; the
+    // event queues and the sink too (review 7).
+    let sizes = log_text.lines().find(|l| {
+        l.contains("health report")
+            && ["file_map=", "kernel_queue=", "user_queue=", "sink="].iter().all(|n| l.contains(n))
+    });
     report.check("a_report_logs_structure_sizes", sizes.is_some(), sizes.unwrap_or("").trim());
     let sizes = sizes.and_then(|l| l.split("sizes=").nth(1)).unwrap_or("").trim();
     report.note("a_reports_sizes", json!(sizes));

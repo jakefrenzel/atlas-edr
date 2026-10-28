@@ -10,7 +10,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::mpsc::{Sender, channel, sync_channel};
+use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -29,6 +29,7 @@ use crate::health::ThreadList;
 use crate::input::{Header, Session as Which};
 use crate::intake::{Intake, Queues};
 use crate::pipeline::{Pipeline, Setup};
+use crate::queue::QueueGauge;
 use crate::watchlist::BadPattern;
 
 /// What to start.
@@ -125,6 +126,9 @@ pub struct HealthSources {
     /// a test counts its calls). It costs ~45 ms, so it runs at most once a
     /// report period, for a report (plan 1b-4a-p1, Q7, review m3).
     pub threads: Arc<dyn Fn() -> Option<ThreadList> + Send + Sync>,
+    /// The event queues' (and, added by `run`, the sink's) gauges, by name
+    /// (R6, review 7).
+    pub queues: Vec<(&'static str, QueueGauge)>,
 }
 
 /// Starts the sensor (§11.4): identity, the services, both sessions and their
@@ -151,8 +155,8 @@ pub fn start(opts: AgentOptions, sink: impl FnMut(Event) + Send + 'static) -> Re
     let pipeline =
         Pipeline::new(setup, WinLookups::new(), Box::new(|_| EventId::new_v7())).map_err(AgentError::Watchlist)?;
 
-    let (ktx, krx) = sync_channel(opts.driver.kernel_queue_cap);
-    let (utx, urx) = sync_channel(opts.driver.user_queue_cap);
+    let (ktx, krx) = crate::queue::bounded(opts.driver.kernel_queue_cap);
+    let (utx, urx) = crate::queue::bounded(opts.driver.user_queue_cap);
     let queues = || Queues { kernel: ktx.clone(), user: utx.clone() };
     let intake_counters = Arc::new(IntakeCounters::default());
     let self_keys = [started.self_key];
@@ -251,6 +255,11 @@ impl Running {
             sessions: self.names.clone(),
             seeding: self.seeding,
             threads: Arc::new(super::health::threads),
+            queues: self
+                .spare
+                .as_ref()
+                .map(|q| vec![("kernel_queue", q.kernel.gauge()), ("user_queue", q.user.gauge())])
+                .unwrap_or_default(),
         }
     }
 

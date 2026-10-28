@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -63,7 +63,7 @@ pub struct HealthThread {
 /// Everything a report needs besides the sources.
 #[derive(Clone)]
 pub struct Reporting {
-    pub to: SyncSender<Record>,
+    pub to: crate::queue::QueueSender<Record>,
     pub device: Device,
     /// `loss.buffer_backlog_drops` (`Store::drops`).
     pub buffer_drops: Arc<AtomicU64>,
@@ -201,6 +201,7 @@ pub fn snapshot(src: &HealthSources, buffer_drops: &AtomicU64, pipeline: Option<
         cpu_time,
         working_set,
         seeding: src.seeding,
+        queues: src.queues.iter().map(|(name, g)| (*name, g.read().0, g.read().1)).collect(),
     }
 }
 
@@ -230,6 +231,8 @@ pub fn final_snapshot(
         cpu_time,
         working_set,
         seeding,
+        // The sensor has stopped: its queues were drained.
+        queues: Sizes::new(),
     }
 }
 
@@ -302,7 +305,7 @@ fn thread(tid: u32, me: u32) -> Option<((u32, u64), (String, u64))> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::sync_channel;
+    use crate::queue::QueueReceiver;
 
     use atlas_schema::classes::sensor_health::SensorHealthAction;
     use atlas_schema::{BootId, DeviceUid, EventKind};
@@ -329,19 +332,18 @@ mod tests {
                 lists.fetch_add(1, Ordering::Relaxed);
                 Some(ThreadList::default())
             }),
+            queues: vec![],
         }
     }
 
-    fn reporting() -> (Reporting, Receiver<Record>) {
-        // Room for a report at every check of a test (a loss at each one):
-        // a full channel would block the health thread and hang the test.
-        let (to, rx) = sync_channel(4_096);
+    fn reporting() -> (Reporting, QueueReceiver<Record>) {
+        let (to, rx) = crate::queue::bounded(4_096);
         let device = Device { uid: DeviceUid::from_bytes([1; 16]), boot_id: BootId::from_bytes([2; 16]) };
         (Reporting { to, device, buffer_drops: Arc::new(AtomicU64::new(0)) }, rx)
     }
 
     /// The next report's time and `loss.kernel_queue_drops`.
-    fn next_report(rx: &Receiver<Record>, within: Duration) -> Option<(i64, Option<u64>)> {
+    fn next_report(rx: &QueueReceiver<Record>, within: Duration) -> Option<(i64, Option<u64>)> {
         let Record::Health(e) = rx.recv_timeout(within).ok()? else { panic!("not a report") };
         let EventKind::SensorHealth(a) = &e.kind else { panic!("not Sensor Health") };
         let SensorHealthAction::Report(r) = &a.action;
