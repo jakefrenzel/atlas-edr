@@ -22,6 +22,7 @@ pub mod health;
 pub mod identity;
 pub mod instance;
 pub mod lookups;
+pub mod power;
 pub mod privilege;
 pub mod run;
 mod seeder;
