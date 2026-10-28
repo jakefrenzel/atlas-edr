@@ -53,8 +53,9 @@ pub struct Config {
     pub file_op_end: bool,
     /// Seed the key and file maps from the handle table at start (§7.4).
     pub seed_on_start: bool,
-    /// Ask the seeder about unknown handles (§7.4). Off, an event on an unknown
-    /// handle waits only for the start-up pass, while it is outstanding.
+    /// Ask the seeder about unknown handles (§7.4). Off by default, the first
+    /// §13 fallback (plan 1b-4a-p2, R2): an event on an unknown handle waits
+    /// only for the start-up pass, while it is outstanding.
     pub seed_on_miss: bool,
 }
 
@@ -87,7 +88,7 @@ impl Default for Config {
             registry_value_reads: true,
             file_op_end: true,
             seed_on_start: true,
-            seed_on_miss: true,
+            seed_on_miss: false,
         }
     }
 }
@@ -201,6 +202,7 @@ mod tests {
         let c = Config::default();
         assert_eq!((c.hold, c.confirm_window), (Duration::from_millis(750), Duration::from_millis(250)));
         assert_eq!(c.dns_rate_per_pid, 100);
-        assert!(c.network_udp && c.registry_value_reads && c.seed_on_miss);
+        assert!(c.network_udp && c.registry_value_reads && c.seed_on_start);
+        assert!(!c.seed_on_miss, "on-miss seeding is off by default (R2)");
     }
 }

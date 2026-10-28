@@ -50,6 +50,11 @@ impl T {
         T::with(Config::default(), FakeLookups::default())
     }
 
+    /// With on-miss seeding on (off by default since plan 1b-4a-p2, R2).
+    fn seeding_on_miss() -> T {
+        T::with(Config { seed_on_miss: true, ..Config::default() }, FakeLookups::default())
+    }
+
     fn with(config: Config, lookups: FakeLookups) -> T {
         let lookups = lookups.with_device(r"\Device\HarddiskVolume3", "C:");
         let mut accounts = lookups.accounts.clone();
@@ -625,7 +630,7 @@ fn a_set_attributes_leaves_the_caches_alone_and_an_update_does_not() {
 /// answered without forgetting, the waiting Update forgets.
 #[test]
 fn a_set_attributes_the_seeder_answers_leaves_the_caches_alone() {
-    let mut t = T::new();
+    let mut t = T::seeding_on_miss();
     running(&mut t, 100, 10, EXPLORER);
     let f = r"\Device\HarddiskVolume3\Windows\System32\kernel32.dll";
     t.ev(5, 100, Some(key(10)), set_info(0xB, 4)); // a handle from before the agent
@@ -1006,7 +1011,7 @@ fn short_names_in_emitted_paths_are_expanded() {
 
 #[test]
 fn an_unknown_handle_is_named_by_the_seeder_or_dropped() {
-    let mut t = T::new();
+    let mut t = T::seeding_on_miss();
     running(&mut t, 100, 10, EXPLORER);
     t.ev(5, 100, Some(key(10)), write(0xA)); // opened before we watched
     t.ev(6, 4, None, RawEvent::FileCleanup(handle(0xA)));
@@ -1433,7 +1438,7 @@ fn bookkeeping_is_freed_when_no_reply_comes() {
 fn a_reused_base_never_names_old_children() {
     // 0x50 was opened before we watched, and Run is opened below it. Then 0x50
     // closes: Run can only be named by asking about Run itself.
-    let mut t = T::new();
+    let mut t = T::seeding_on_miss();
     running(&mut t, 100, 10, EXPLORER);
     t.ev(5, 100, Some(key(10)), RawEvent::RegOpenKey(reg_open(0x60, 0x50, "Run", 0)));
     t.ev(6, 100, Some(key(10)), key_close(0x50));
@@ -1464,7 +1469,7 @@ fn a_reused_base_never_names_old_children() {
 
 #[test]
 fn an_address_absent_from_the_table_is_answered_at_once() {
-    let mut t = T::new();
+    let mut t = T::seeding_on_miss();
     running(&mut t, 100, 10, EXPLORER);
     t.ev(5, 100, Some(key(10)), reg_set(0x70, "v", 4, 4)); // its key closed before the read
     t.ev(6, 100, Some(key(10)), write(0x80));
