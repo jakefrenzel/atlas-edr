@@ -157,7 +157,7 @@ impl<L: Lookups> Pipeline<L> {
     /// waits on stream time, and returns the events ready to emit, in order.
     pub fn tick(&mut self, now: i64) -> Vec<Event> {
         self.now = now;
-        for inc in self.ordering.release(now) {
+        while let Some(inc) = self.ordering.next_due(now) {
             // Stream time reaches each event before it is processed, so a
             // window that closed before it is applied first.
             self.step(inc.header.ts);
@@ -170,7 +170,7 @@ impl<L: Lookups> Pipeline<L> {
     /// A clean stop (§11.4): everything held is processed and everything
     /// pending goes out as is.
     pub fn stop(&mut self) -> Vec<Event> {
-        for inc in self.ordering.drain() {
+        while let Some(inc) = self.ordering.next_held() {
             self.step(inc.header.ts);
             self.process(inc);
         }
