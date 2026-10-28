@@ -2,8 +2,6 @@
 //! §5.2), Terminate, Module Load, the rundown that seeds the cache (§6.2), and
 //! enrichment results (§6.3).
 
-use std::collections::HashMap;
-
 use atlas_etw::parse::{ClassicKind, ClassicProcess, ImageLoad, ProcessStart, ProcessStop};
 use atlas_schema::classes::module::{ModuleAction, ModuleActivity};
 use atlas_schema::classes::process::ProcessActivity;
@@ -14,6 +12,7 @@ use super::expand::{Expansion, Slot};
 use super::{Pending, Pipeline, alive};
 use crate::completion::{PendingId, Reason};
 use crate::counters::{Class, Counters};
+use crate::fast::FastMap;
 use crate::input::Header;
 use crate::paths::{fit, has_short_name};
 use crate::process::{Identity, ProcInfo, ProcessCache, file_name, integrity, start_key};
@@ -24,9 +23,9 @@ use crate::time::filetime_to_unix_ns;
 #[derive(Default)]
 pub struct Launches {
     /// pid → (QPC, the pending Launch, start key): waiting for the classic half.
-    kernel: HashMap<u32, (i64, PendingId, u64)>,
+    kernel: FastMap<u32, (i64, PendingId, u64)>,
     /// pid → the classic half and its header: waiting for the Kernel-Process half.
-    classic: HashMap<u32, (i64, ClassicProcess, Header)>,
+    classic: FastMap<u32, (i64, ClassicProcess, Header)>,
     enrich: Pending<EnrichTarget>,
 }
 

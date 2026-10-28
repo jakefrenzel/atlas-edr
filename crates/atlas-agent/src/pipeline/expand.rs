@@ -7,8 +7,6 @@
 //! each is a slot of the same pending event, and the event waits until every
 //! slot has answered or the deadline passes.
 
-use std::collections::HashMap;
-
 use atlas_schema::classes::file::FileAction;
 use atlas_schema::classes::module::ModuleAction;
 use atlas_schema::classes::process::ProcessActivity;
@@ -16,6 +14,7 @@ use atlas_schema::{Event, EventKind, File};
 
 use super::{Pipeline, alive};
 use crate::completion::{PendingId, Reason, Wait};
+use crate::fast::FastMap;
 use crate::paths::has_short_name;
 use crate::process::file_name;
 use crate::services::{Lookups, Request};
@@ -51,9 +50,9 @@ impl Expansion {
 
 #[derive(Default)]
 pub struct Expands {
-    by_slot: HashMap<(PendingId, u8), Expansion>,
+    by_slot: FastMap<(PendingId, u8), Expansion>,
     /// Per event: slots still unanswered, and how many it asked for.
-    outstanding: HashMap<PendingId, (u8, u8)>,
+    outstanding: FastMap<PendingId, (u8, u8)>,
 }
 
 impl Expands {
