@@ -1,6 +1,6 @@
 # Sub-project 1b-4a-p2 — The Profiling Step's Remaining Fixes Implementation Plan
 
-> **Status:** Draft (2026-10-27), independently reviewed (Review Log; its fixes are in), for the user's approval. **For agentic workers:** steps use checkbox (`- [ ] `) syntax for tracking. Task 14 is a run on the host by the user, from a script. Nothing in this plan needs the VM or a kernel driver.
+> **Status:** Approved by the user (2026-10-27), after an independent review (Review Log; its fixes are in). **For agentic workers:** steps use checkbox (`- [ ] `) syntax for tracking. Task 14 is a run on the host by the user, from a script. Nothing in this plan needs the VM or a kernel driver.
 
 **Goal:** Finish the profiling step that comes before plan 1b-4b (decision log, 2026-10-12, D6): every item plan 1b-4a-p1 left over budget is fixed or decided, each from measured facts (the D6 notes, R1–R8), and the result is measured on the host against the old build under the same conditions.
 - **On-miss seeding off by default** (R2, §13's first fallback): it spent its whole budget, 1% of one core, every minute, for about 1% of the answers;
