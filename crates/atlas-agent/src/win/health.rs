@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,7 @@ use super::agent::{HealthSources, Stopped};
 use super::identity;
 use super::util::Owned;
 use crate::counters::Counters;
-use crate::health::{self, Diagnostics, SessionLoss, Snapshot, ThreadList};
+use crate::health::{self, Diagnostics, SessionLoss, Sizes, Snapshot, ThreadList};
 use crate::store::Record;
 
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +63,7 @@ pub struct HealthThread {
 /// Everything a report needs besides the sources.
 #[derive(Clone)]
 pub struct Reporting {
-    pub to: SyncSender<Record>,
+    pub to: crate::queue::QueueSender<Record>,
     pub device: Device,
     /// `loss.buffer_backlog_drops` (`Store::drops`).
     pub buffer_drops: Arc<AtomicU64>,
@@ -151,6 +151,7 @@ fn log(r: &atlas_schema::classes::sensor_health::HealthReport, d: &Diagnostics, 
         working_set_mb = n(r.resources.working_set.map(|b| b >> 20)),
         threads_ms = d.threads_interval.map_or(-1, |ns| ns / 1_000_000),
         threads = d.threads.as_deref().map_or_else(|| "-".to_owned(), thread_line),
+        sizes = sizes_line(&d.sizes),
         "health report"
     );
 }
@@ -161,11 +162,17 @@ fn thread_line(threads: &[(String, u64)]) -> String {
     parts.join(" ")
 }
 
-/// The pipeline's counters, read on its thread between two passes; `None` if
-/// it does not answer in time (it ended, or is stuck).
-fn pipeline_counters(src: &HealthSources, timeout: Duration) -> Option<Counters> {
+/// `name=entries/capacity` for each structure, as the log line carries them (R6).
+fn sizes_line(sizes: &[(&str, u64, u64)]) -> String {
+    let parts: Vec<String> = sizes.iter().map(|(name, len, cap)| format!("{name}={len}/{cap}")).collect();
+    parts.join(" ")
+}
+
+/// The pipeline's counters and structure sizes, read on its thread between
+/// two passes; `None` if it does not answer in time (it ended, or is stuck).
+fn pipeline_counters(src: &HealthSources, timeout: Duration) -> Option<(Counters, Sizes)> {
     let (tx, rx) = channel();
-    src.control.send(Box::new(move |p| drop(tx.send(p.counters())))).ok()?;
+    src.control.send(Box::new(move |p| drop(tx.send((p.counters(), p.sizes()))))).ok()?;
     rx.recv_timeout(timeout).ok()
 }
 
@@ -176,12 +183,14 @@ fn session_loss(info: Option<SessionInfo>) -> Option<SessionLoss> {
 /// Every source now but the threads (the caller lists them when due).
 /// `pipeline` is read by the caller: through the control channel while
 /// running, from `Stopped` at the end.
-pub fn snapshot(src: &HealthSources, buffer_drops: &AtomicU64, pipeline: Option<Counters>) -> Snapshot {
+pub fn snapshot(src: &HealthSources, buffer_drops: &AtomicU64, pipeline: Option<(Counters, Sizes)>) -> Snapshot {
     let query = |name: &str| session_loss(query_by_name(name).ok().flatten());
     let (cpu_time, working_set) = resources();
+    let (pipeline, pipeline_sizes) = pipeline.map_or((None, Sizes::new()), |(c, s)| (Some(c), s));
     Snapshot {
         threads: None,
         pipeline,
+        pipeline_sizes,
         intake: src.intake.totals(),
         services: src.services.totals(),
         callback_panics: src.counters.iter().map(|c| c.panics.load(Ordering::Relaxed)).sum(),
@@ -192,6 +201,7 @@ pub fn snapshot(src: &HealthSources, buffer_drops: &AtomicU64, pipeline: Option<
         cpu_time,
         working_set,
         seeding: src.seeding,
+        queues: src.queues.iter().map(|(name, g)| (*name, g.read().0, g.read().1)).collect(),
     }
 }
 
@@ -209,6 +219,8 @@ pub fn final_snapshot(
     Snapshot {
         threads,
         pipeline: stopped.pipeline.as_ref().ok().cloned(),
+        // The pipeline has stopped: its structures were emptied.
+        pipeline_sizes: Sizes::new(),
         intake: stopped.intake.totals(),
         services: stopped.services.totals(),
         callback_panics: stopped.callback_panics,
@@ -219,6 +231,8 @@ pub fn final_snapshot(
         cpu_time,
         working_set,
         seeding,
+        // The sensor has stopped: its queues were drained.
+        queues: Sizes::new(),
     }
 }
 
@@ -291,7 +305,7 @@ fn thread(tid: u32, me: u32) -> Option<((u32, u64), (String, u64))> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::sync_channel;
+    use crate::queue::QueueReceiver;
 
     use atlas_schema::classes::sensor_health::SensorHealthAction;
     use atlas_schema::{BootId, DeviceUid, EventKind};
@@ -318,19 +332,18 @@ mod tests {
                 lists.fetch_add(1, Ordering::Relaxed);
                 Some(ThreadList::default())
             }),
+            queues: vec![],
         }
     }
 
-    fn reporting() -> (Reporting, Receiver<Record>) {
-        // Room for a report at every check of a test (a loss at each one):
-        // a full channel would block the health thread and hang the test.
-        let (to, rx) = sync_channel(4_096);
+    fn reporting() -> (Reporting, QueueReceiver<Record>) {
+        let (to, rx) = crate::queue::bounded(4_096);
         let device = Device { uid: DeviceUid::from_bytes([1; 16]), boot_id: BootId::from_bytes([2; 16]) };
         (Reporting { to, device, buffer_drops: Arc::new(AtomicU64::new(0)) }, rx)
     }
 
     /// The next report's time and `loss.kernel_queue_drops`.
-    fn next_report(rx: &Receiver<Record>, within: Duration) -> Option<(i64, Option<u64>)> {
+    fn next_report(rx: &QueueReceiver<Record>, within: Duration) -> Option<(i64, Option<u64>)> {
         let Record::Health(e) = rx.recv_timeout(within).ok()? else { panic!("not a report") };
         let EventKind::SensorHealth(a) = &e.kind else { panic!("not Sensor Health") };
         let SensorHealthAction::Report(r) = &a.action;
@@ -482,6 +495,11 @@ mod tests {
     fn the_thread_line_is_name_equals_ms() {
         let line = thread_line(&[("atlas-hash-0".into(), 1_234_000_000), ("atlas-pipeline".into(), 999_999)]);
         assert_eq!(line, "atlas-hash-0=1234 atlas-pipeline=0");
+    }
+
+    #[test]
+    fn the_sizes_line_is_name_equals_entries_over_capacity() {
+        assert_eq!(sizes_line(&[("file_map", 3, 16), ("hash_cache", 0, 0)]), "file_map=3/16 hash_cache=0/0");
     }
 
     #[test]

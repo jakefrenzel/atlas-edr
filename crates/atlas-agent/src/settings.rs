@@ -36,7 +36,7 @@
 //!
 //! [seeding]
 //! on_start = true
-//! on_miss = true
+//! on_miss = false            # on: the seeder answers unknown handles (§7.4)
 //! cpu_ms_per_minute = 600     # the seeder's CPU budget (§7.4)
 //! ```
 

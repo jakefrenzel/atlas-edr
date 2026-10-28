@@ -86,6 +86,36 @@ fn payload_for(fields: &[layout::Field], p: PointerSize) -> Vec<u8> {
     b.0
 }
 
+proptest! {
+    /// The ASCII fast path and the pre-sized decode give std's answer for any
+    /// units: ASCII, other BMP characters, pairs, lone surrogates (plan 1b-4a-p2).
+    #[test]
+    fn to_string_lossy_is_from_utf16_lossy(
+        units in prop::collection::vec(
+            prop_oneof![0u16..0x80, 0x80u16..0xD800, 0xD800u16..0xE000, 0xE000u16..=0xFFFF],
+            0..64,
+        )
+    ) {
+        prop_assert_eq!(WStr::from_units(&units).to_string_lossy(), String::from_utf16_lossy(&units));
+    }
+
+    /// ASCII and Latin-1 only: the edge of the fast path.
+    #[test]
+    fn to_string_lossy_of_latin_1_is_from_utf16_lossy(units in prop::collection::vec(0u16..0x100, 0..64)) {
+        prop_assert_eq!(WStr::from_units(&units).to_string_lossy(), String::from_utf16_lossy(&units));
+    }
+}
+
+#[test]
+fn to_string_lossy_examples() {
+    let s = |u: &[u16]| WStr::from_units(u).to_string_lossy();
+    assert_eq!(s(&[0x63, 0x3A, 0x5C]), r"c:\");
+    assert_eq!(s(&[0x63, 0xE9]), "c\u{e9}");
+    assert_eq!(s(&[0x41, 0xD800, 0x42]), "A\u{fffd}B");
+    assert_eq!(s(&[0xD83D, 0xDE00]), "\u{1F600}");
+    assert_eq!(s(&[]), "");
+}
+
 #[test]
 fn every_layout_parses_and_every_strict_prefix_fails() {
     for l in LAYOUTS {

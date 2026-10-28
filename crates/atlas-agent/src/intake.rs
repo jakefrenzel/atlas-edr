@@ -9,16 +9,18 @@
 //! - DNS-Client events pass a per-PID token bucket, then go to the user-mode
 //!   queue; everything else goes to the kernel queue. Full queues drop and count.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::TrySendError;
 
 use atlas_etw::parse::{FileOpEnd, ParseError, RawEvent};
 
 use crate::cleanup;
 use crate::config::{Config, Ticks};
 use crate::counters::IntakeCounters;
+use crate::fast::{FastMap, FastSet};
 use crate::input::{Header, Incoming, Session};
+use crate::queue::QueueSender;
 use crate::recent::Recent;
 use crate::services::{EarlyKey, ValueRead};
 
@@ -28,20 +30,20 @@ pub type FastRead = Box<dyn FnMut(EarlyKey, ValueRead) + Send>;
 /// The two queues into the pipeline (§3.2): bounded, never blocking.
 pub struct Queues {
     /// Kernel providers and Session B (default 65,536 entries).
-    pub kernel: SyncSender<Incoming>,
+    pub kernel: QueueSender<Incoming>,
     /// User-mode providers, DNS-Client (default 8,192), so a forger cannot
     /// push kernel events out (§4.4).
-    pub user: SyncSender<Incoming>,
+    pub user: QueueSender<Incoming>,
 }
 
 pub struct Intake {
-    kernel: SyncSender<Incoming>,
-    user: SyncSender<Incoming>,
+    kernel: QueueSender<Incoming>,
+    user: QueueSender<Incoming>,
     counters: Arc<IntakeCounters>,
     dns: Buckets,
     early: Option<EarlyKeys>,
     fast_read: Option<FastRead>,
-    self_keys: HashSet<u64>,
+    self_keys: FastSet<u64>,
     /// `None` while `file.op_end` is off: no OperationEnd comes, so no
     /// Cleanup is paired or counted as unpaired (plan 1b-4a).
     cleanups: Option<Cleanups>,
@@ -127,6 +129,7 @@ impl Intake {
                     if evicted > 0 {
                         self.counters.early_key_map_evictions.fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
                     }
+                    self.counters.set_early_keys(m.sizes());
                 }
             }
             RawEvent::RegCloseKey(k) => {
@@ -135,6 +138,7 @@ impl Intake {
                     && !header.start_key.is_some_and(|s| self.self_keys.contains(&s))
                 {
                     m.close(k.key_object);
+                    self.counters.set_early_keys(m.sizes());
                 }
             }
             RawEvent::RegSetValue(v) if v.status == 0 => {
@@ -186,17 +190,17 @@ impl Intake {
 /// oldest.
 pub(crate) struct Cleanups {
     /// Cleanup Irp → (FileObject, FileKey, QPC).
-    irps: HashMap<u64, (u64, u64, i64)>,
+    irps: FastMap<u64, (u64, u64, i64)>,
     /// A successful OperationEnd that reports a removed name and found no
     /// Cleanup: Irp → its header and outcome.
-    early: HashMap<u64, (Header, u64)>,
+    early: FastMap<u64, (Header, u64)>,
     /// FileKeys with a delete requested (`DeletePath`, `SetDelete` set, or a
     /// delete-on-close handle's Cleanup) and not cleared or reported since.
     requested: Recent<u64>,
     /// A request's Irp → its FileKey, until the request's OperationEnd: a
     /// failed one takes the request back, a successful one is passed on so the
     /// pipeline knows the request stood (R-M1).
-    request_irps: HashMap<u64, u64>,
+    request_irps: FastMap<u64, u64>,
     /// Handles opened delete-on-close and not closed yet.
     on_close: Recent<u64>,
     /// An outcome comes within this many ticks of its Cleanup (1 s). The rules
@@ -219,10 +223,10 @@ const DELETE_REQUESTS_CAP: usize = 4096;
 impl Cleanups {
     fn new(ticks: Ticks, counters: Arc<IntakeCounters>) -> Self {
         Cleanups {
-            irps: HashMap::new(),
-            early: HashMap::new(),
+            irps: FastMap::default(),
+            early: FastMap::default(),
             requested: Recent::new(DELETE_REQUESTS_CAP),
-            request_irps: HashMap::new(),
+            request_irps: FastMap::default(),
             on_close: Recent::new(DELETE_REQUESTS_CAP),
             window: ticks.frequency.max(1),
             counters,
@@ -337,7 +341,7 @@ impl Cleanups {
 /// A relative open whose base is unknown is simply not cached; a miss costs
 /// only a fall back to the ordered path. Bounded, evicting the oldest.
 pub struct EarlyKeys {
-    names: HashMap<u64, (String, u64)>,
+    names: FastMap<u64, (String, u64)>,
     order: VecDeque<(u64, u64)>,
     generation: u64,
     cap: usize,
@@ -345,7 +349,7 @@ pub struct EarlyKeys {
 
 impl EarlyKeys {
     pub fn new(cap: usize) -> Self {
-        EarlyKeys { names: HashMap::new(), order: VecDeque::new(), generation: 0, cap }
+        EarlyKeys { names: FastMap::default(), order: VecDeque::new(), generation: 0, cap }
     }
 
     /// Returns how many entries were evicted to make room.
@@ -371,6 +375,11 @@ impl EarlyKeys {
 
     pub fn close(&mut self, key: u64) {
         self.names.remove(&key);
+    }
+
+    /// (entries, capacity) (R6).
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.names.len(), self.names.capacity())
     }
 
     pub fn name(&self, key: u64) -> Option<&str> {
@@ -408,12 +417,12 @@ struct Buckets {
     /// Tokens are kept in millitokens.
     rate: u64,
     frequency: i64,
-    by_pid: HashMap<u32, (u64, i64)>,
+    by_pid: FastMap<u32, (u64, i64)>,
 }
 
 impl Buckets {
     fn new(rate: u32, frequency: i64) -> Self {
-        Buckets { rate: u64::from(rate) * 1000, frequency, by_pid: HashMap::new() }
+        Buckets { rate: u64::from(rate) * 1000, frequency, by_pid: FastMap::default() }
     }
 
     fn take(&mut self, pid: u32, ts: i64) -> bool {
@@ -443,11 +452,11 @@ impl Buckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::{QueueReceiver, bounded};
     use atlas_etw::parse::{
         DnsQuery, FileCreate, FileHandle, FileOpEnd, FileSetInfo, RegKey, RegOpen, RegSetValue, WStr,
     };
     use std::sync::Mutex;
-    use std::sync::mpsc::{Receiver, sync_channel};
 
     fn header(pid: u32, ts: i64) -> Header {
         Header { session: Session::Sensor, pid, tid: 9, ts, start_key: Some(77) }
@@ -455,16 +464,18 @@ mod tests {
 
     type Reads = Arc<Mutex<Vec<(EarlyKey, ValueRead)>>>;
 
-    fn intake(kernel_cap: usize) -> (Intake, Receiver<Incoming>, Receiver<Incoming>, Arc<IntakeCounters>, Reads) {
+    fn intake(
+        kernel_cap: usize,
+    ) -> (Intake, QueueReceiver<Incoming>, QueueReceiver<Incoming>, Arc<IntakeCounters>, Reads) {
         intake_with(kernel_cap, Config { dns_rate_per_pid: 2, ..Config::default() })
     }
 
     fn intake_with(
         kernel_cap: usize,
         cfg: Config,
-    ) -> (Intake, Receiver<Incoming>, Receiver<Incoming>, Arc<IntakeCounters>, Reads) {
-        let (ktx, krx) = sync_channel(kernel_cap);
-        let (utx, urx) = sync_channel(4);
+    ) -> (Intake, QueueReceiver<Incoming>, QueueReceiver<Incoming>, Arc<IntakeCounters>, Reads) {
+        let (ktx, krx) = bounded(kernel_cap);
+        let (utx, urx) = bounded(4);
         let counters = Arc::new(IntakeCounters::default());
         let reads: Reads = Arc::new(Mutex::new(Vec::new()));
         let r = reads.clone();
@@ -516,7 +527,7 @@ mod tests {
         RawEvent::FileOpEnd(FileOpEnd { irp, extra_information: info, status: 0 })
     }
 
-    fn passed_outcomes(krx: &Receiver<Incoming>) -> Vec<(u64, u64)> {
+    fn passed_outcomes(krx: &QueueReceiver<Incoming>) -> Vec<(u64, u64)> {
         krx.try_iter()
             .filter_map(|inc| match inc.event {
                 RawEvent::FileOpEnd(o) if !o.failed() => Some((o.irp, o.extra_information)),
@@ -797,6 +808,20 @@ mod tests {
         i.on_event(header(1, 4), Ok(close));
         i.on_event(header(1, 5), Ok(set(10, "v")));
         assert_eq!(reads.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_early_maps_size_is_a_gauge() {
+        // R6: entries and capacity after each open and close.
+        let (mut i, _, _, c, _) = intake(64);
+        i.on_event(header(1, 1), Ok(open(10, 0, r"\REGISTRY\MACHINE\X")));
+        i.on_event(header(1, 2), Ok(open(11, 10, "Y")));
+        assert_eq!(IntakeCounters::get(&c.early_keys), 2);
+        assert!(IntakeCounters::get(&c.early_keys_capacity) >= 2);
+        let close = RawEvent::RegCloseKey(RegKey { key_object: 10, status: 0, key_name: WStr::default() });
+        i.on_event(header(1, 3), Ok(close));
+        assert_eq!(IntakeCounters::get(&c.early_keys), 1);
+        assert_eq!(c.totals().early_keys, 1);
     }
 
     #[test]

@@ -3,11 +3,14 @@
 //! sets every tick, and a scan of a large map per event or per tick is the
 //! trap `evict` describes.
 
+use crate::fast::FastMap;
 use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 
-pub struct Recent<K> {
-    map: HashMap<K, i64>,
+/// `S` is the map's hasher: foldhash by default ([`crate::fast`]); a set keyed
+/// by something an outsider chooses (a path) takes std's.
+pub struct Recent<K, S = foldhash::fast::RandomState> {
+    map: HashMap<K, i64, S>,
     /// Insertion order, with the time inserted. An entry whose time no longer
     /// matches the map (the key was seen again, or removed) is stale and skipped.
     order: VecDeque<(i64, K)>,
@@ -18,7 +21,14 @@ pub struct Recent<K> {
 impl<K: Hash + Eq + Clone> Recent<K> {
     /// At most `cap` keys (and queued times) are kept; past it the oldest go.
     pub fn new(cap: usize) -> Self {
-        Recent { map: HashMap::new(), order: VecDeque::new(), cap: cap.max(1), evictions: 0 }
+        Recent::new_in(cap)
+    }
+}
+
+impl<K: Hash + Eq + Clone, S: BuildHasher + Default> Recent<K, S> {
+    /// As [`Recent::new`], with the hasher `S`.
+    pub fn new_in(cap: usize) -> Self {
+        Recent { map: HashMap::default(), order: VecDeque::new(), cap: cap.max(1), evictions: 0 }
     }
 
     /// Records `key` at `ts`; the latest time wins.
@@ -66,6 +76,10 @@ impl<K: Hash + Eq + Clone> Recent<K> {
         self.map.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -78,14 +92,14 @@ impl<K: Hash + Eq + Clone> Recent<K> {
 /// Like [`Recent`], with a value per key: forgotten oldest first, by time or
 /// past the cap, with no scans.
 pub struct RecentMap<K, V> {
-    map: HashMap<K, (i64, V)>,
+    map: FastMap<K, (i64, V)>,
     order: VecDeque<(i64, K)>,
     cap: usize,
 }
 
 impl<K: Hash + Eq + Clone, V> RecentMap<K, V> {
     pub fn new(cap: usize) -> Self {
-        RecentMap { map: HashMap::new(), order: VecDeque::new(), cap: cap.max(1) }
+        RecentMap { map: FastMap::default(), order: VecDeque::new(), cap: cap.max(1) }
     }
 
     /// Records `key` at `ts`; a second insert replaces the value and the time.
@@ -122,6 +136,10 @@ impl<K: Hash + Eq + Clone, V> RecentMap<K, V> {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
     }
 
     pub fn is_empty(&self) -> bool {

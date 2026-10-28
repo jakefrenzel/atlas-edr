@@ -50,6 +50,11 @@ impl T {
         T::with(Config::default(), FakeLookups::default())
     }
 
+    /// With on-miss seeding on (off by default since plan 1b-4a-p2, R2).
+    fn seeding_on_miss() -> T {
+        T::with(Config { seed_on_miss: true, ..Config::default() }, FakeLookups::default())
+    }
+
     fn with(config: Config, lookups: FakeLookups) -> T {
         let lookups = lookups.with_device(r"\Device\HarddiskVolume3", "C:");
         let mut accounts = lookups.accounts.clone();
@@ -598,6 +603,44 @@ fn forgotten(t: &mut T) -> Vec<String> {
         .collect()
 }
 
+/// R6: every bounded structure by name, each with its entries and capacity.
+#[test]
+fn the_sizes_name_each_bounded_structure() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(0x1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+    t.ev(6, 100, Some(key(10)), create(0x2, 0xB, r"\Device\HarddiskVolume3\b.txt", 0));
+    t.at(400); // still held
+    let held = t.p.sizes();
+    let names: Vec<&str> = held.iter().map(|s| s.0).collect();
+    assert_eq!(
+        names,
+        [
+            "ordering",
+            "completion",
+            "pending",
+            "processes",
+            "file_map",
+            "key_map",
+            "confirmed_irps",
+            "failed_irps",
+            "watch_opens",
+            "address_history",
+            "negative_cache",
+            "tcp",
+            "udp_flows"
+        ]
+    );
+    let get = |s: &[(&str, u64, u64)], n: &str| s.iter().find(|x| x.0 == n).map(|x| (x.1, x.2)).unwrap();
+    assert!(get(&held, "ordering").0 >= 2, "both Creates held");
+    assert!(held.iter().all(|(_, len, cap)| len <= cap), "{held:?}");
+    t.at(1_200);
+    let after = t.p.sizes();
+    assert_eq!(get(&after, "ordering").0, 0);
+    assert_eq!(get(&after, "file_map").0, 2, "both handles mapped");
+    assert!(get(&after, "processes").0 >= 1);
+}
+
 /// D6: the System process sets the basic information of the DLLs starting
 /// processes load; forgetting their hashes then re-hashed them on every launch.
 #[test]
@@ -625,7 +668,7 @@ fn a_set_attributes_leaves_the_caches_alone_and_an_update_does_not() {
 /// answered without forgetting, the waiting Update forgets.
 #[test]
 fn a_set_attributes_the_seeder_answers_leaves_the_caches_alone() {
-    let mut t = T::new();
+    let mut t = T::seeding_on_miss();
     running(&mut t, 100, 10, EXPLORER);
     let f = r"\Device\HarddiskVolume3\Windows\System32\kernel32.dll";
     t.ev(5, 100, Some(key(10)), set_info(0xB, 4)); // a handle from before the agent
@@ -1006,7 +1049,7 @@ fn short_names_in_emitted_paths_are_expanded() {
 
 #[test]
 fn an_unknown_handle_is_named_by_the_seeder_or_dropped() {
-    let mut t = T::new();
+    let mut t = T::seeding_on_miss();
     running(&mut t, 100, 10, EXPLORER);
     t.ev(5, 100, Some(key(10)), write(0xA)); // opened before we watched
     t.ev(6, 4, None, RawEvent::FileCleanup(handle(0xA)));
@@ -1433,7 +1476,7 @@ fn bookkeeping_is_freed_when_no_reply_comes() {
 fn a_reused_base_never_names_old_children() {
     // 0x50 was opened before we watched, and Run is opened below it. Then 0x50
     // closes: Run can only be named by asking about Run itself.
-    let mut t = T::new();
+    let mut t = T::seeding_on_miss();
     running(&mut t, 100, 10, EXPLORER);
     t.ev(5, 100, Some(key(10)), RawEvent::RegOpenKey(reg_open(0x60, 0x50, "Run", 0)));
     t.ev(6, 100, Some(key(10)), key_close(0x50));
@@ -1464,7 +1507,7 @@ fn a_reused_base_never_names_old_children() {
 
 #[test]
 fn an_address_absent_from_the_table_is_answered_at_once() {
-    let mut t = T::new();
+    let mut t = T::seeding_on_miss();
     running(&mut t, 100, 10, EXPLORER);
     t.ev(5, 100, Some(key(10)), reg_set(0x70, "v", 4, 4)); // its key closed before the read
     t.ev(6, 100, Some(key(10)), write(0x80));
@@ -1563,6 +1606,32 @@ fn without_on_miss_seeding_only_the_start_up_pass_is_waited_for() {
     t.ev(1_901, 4, None, RawEvent::FileCleanup(handle(0xB)));
     t.at(2_700);
     assert_eq!((t.p.counters().unknown_file_object, t.p.completion.pending_len()), (1, 0));
+}
+
+#[test]
+fn without_on_miss_seeding_the_address_history_ends_with_the_start_up_passes() {
+    // Plan 1b-4a-p2, R3: with on-miss seeding off no snapshot comes after the
+    // start-up passes, so the reuse rule's address history goes with them.
+    let history = |t: &T| t.p.bookkeeping().into_iter().find(|(n, _)| *n == "address history").unwrap().1;
+    for on_miss in [false, true] {
+        let mut t = T::with(Config { seed_on_miss: on_miss, ..Config::default() }, FakeLookups::default());
+        running(&mut t, 100, 10, EXPLORER);
+        t.ev(5, 100, Some(key(10)), create(0x1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+        t.at(1_000);
+        assert_eq!(history(&t), 1, "kept while a start-up pass is to come (on_miss {on_miss})");
+        for kind in [HandleKind::Key, HandleKind::File] {
+            t.reply(Reply::Snapshot(Snapshot {
+                kind,
+                taken: ms(1_000),
+                asked: vec![],
+                named: vec![],
+                unnamable: vec![],
+            }));
+        }
+        t.ev(1_100, 100, Some(key(10)), create(0x2, 0xB, r"\Device\HarddiskVolume3\b.txt", 0));
+        t.at(2_000);
+        assert_eq!(history(&t), if on_miss { 2 } else { 0 }, "on_miss {on_miss}");
+    }
 }
 
 #[test]

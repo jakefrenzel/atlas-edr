@@ -5,7 +5,8 @@
 //! Deadlines are QPC times. A reason without one (the failure-confirm window,
 //! which is stream time) is resolved or cancelled by the pipeline itself.
 
-use std::collections::{HashMap, VecDeque};
+use crate::fast::FastMap;
+use std::collections::VecDeque;
 
 /// Why an event is incomplete (§3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,7 +57,7 @@ struct Entry<E> {
 
 pub struct Completion<E> {
     queue: VecDeque<Slot<E>>,
-    pending: HashMap<PendingId, Entry<E>>,
+    pending: FastMap<PendingId, Entry<E>>,
     next: PendingId,
     cap: usize,
     overflow: u64,
@@ -72,7 +73,7 @@ impl<E> Completion<E> {
     pub fn new(pending_cap: usize) -> Self {
         Completion {
             queue: VecDeque::new(),
-            pending: HashMap::new(),
+            pending: FastMap::default(),
             next: 0,
             cap: pending_cap,
             overflow: 0,
@@ -235,6 +236,11 @@ impl<E> Completion<E> {
 
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// (events in line, their capacity, pending entries, their capacity) (R6).
+    pub fn sizes(&self) -> (usize, usize, usize, usize) {
+        (self.queue.len(), self.queue.capacity(), self.pending.len(), self.pending.capacity())
     }
 
     pub fn is_empty(&self) -> bool {

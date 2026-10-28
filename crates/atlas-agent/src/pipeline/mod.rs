@@ -17,13 +17,12 @@ mod proc;
 mod reg;
 mod seed;
 
-use std::collections::{HashMap, HashSet};
-
 use atlas_schema::{Device, Event, EventId, EventKind, EventMeta, ProcessRef, ProcessUid, Sensor};
 
 use crate::completion::{Completion, Expired, PendingId, Reason, Wait};
 use crate::config::{Config, Ticks};
 use crate::counters::{Class, Counters};
+use crate::fast::{FastMap, FastSet};
 use crate::input::{Header, Incoming};
 use crate::keymap::KeyMap;
 use crate::ordering::{Ordering, Pushed};
@@ -63,8 +62,8 @@ pub struct Pipeline<L> {
     pub(crate) clock: Clock,
     pub(crate) id: Identity,
     pub(crate) ccs: u32,
-    pub(crate) self_keys: HashSet<u64>,
-    pub(crate) self_uids: HashSet<ProcessUid>,
+    pub(crate) self_keys: FastSet<u64>,
+    pub(crate) self_uids: FastSet<ProcessUid>,
     pub(crate) started: i64,
     pub(crate) lookups: L,
     pub(crate) ids: IdGen,
@@ -103,7 +102,7 @@ impl<L: Lookups> Pipeline<L> {
             keys: KeyMap::new(config.key_map_cap),
             reg: Registry::default(),
             net: Network::new(config.flow_cap, t(config.udp_idle)),
-            seeding: Seeding::new(),
+            seeding: Seeding::new(config.seed_on_miss),
             expands: Expands::default(),
             self_uids: self_keys.iter().map(|k| identity.uid(*k)).collect(),
             self_keys: self_keys.into_iter().collect(),
@@ -158,7 +157,7 @@ impl<L: Lookups> Pipeline<L> {
     /// waits on stream time, and returns the events ready to emit, in order.
     pub fn tick(&mut self, now: i64) -> Vec<Event> {
         self.now = now;
-        for inc in self.ordering.release(now) {
+        while let Some(inc) = self.ordering.next_due(now) {
             // Stream time reaches each event before it is processed, so a
             // window that closed before it is applied first.
             self.step(inc.header.ts);
@@ -171,7 +170,7 @@ impl<L: Lookups> Pipeline<L> {
     /// A clean stop (§11.4): everything held is processed and everything
     /// pending goes out as is.
     pub fn stop(&mut self) -> Vec<Event> {
-        for inc in self.ordering.drain() {
+        while let Some(inc) = self.ordering.next_held() {
             self.step(inc.header.ts);
             self.process(inc);
         }
@@ -287,6 +286,31 @@ impl<L: Lookups> Pipeline<L> {
             }
         }
         out
+    }
+
+    /// Each bounded structure's entries and allocated capacity, for the
+    /// diagnostic log (plan 1b-4a-p2, R6).
+    pub fn sizes(&self) -> crate::health::Sizes {
+        let (line, line_cap, pending, pending_cap) = self.completion.sizes();
+        let (tcp, tcp_cap, flows, flows_cap) = self.net.sizes();
+        let [confirmed, failed, opened] = self.files.recent_sizes();
+        let n = |len: usize, cap: usize| (len as u64, cap as u64);
+        let entries = [
+            ("ordering", n(self.ordering.len(), self.ordering.capacity())),
+            ("completion", n(line, line_cap)),
+            ("pending", n(pending, pending_cap)),
+            ("processes", n(self.procs.len(), self.procs.capacity())),
+            ("file_map", n(self.files.map.len(), self.files.map.capacity())),
+            ("key_map", n(self.keys.len(), self.keys.capacity())),
+            ("confirmed_irps", n(confirmed.0, confirmed.1)),
+            ("failed_irps", n(failed.0, failed.1)),
+            ("watch_opens", n(opened.0, opened.1)),
+            ("address_history", n(self.seeding.history_len(), self.seeding.history_capacity())),
+            ("negative_cache", n(self.seeding.negative_cache_len(), self.seeding.negative_cache_capacity())),
+            ("tcp", n(tcp, tcp_cap)),
+            ("udp_flows", n(flows, flows_cap)),
+        ];
+        entries.into_iter().map(|(name, (len, cap))| (name, len, cap)).collect()
     }
 
     /// What is kept for pending events and recent history, by name (tests check
@@ -466,12 +490,12 @@ pub(crate) fn alive<E>(c: &Completion<E>, id: PendingId, reason: Reason) -> bool
 
 /// Request bookkeeping shared by the domain modules.
 pub(crate) struct Pending<T> {
-    pub(crate) by_id: HashMap<PendingId, T>,
+    pub(crate) by_id: FastMap<PendingId, T>,
 }
 
 impl<T> Default for Pending<T> {
     fn default() -> Self {
-        Pending { by_id: HashMap::new() }
+        Pending { by_id: FastMap::default() }
     }
 }
 

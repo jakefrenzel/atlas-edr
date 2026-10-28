@@ -5,7 +5,8 @@
 //! `cargo test -p atlas-agent --test binary -- --ignored --nocapture`
 //!
 //! 1. `atlas-agent run --data-dir C:\ProgramData\Atlas-Test-binary-<pid>`
-//!    starts in its own process group, which creates the data directory;
+//!    starts in its own process group, which creates the data directory, and
+//!    turns power throttling off for itself;
 //! 2. a second `run` is refused by the single-instance lock;
 //! 3. an actor (this test binary again, `ATLAS_BINARY_ACTOR=1`) creates,
 //!    renames and deletes a file, creates a registry key and value and deletes
@@ -25,13 +26,14 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use atlas_agent::win::datadir;
+use atlas_agent::win::{datadir, power};
 use atlas_buffer::{Cursor, Reader};
 use atlas_schema::classes::file::FileAction;
 use atlas_schema::classes::network::NetworkAction;
@@ -40,6 +42,7 @@ use atlas_schema::classes::registry::{RegistryKeyAction, RegistryValueAction};
 use atlas_schema::classes::sensor_health::{HealthReport, SensorHealthAction};
 use atlas_schema::{Event, EventKind, decode_event};
 use serde_json::{Value, json};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{AllocConsole, CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetConsoleWindow};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_OPTION_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
@@ -280,6 +283,9 @@ fn binary_run_and_dump() {
     let up_ns = unix_now();
     report.note("start_ms", json!(started.elapsed().as_millis() as u64));
     assert!(up, "the agent did not start: {:#?}", lines.lock().unwrap());
+    // Plan 1b-4a-p2, R8: the agent opted out of power throttling at start.
+    let full_speed = cleanup.agent.as_ref().map(|a| power::runs_at_full_speed(HANDLE(a.as_raw_handle())));
+    report.check("the_agent_runs_at_full_speed", matches!(full_speed, Some(Ok(true))), format!("{full_speed:?}"));
 
     // ---- a second instance ----
     let second = base.join("Second");
@@ -363,8 +369,18 @@ fn binary_run_and_dump() {
     // m2). Not a check: a thread shows only if it used a clock tick (~15.6 ms)
     // since the last listing, a few seconds before; its line is kept instead.
     let last = log_text.lines().rfind(|l| l.contains("health report")).unwrap_or("");
-    let threads = last.split("threads=").nth(1).unwrap_or("").trim();
+    let threads = last.split("threads=").nth(1).and_then(|t| t.split(" sizes=").next()).unwrap_or("").trim();
     report.note("final_report_threads", json!(threads));
+    // A periodic report's line gives each bounded structure's entries and
+    // capacity (plan 1b-4a-p2, R6); the pipeline's only while it runs; the
+    // event queues and the sink too (review 7).
+    let sizes = log_text.lines().find(|l| {
+        l.contains("health report")
+            && ["file_map=", "kernel_queue=", "user_queue=", "sink="].iter().all(|n| l.contains(n))
+    });
+    report.check("a_report_logs_structure_sizes", sizes.is_some(), sizes.unwrap_or("").trim());
+    let sizes = sizes.and_then(|l| l.split("sizes=").nth(1)).unwrap_or("").trim();
+    report.note("a_reports_sizes", json!(sizes));
 
     // ---- the buffer: through dump, and directly ----
     let (code, out, err) = run_to_end(&["dump", "--data-dir", &data.to_string_lossy()], Duration::from_secs(60));

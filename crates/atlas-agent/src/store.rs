@@ -22,7 +22,9 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::RecvTimeoutError;
+
+use crate::queue::{QueueReceiver, QueueSender, bounded};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -40,7 +42,7 @@ pub enum Record {
 /// The pipeline's sink (plan 1b-3c's interface): never blocks.
 #[derive(Clone)]
 pub struct Sink {
-    tx: SyncSender<Record>,
+    tx: QueueSender<Record>,
     drops: Arc<AtomicU64>,
 }
 
@@ -54,7 +56,7 @@ impl Sink {
 
 /// The running writer thread.
 pub struct Store {
-    tx: SyncSender<Record>,
+    tx: QueueSender<Record>,
     drops: Arc<AtomicU64>,
     thread: JoinHandle<io::Result<Stats>>,
 }
@@ -107,7 +109,7 @@ impl Store {
 
     /// The writer thread over `writer`.
     pub(crate) fn spawn<W: Log + Send + 'static>(writer: W, recovery: Recovery, channel_cap: usize) -> Store {
-        let (tx, rx) = sync_channel(channel_cap);
+        let (tx, rx) = bounded(channel_cap);
         let drops = Arc::new(AtomicU64::new(0));
         let mut core = Core::new(writer, drops.clone(), recovery);
         let thread = std::thread::Builder::new()
@@ -136,9 +138,9 @@ impl Store {
         self.drops.clone()
     }
 
-    /// Where the health thread sends its reports. It may block while the
-    /// writer is stuck on the disk; the health thread can wait.
-    pub fn health(&self) -> SyncSender<Record> {
+    /// Where the health thread sends its reports, with `send`: a report is
+    /// queued even past the cap, and never waits (plan 1b-4a-p2, R6b).
+    pub fn health(&self) -> QueueSender<Record> {
         self.tx.clone()
     }
 
@@ -218,7 +220,7 @@ impl<W: Log> Core<W> {
     }
 
     /// Until every sender is gone.
-    pub(crate) fn run(&mut self, rx: &Receiver<Record>) {
+    pub(crate) fn run(&mut self, rx: &QueueReceiver<Record>) {
         loop {
             match rx.recv_timeout(TICK_EVERY) {
                 Ok(r) => {
@@ -456,7 +458,7 @@ mod tests {
 
     #[test]
     fn a_full_channel_drops_and_counts_never_blocks() {
-        let (tx, rx) = sync_channel(2);
+        let (tx, rx) = bounded(2);
         let drops = Arc::new(AtomicU64::new(0));
         let sink = Sink { tx, drops: drops.clone() };
         // On its own thread: a send that blocked would fail the test, not hang

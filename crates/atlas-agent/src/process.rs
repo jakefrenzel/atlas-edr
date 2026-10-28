@@ -4,8 +4,7 @@
 //! entries, so "the entry live at the event's timestamp" (§5.3) survives PID
 //! reuse. An entry stays `retention` after its Terminate, then is removed.
 
-use std::collections::HashMap;
-
+use crate::fast::FastMap;
 use atlas_schema::{BootId, DeviceUid, File, Integrity, ProcessRef, ProcessUid, User, process_uid};
 
 /// The start key of a new process (§5.2, S1): `(BootId << 48) | sequence`.
@@ -111,8 +110,8 @@ struct Entry {
 }
 
 pub struct ProcessCache {
-    by_key: HashMap<u64, Entry>,
-    by_pid: HashMap<u32, Vec<u64>>,
+    by_key: FastMap<u64, Entry>,
+    by_pid: FastMap<u32, Vec<u64>>,
     retention: i64,
     cap: usize,
     evictions: u64,
@@ -122,8 +121,8 @@ pub struct ProcessCache {
 impl ProcessCache {
     pub fn new(retention_ticks: i64, cap: usize) -> Self {
         ProcessCache {
-            by_key: HashMap::new(),
-            by_pid: HashMap::new(),
+            by_key: FastMap::default(),
+            by_pid: FastMap::default(),
             retention: retention_ticks,
             cap,
             evictions: 0,
@@ -218,6 +217,10 @@ impl ProcessCache {
 
     pub fn len(&self) -> usize {
         self.by_key.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.by_key.capacity()
     }
 
     pub fn is_empty(&self) -> bool {

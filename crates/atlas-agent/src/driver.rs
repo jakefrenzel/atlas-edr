@@ -1,6 +1,8 @@
 //! The pipeline thread's loop (sensor spec §3.2; plan 1b-3c, decision D1).
 //!
-//! Every `cadence` (10 ms) one pass:
+//! One pass every `cadence` (10 ms), or `idle_cadence` (40 ms) after a pass that
+//! found no event (plan 1b-4a-p2, R3: on a quiet machine ETW delivers once a
+//! flush period, 250 ms, so most 10 ms passes found nothing):
 //! 1. drains the kernel and user-mode queues into [`Pipeline::push`], at most
 //!    a queue's capacity each, so a flood cannot starve `tick` (review R-m8);
 //! 2. feeds the services' replies into [`Pipeline::reply`], and runs any
@@ -19,6 +21,8 @@
 //! (`win::agent`); the tests use fakes.
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
+
+use crate::queue::QueueReceiver;
 use std::time::{Duration, Instant};
 
 use atlas_schema::Event;
@@ -41,6 +45,8 @@ pub trait Lanes {
 pub struct DriverConfig {
     /// One pass every this long; `tick` must come at least every 50 ms.
     pub cadence: Duration,
+    /// After a pass that found no event, the next comes this long after it.
+    pub idle_cadence: Duration,
     /// The anchor pair is re-taken this often (§3.3).
     pub anchor_every: Duration,
     /// Queue capacities (§3.2): kernel providers and Session B, and the
@@ -53,6 +59,7 @@ impl Default for DriverConfig {
     fn default() -> Self {
         DriverConfig {
             cadence: Duration::from_millis(10),
+            idle_cadence: Duration::from_millis(40),
             anchor_every: Duration::from_secs(60),
             kernel_queue_cap: 65_536,
             user_queue_cap: 8_192,
@@ -72,8 +79,8 @@ pub type Control<L> = Box<dyn FnOnce(&mut Pipeline<L>) + Send>;
 pub struct Driver<L, S> {
     pipeline: Pipeline<L>,
     lanes: S,
-    kernel: Receiver<Incoming>,
-    user: Receiver<Incoming>,
+    kernel: QueueReceiver<Incoming>,
+    user: QueueReceiver<Incoming>,
     control: Receiver<Control<L>>,
     clock: Clock,
     anchor: AnchorSource,
@@ -84,8 +91,8 @@ impl<L: Lookups, S: Lanes> Driver<L, S> {
     pub fn new(
         pipeline: Pipeline<L>,
         lanes: S,
-        kernel: Receiver<Incoming>,
-        user: Receiver<Incoming>,
+        kernel: QueueReceiver<Incoming>,
+        user: QueueReceiver<Incoming>,
         clock: Clock,
         anchor: AnchorSource,
         cfg: DriverConfig,
@@ -107,7 +114,7 @@ impl<L: Lookups, S: Lanes> Driver<L, S> {
         let mut next_anchor = Instant::now() + self.cfg.anchor_every;
         loop {
             let started = Instant::now();
-            let open = self.pass(&mut sink);
+            let (open, pushed) = self.pass(&mut sink);
             if !open {
                 break;
             }
@@ -115,7 +122,7 @@ impl<L: Lookups, S: Lanes> Driver<L, S> {
                 self.pipeline.set_anchor((self.anchor)());
                 next_anchor = started + self.cfg.anchor_every;
             }
-            std::thread::sleep(self.cfg.cadence.saturating_sub(started.elapsed()));
+            std::thread::sleep(next_wait(&self.cfg, pushed).saturating_sub(started.elapsed()));
         }
         for r in self.lanes.replies() {
             self.pipeline.reply(r);
@@ -126,10 +133,10 @@ impl<L: Lookups, S: Lanes> Driver<L, S> {
         self.pipeline.counters()
     }
 
-    /// One pass. Returns whether a queue is still open.
-    fn pass(&mut self, sink: &mut impl FnMut(Event)) -> bool {
-        let kernel = drain(&self.kernel, &mut self.pipeline, self.cfg.kernel_queue_cap);
-        let user = drain(&self.user, &mut self.pipeline, self.cfg.user_queue_cap);
+    /// One pass. Returns whether a queue is still open, and the events it pushed.
+    fn pass(&mut self, sink: &mut impl FnMut(Event)) -> (bool, usize) {
+        let (kernel, k) = drain(&self.kernel, &mut self.pipeline, self.cfg.kernel_queue_cap);
+        let (user, u) = drain(&self.user, &mut self.pipeline, self.cfg.user_queue_cap);
         for r in self.lanes.replies() {
             self.pipeline.reply(r);
         }
@@ -143,26 +150,39 @@ impl<L: Lookups, S: Lanes> Driver<L, S> {
         for e in out {
             sink(e);
         }
-        kernel || user
+        (kernel || user, k + u)
     }
 }
 
+/// How long after a pass's start the next one comes: `cadence` when the pass
+/// pushed events, `idle_cadence` when it found none.
+fn next_wait(cfg: &DriverConfig, pushed: usize) -> Duration {
+    if pushed > 0 { cfg.cadence } else { cfg.idle_cadence }
+}
+
 /// Pushes what is queued, at most `max` events. Returns whether the queue is
-/// still open.
-fn drain<L: Lookups>(rx: &Receiver<Incoming>, p: &mut Pipeline<L>, max: usize) -> bool {
+/// still open, and how many it pushed.
+fn drain<L: Lookups>(rx: &QueueReceiver<Incoming>, p: &mut Pipeline<L>, max: usize) -> (bool, usize) {
+    let mut n = 0;
     for _ in 0..max.max(1) {
         match rx.try_recv() {
-            Ok(inc) => p.push(inc),
-            Err(TryRecvError::Empty) => return true,
-            Err(TryRecvError::Disconnected) => return false,
+            Ok(inc) => {
+                p.push(inc);
+                n += 1;
+            }
+            Err(TryRecvError::Empty) => return (true, n),
+            Err(TryRecvError::Disconnected) => return (false, n),
         }
     }
-    true
+    (true, n)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::{SyncSender, channel, sync_channel};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc::channel;
+
+    use crate::queue::{QueueSender, bounded};
     use std::sync::{Arc, Mutex};
 
     use atlas_etw::parse::{FileCreate, RawEvent};
@@ -179,8 +199,8 @@ mod tests {
 
     /// A driver on its own thread with a real clock; the sink sends events back.
     struct Running {
-        kernel: Option<SyncSender<Incoming>>,
-        user: Option<SyncSender<Incoming>>,
+        kernel: Option<QueueSender<Incoming>>,
+        user: Option<QueueSender<Incoming>>,
         events: std::sync::mpsc::Receiver<Event>,
         thread: std::thread::JoinHandle<Counters>,
         t0: Instant,
@@ -192,6 +212,16 @@ mod tests {
 
     fn start(cfg: DriverConfig, anchor: AnchorSource) -> Running {
         let t0 = Instant::now();
+        let p = pipeline();
+        let (ktx, krx) = bounded(cfg.kernel_queue_cap);
+        let (utx, urx) = bounded(cfg.user_queue_cap);
+        let (etx, events) = channel();
+        let driver = Driver::new(p, FakeLanes::new(|_| None), krx, urx, Box::new(move || qpc(t0)), anchor, cfg);
+        let thread = std::thread::spawn(move || driver.run(|e| etx.send(e).unwrap()));
+        Running { kernel: Some(ktx), user: Some(utx), events, thread, t0 }
+    }
+
+    fn pipeline() -> Pipeline<FakeLookups> {
         let setup = Setup {
             config: Config::default(),
             ticks: Ticks::new(FREQ),
@@ -205,13 +235,54 @@ mod tests {
             self_keys: vec![],
             started: 0,
         };
-        let p = Pipeline::new(setup, FakeLookups::default(), sequential_ids()).unwrap();
-        let (ktx, krx) = sync_channel(cfg.kernel_queue_cap);
-        let (utx, urx) = sync_channel(cfg.user_queue_cap);
-        let (etx, events) = channel();
-        let driver = Driver::new(p, FakeLanes::new(|_| None), krx, urx, Box::new(move || qpc(t0)), anchor, cfg);
-        let thread = std::thread::spawn(move || driver.run(|e| etx.send(e).unwrap()));
-        Running { kernel: Some(ktx), user: Some(utx), events, thread, t0 }
+        Pipeline::new(setup, FakeLookups::default(), sequential_ids()).unwrap()
+    }
+
+    #[test]
+    fn the_next_pass_waits_longer_after_finding_nothing() {
+        let cfg = DriverConfig::default();
+        assert_eq!((cfg.cadence, cfg.idle_cadence), (Duration::from_millis(10), Duration::from_millis(40)));
+        assert_eq!(next_wait(&cfg, 0), cfg.idle_cadence);
+        assert_eq!(next_wait(&cfg, 1), cfg.cadence);
+    }
+
+    #[test]
+    fn drain_counts_what_it_pushed() {
+        let mut p = pipeline();
+        let (tx, rx) = bounded(8);
+        for i in 0..3 {
+            tx.send(created(i, r"\Device\HarddiskVolume3\a.txt")).unwrap();
+        }
+        assert_eq!(drain(&rx, &mut p, 2), (true, 2));
+        assert_eq!(drain(&rx, &mut p, 8), (true, 1));
+        assert_eq!(drain(&rx, &mut p, 8), (true, 0));
+        drop(tx);
+        assert_eq!(drain(&rx, &mut p, 8), (false, 0));
+    }
+
+    #[test]
+    fn an_idle_loop_passes_at_the_idle_cadence() {
+        // Plan 1b-4a-p2, R3: with nothing queued, about one pass per 40 ms, not
+        // per 10 ms. Only an upper bound: a loaded runner makes fewer passes.
+        let passes = Arc::new(AtomicUsize::new(0));
+        let n = passes.clone();
+        let t0 = Instant::now();
+        let clock = Box::new(move || {
+            n.fetch_add(1, AtomicOrdering::Relaxed);
+            qpc(t0)
+        });
+        let (ktx, krx) = bounded(1);
+        let (utx, urx) = bounded(1);
+        let driver =
+            Driver::new(pipeline(), FakeLanes::new(|_| None), krx, urx, clock, no_anchor(), DriverConfig::default());
+        let thread = std::thread::spawn(move || driver.run(|_| {}));
+        std::thread::sleep(Duration::from_millis(400));
+        let seen = passes.load(AtomicOrdering::Relaxed);
+        drop((ktx, utx));
+        thread.join().unwrap();
+        // 400 ms: about 10 passes at 40 ms; 25 to 40 at 10 ms (std's sleep
+        // uses a high-resolution timer, so the 15.6 ms tick does not round it).
+        assert!(seen <= 18, "{seen} passes in 400 ms");
     }
 
     /// A file created by the Idle process (a built-in actor), at QPC `ts`.
@@ -325,10 +396,10 @@ mod tests {
             started: 0,
         };
         let p = Pipeline::new(setup, FakeLookups::default(), sequential_ids()).unwrap();
-        let (ktx, krx) = sync_channel(4);
-        let (utx, urx) = sync_channel(4);
+        let (ktx, krx) = bounded(4);
+        let (utx, urx) = bounded(4);
         drop((ktx, utx));
-        let cfg = DriverConfig { cadence: Duration::ZERO, ..DriverConfig::default() };
+        let cfg = DriverConfig { cadence: Duration::ZERO, idle_cadence: Duration::ZERO, ..DriverConfig::default() };
         Driver::new(p, Counting(s), krx, urx, Box::new(|| 0), no_anchor(), cfg).run(|_| {});
         // The start-up seeding pass (`seed_on_start`) is asked for on the first pass.
         assert_eq!(*submitted.lock().unwrap(), 2, "a Seed per handle kind");
@@ -350,8 +421,8 @@ mod tests {
             started: 0,
         };
         let p = Pipeline::new(setup, FakeLookups::default(), sequential_ids()).unwrap();
-        let (ktx, krx) = sync_channel(4);
-        let (_utx, urx) = sync_channel(4);
+        let (ktx, krx) = bounded(4);
+        let (_utx, urx) = bounded(4);
         let (ctx, crx) = channel::<Control<FakeLookups>>();
         let t0 = Instant::now();
         let driver = Driver::new(

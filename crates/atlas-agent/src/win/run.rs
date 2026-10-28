@@ -3,8 +3,9 @@
 //!
 //! Start: an elevated token → the single-instance lock → the data directory
 //! (created or verified, §11.1) → `agent.toml` → the diagnostic log → the
-//! buffer → the sensor ([`agent::start`]) with the buffer writer as its sink →
-//! the health thread.
+//! buffer → power throttling turned off ([`power`], plan 1b-4a-p2, R8) → the
+//! sensor ([`agent::start`]) with the buffer writer as its sink → the health
+//! thread.
 //!
 //! Clean stop: the health thread → the sensor ([`agent::Running::stop`]) →
 //! the final Sensor Health report → the buffer, flushed.
@@ -31,6 +32,7 @@ use super::agent::{self, AgentOptions};
 use super::datadir;
 use super::health::{self, HealthConfig, HealthThread, Interval, Reporting};
 use super::instance;
+use super::power;
 use super::util::Owned;
 use crate::config::Config;
 use crate::driver::DriverConfig;
@@ -152,6 +154,10 @@ where
     // Before the sessions start: Ctrl+C during start-up must not end the
     // process with them running. A stop asked for meanwhile waits in `stop`.
     let stop = install_ctrl_handler();
+    // SAFETY: GetCurrentProcess returns a pseudo-handle; nothing to close.
+    if let Err(e) = power::run_at_full_speed(unsafe { GetCurrentProcess() }) {
+        tracing::warn!("power throttling could not be turned off: {e}");
+    }
     tracing::info!("starting the sensor");
     let running = match agent::start(agent_opts, sink) {
         Ok(r) => r,
@@ -174,7 +180,9 @@ where
         buffer_drops: store.drops(),
     };
     let first = Interval { from: Snapshot::at_start(seeding, started.anchor.unix_ns), start: started.anchor.unix_ns };
-    let health = HealthThread::start(running.health_sources(), reporting.clone(), first, opts.health);
+    let mut sources = running.health_sources();
+    sources.queues.push(("sink", store.health().gauge()));
+    let health = HealthThread::start(sources, reporting.clone(), first, opts.health);
 
     tracing::info!("running; Ctrl+C stops");
     let mut code = EXIT_OK;

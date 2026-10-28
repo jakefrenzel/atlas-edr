@@ -10,14 +10,13 @@
 //! - addresses that cannot be named go into a negative cache until the address
 //!   is reused or its owner exits; events on them do not wait.
 
-use std::collections::{HashMap, HashSet};
-
 use atlas_schema::{EventKind, File};
 
 use super::Pipeline;
 use super::file::{Fill, fill_file_event, forgets_cached};
 use crate::completion::Reason;
 use crate::config::Ticks;
+use crate::fast::{FastMap, FastSet};
 use crate::process::file_name;
 use crate::recent::Recent;
 use crate::services::{HandleKind, Lookups, Request, Snapshot};
@@ -28,30 +27,35 @@ const CHANGES_CAP: usize = 1 << 19;
 const UNNAMABLE_CAP: usize = 1 << 16;
 
 pub struct Seeding {
-    asks: HashMap<HandleKind, HashSet<u64>>,
-    last_request: HashMap<HandleKind, i64>,
-    latest: HashMap<HandleKind, HashSet<u64>>,
+    asks: FastMap<HandleKind, FastSet<u64>>,
+    last_request: FastMap<HandleKind, i64>,
+    latest: FastMap<HandleKind, FastSet<u64>>,
     queued: Vec<Snapshot>,
     /// (kind, address) → (owner PID, insertion order). Owner 0: the address
     /// was not in the table at all.
-    unnamable: HashMap<(HandleKind, u64), (u32, u64)>,
+    unnamable: FastMap<(HandleKind, u64), (u32, u64)>,
     unnamable_seq: u64,
     changes: Recent<(HandleKind, u64)>,
     /// Kinds whose start-up pass has not been applied yet.
-    startup: HashSet<HandleKind>,
+    startup: FastSet<HandleKind>,
+    /// On-miss seeding (§7.4). Off, no snapshot comes after the start-up
+    /// passes, so the address history is kept only until they are applied
+    /// (plan 1b-4a-p2, R3).
+    on_miss: bool,
 }
 
 impl Seeding {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(on_miss: bool) -> Self {
         Seeding {
-            asks: HashMap::new(),
-            last_request: HashMap::new(),
-            latest: HashMap::new(),
+            asks: FastMap::default(),
+            last_request: FastMap::default(),
+            latest: FastMap::default(),
             queued: Vec::new(),
-            unnamable: HashMap::new(),
+            unnamable: FastMap::default(),
             unnamable_seq: 0,
             changes: Recent::new(CHANGES_CAP),
-            startup: HashSet::new(),
+            startup: FastSet::default(),
+            on_miss,
         }
     }
 
@@ -120,8 +124,15 @@ impl Seeding {
 
     /// A Create/Open/Close for this address: it may now belong to someone else.
     pub(super) fn changed(&mut self, kind: HandleKind, address: u64, ts: i64) {
-        self.changes.insert((kind, address), ts);
+        if self.history_needed() {
+            self.changes.insert((kind, address), ts);
+        }
         self.unnamable.remove(&(kind, address));
+    }
+
+    /// Whether a snapshot can still come, so its reuse rule needs the history.
+    fn history_needed(&self) -> bool {
+        self.on_miss || !self.startup.is_empty() || !self.queued.is_empty()
     }
 
     pub(super) fn last_change(&self, kind: HandleKind, address: u64) -> Option<i64> {
@@ -138,6 +149,18 @@ impl Seeding {
 
     pub fn negative_cache_len(&self) -> usize {
         self.unnamable.len()
+    }
+
+    pub fn negative_cache_capacity(&self) -> usize {
+        self.unnamable.capacity()
+    }
+
+    pub fn history_len(&self) -> usize {
+        self.changes.len()
+    }
+
+    pub fn history_capacity(&self) -> usize {
+        self.changes.capacity()
     }
 }
 
@@ -159,10 +182,10 @@ impl<L: Lookups> Pipeline<L> {
     fn apply_snapshot(&mut self, s: Snapshot) {
         let kind = s.kind;
         let taken = s.taken;
-        let in_table: HashSet<u64> = s.named.iter().map(|n| n.address).chain(s.unnamable.iter().map(|u| u.0)).collect();
+        let in_table: FastSet<u64> = s.named.iter().map(|n| n.address).chain(s.unnamable.iter().map(|u| u.0)).collect();
         // Covered but not in the table: closed before the read. Nothing can name
         // the address until it is used again (the negative cache, owner 0).
-        let absent: HashSet<u64> = if s.asked.is_empty() {
+        let absent: FastSet<u64> = if s.asked.is_empty() {
             match kind {
                 HandleKind::Key => self.reg.waiting.keys().copied().filter(|r| !in_table.contains(r)).collect(),
                 HandleKind::File => self
@@ -210,6 +233,9 @@ impl<L: Lookups> Pipeline<L> {
         }
         if s.asked.is_empty() {
             self.seeding.startup.remove(&kind);
+            if !self.seeding.history_needed() {
+                self.seeding.changes = Recent::new(CHANGES_CAP);
+            }
         }
         self.seeding.latest.insert(kind, in_table);
     }
