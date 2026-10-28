@@ -39,10 +39,14 @@ pub struct Seeding {
     changes: Recent<(HandleKind, u64)>,
     /// Kinds whose start-up pass has not been applied yet.
     startup: HashSet<HandleKind>,
+    /// On-miss seeding (§7.4). Off, no snapshot comes after the start-up
+    /// passes, so the address history is kept only until they are applied
+    /// (plan 1b-4a-p2, R3).
+    on_miss: bool,
 }
 
 impl Seeding {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(on_miss: bool) -> Self {
         Seeding {
             asks: HashMap::new(),
             last_request: HashMap::new(),
@@ -52,6 +56,7 @@ impl Seeding {
             unnamable_seq: 0,
             changes: Recent::new(CHANGES_CAP),
             startup: HashSet::new(),
+            on_miss,
         }
     }
 
@@ -120,8 +125,15 @@ impl Seeding {
 
     /// A Create/Open/Close for this address: it may now belong to someone else.
     pub(super) fn changed(&mut self, kind: HandleKind, address: u64, ts: i64) {
-        self.changes.insert((kind, address), ts);
+        if self.history_needed() {
+            self.changes.insert((kind, address), ts);
+        }
         self.unnamable.remove(&(kind, address));
+    }
+
+    /// Whether a snapshot can still come, so its reuse rule needs the history.
+    fn history_needed(&self) -> bool {
+        self.on_miss || !self.startup.is_empty() || !self.queued.is_empty()
     }
 
     pub(super) fn last_change(&self, kind: HandleKind, address: u64) -> Option<i64> {
@@ -210,6 +222,9 @@ impl<L: Lookups> Pipeline<L> {
         }
         if s.asked.is_empty() {
             self.seeding.startup.remove(&kind);
+            if !self.seeding.history_needed() {
+                self.seeding.changes = Recent::new(CHANGES_CAP);
+            }
         }
         self.seeding.latest.insert(kind, in_table);
     }
