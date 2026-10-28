@@ -86,6 +86,11 @@ impl Network {
         self.evictions
     }
 
+    /// (TCP connections, their capacity, UDP flows, their capacity) (R6).
+    pub fn sizes(&self) -> (usize, usize, usize, usize) {
+        (self.tcp.len(), self.tcp.capacity(), self.flows.len(), self.flows.capacity())
+    }
+
     fn close_flow(f: Flow, out: &mut Completion<Event>, clock: &Clock, ids: &mut IdGen, id: &Identity) {
         // A UDP Close is timestamped at the flow's last datagram (§3.3).
         let kind = activity(f.actor, f.local, f.remote, NetworkProtocol::Udp, f.direction, CLOSE);

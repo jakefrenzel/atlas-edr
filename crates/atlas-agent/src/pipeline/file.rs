@@ -155,6 +155,16 @@ impl Files {
         }
     }
 
+    /// (entries, capacity) of the confirmed and failed IRPs and the watchlist
+    /// opens (R6).
+    pub(super) fn recent_sizes(&self) -> [(usize, usize); 3] {
+        [
+            (self.confirmed.len(), self.confirmed.capacity()),
+            (self.failed.len(), self.failed.capacity()),
+            (self.opened.len(), self.opened.capacity()),
+        ]
+    }
+
     #[cfg(test)]
     pub(super) fn sizes(&self) -> [(&'static str, usize); 7] {
         [

@@ -150,6 +150,18 @@ impl Seeding {
     pub fn negative_cache_len(&self) -> usize {
         self.unnamable.len()
     }
+
+    pub fn negative_cache_capacity(&self) -> usize {
+        self.unnamable.capacity()
+    }
+
+    pub fn history_len(&self) -> usize {
+        self.changes.len()
+    }
+
+    pub fn history_capacity(&self) -> usize {
+        self.changes.capacity()
+    }
 }
 
 impl<L: Lookups> Pipeline<L> {

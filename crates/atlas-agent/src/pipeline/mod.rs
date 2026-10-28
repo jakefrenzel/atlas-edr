@@ -288,6 +288,31 @@ impl<L: Lookups> Pipeline<L> {
         out
     }
 
+    /// Each bounded structure's entries and allocated capacity, for the
+    /// diagnostic log (plan 1b-4a-p2, R6).
+    pub fn sizes(&self) -> crate::health::Sizes {
+        let (line, line_cap, pending, pending_cap) = self.completion.sizes();
+        let (tcp, tcp_cap, flows, flows_cap) = self.net.sizes();
+        let [confirmed, failed, opened] = self.files.recent_sizes();
+        let n = |len: usize, cap: usize| (len as u64, cap as u64);
+        let entries = [
+            ("ordering", n(self.ordering.len(), self.ordering.capacity())),
+            ("completion", n(line, line_cap)),
+            ("pending", n(pending, pending_cap)),
+            ("processes", n(self.procs.len(), self.procs.capacity())),
+            ("file_map", n(self.files.map.len(), self.files.map.capacity())),
+            ("key_map", n(self.keys.len(), self.keys.capacity())),
+            ("confirmed_irps", n(confirmed.0, confirmed.1)),
+            ("failed_irps", n(failed.0, failed.1)),
+            ("watch_opens", n(opened.0, opened.1)),
+            ("address_history", n(self.seeding.history_len(), self.seeding.history_capacity())),
+            ("negative_cache", n(self.seeding.negative_cache_len(), self.seeding.negative_cache_capacity())),
+            ("tcp", n(tcp, tcp_cap)),
+            ("udp_flows", n(flows, flows_cap)),
+        ];
+        entries.into_iter().map(|(name, (len, cap))| (name, len, cap)).collect()
+    }
+
     /// What is kept for pending events and recent history, by name (tests check
     /// it all goes once events leave and windows pass).
     #[cfg(test)]

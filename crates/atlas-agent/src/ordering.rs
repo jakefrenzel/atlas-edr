@@ -111,6 +111,11 @@ impl Ordering {
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
+
+    /// The slots allocated: the most events held at once (R6).
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
 }
 
 #[cfg(test)]

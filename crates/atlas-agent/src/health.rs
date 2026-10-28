@@ -19,6 +19,11 @@ use atlas_schema::{Device, Event, EventId, EventKind, EventMeta, Sensor};
 
 use crate::counters::{Class, Counters, IntakeTotals, ServiceTotals};
 
+/// Bounded structures' entries and allocated capacity, by name, for the
+/// diagnostic log (plan 1b-4a-p2, R6): gauges, not differences. Capacity is
+/// what holds memory: a map keeps its largest allocation after entries leave.
+pub type Sizes = Vec<(&'static str, u64, u64)>;
+
 /// One ETW session's loss counters (`EVENT_TRACE_PROPERTIES`): 32-bit and
 /// cumulative, so differences wrap.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -53,6 +58,9 @@ pub struct Snapshot {
     /// 1b-4a-p1); `None` when not listed this time.
     pub threads: Option<ThreadList>,
     pub seeding: bool,
+    /// The pipeline's structures (R6), read with its counters; empty when not
+    /// read.
+    pub pipeline_sizes: Sizes,
 }
 
 /// One listing of the agent's threads (plan 1b-4a-p1).
@@ -113,6 +121,9 @@ pub struct Diagnostics {
     /// The time between the two listings, ns: it differs from the report's
     /// interval when the threads were last listed before the last report.
     pub threads_interval: Option<i64>,
+    /// Every bounded structure's entries and capacity at `now` (R6): the
+    /// pipeline's, then the early key map, the hash and expansion caches.
+    pub sizes: Sizes,
 }
 
 fn d(prev: u64, now: u64) -> u64 {
@@ -235,9 +246,23 @@ pub fn report(prev: &Snapshot, now: &Snapshot) -> (HealthReport, Diagnostics) {
         fast_reads: d(i0.fast_reads, i1.fast_reads),
         threads: prev.threads.as_ref().zip(now.threads.as_ref()).map(|(a, b)| d_threads(a, b)),
         threads_interval: prev.threads.as_ref().zip(now.threads.as_ref()).map(|(a, b)| b.at - a.at),
+        sizes: sizes(now),
     };
     let report = HealthReport { loss, quality, housekeeping, resources, throughput, ..HealthReport::default() };
     (report, diagnostics)
+}
+
+/// The structures' gauges in `now`: the pipeline's when it was read, then the
+/// intake's and the services'.
+fn sizes(now: &Snapshot) -> Sizes {
+    let (i, s) = (&now.intake, &now.services);
+    let mut v = now.pipeline_sizes.clone();
+    v.push(("early_key_map", i.early_keys, i.early_keys_capacity));
+    v.push(("hash_cache", s.hash_cache_entries, s.hash_cache_capacity));
+    // A BTreeMap allocates per entry, with no spare room: its capacity is its
+    // entries (review 7).
+    v.push(("expand_cache", s.expand_cache_entries, s.expand_cache_entries));
+    v
 }
 
 /// Whether any loss counter rose between the two snapshots: a report is then
@@ -297,7 +322,30 @@ mod tests {
             working_set: Some(50 << 20),
             threads: Some(listing(1_000, &[(1, 10, "atlas-hash-0", 900), (2, 10, "atlas-pipeline", 100)])),
             seeding: true,
+            pipeline_sizes: vec![("file_map", 3, 16)],
         }
+    }
+
+    /// R6: the structures' gauges come from `now` alone, the pipeline's first,
+    /// then the early key map, the hash and expansion caches.
+    #[test]
+    fn a_report_carries_every_structures_size_from_now() {
+        let mut now = busy();
+        now.intake.early_keys = 7;
+        now.intake.early_keys_capacity = 14;
+        now.services.hash_cache_entries = 5;
+        now.services.hash_cache_capacity = 28;
+        now.services.expand_cache_entries = 2;
+        let mut prev = busy();
+        prev.pipeline_sizes = vec![("file_map", 99, 99)];
+        let (_, diag) = report(&prev, &now);
+        assert_eq!(
+            diag.sizes,
+            vec![("file_map", 3, 16), ("early_key_map", 7, 14), ("hash_cache", 5, 28), ("expand_cache", 2, 2)]
+        );
+        // The pipeline not read: its part is absent, the rest still there.
+        now.pipeline_sizes = vec![];
+        assert_eq!(report(&prev, &now).1.sizes.len(), 3);
     }
 
     /// A thread listing: (thread id, creation time, name, CPU ns).

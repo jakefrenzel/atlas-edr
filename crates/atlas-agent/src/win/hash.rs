@@ -92,9 +92,12 @@ impl HashCache {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.map.capacity()
     }
 }
 

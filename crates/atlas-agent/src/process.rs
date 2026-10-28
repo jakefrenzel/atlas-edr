@@ -219,6 +219,10 @@ impl ProcessCache {
         self.by_key.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.by_key.capacity()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_key.is_empty()
     }

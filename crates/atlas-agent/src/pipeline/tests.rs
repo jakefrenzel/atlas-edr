@@ -603,6 +603,44 @@ fn forgotten(t: &mut T) -> Vec<String> {
         .collect()
 }
 
+/// R6: every bounded structure by name, each with its entries and capacity.
+#[test]
+fn the_sizes_name_each_bounded_structure() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(0x1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+    t.ev(6, 100, Some(key(10)), create(0x2, 0xB, r"\Device\HarddiskVolume3\b.txt", 0));
+    t.at(400); // still held
+    let held = t.p.sizes();
+    let names: Vec<&str> = held.iter().map(|s| s.0).collect();
+    assert_eq!(
+        names,
+        [
+            "ordering",
+            "completion",
+            "pending",
+            "processes",
+            "file_map",
+            "key_map",
+            "confirmed_irps",
+            "failed_irps",
+            "watch_opens",
+            "address_history",
+            "negative_cache",
+            "tcp",
+            "udp_flows"
+        ]
+    );
+    let get = |s: &[(&str, u64, u64)], n: &str| s.iter().find(|x| x.0 == n).map(|x| (x.1, x.2)).unwrap();
+    assert!(get(&held, "ordering").0 >= 2, "both Creates held");
+    assert!(held.iter().all(|(_, len, cap)| len <= cap), "{held:?}");
+    t.at(1_200);
+    let after = t.p.sizes();
+    assert_eq!(get(&after, "ordering").0, 0);
+    assert_eq!(get(&after, "file_map").0, 2, "both handles mapped");
+    assert!(get(&after, "processes").0 >= 1);
+}
+
 /// D6: the System process sets the basic information of the DLLs starting
 /// processes load; forgetting their hashes then re-hashed them on every launch.
 #[test]

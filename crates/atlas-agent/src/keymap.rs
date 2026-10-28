@@ -236,6 +236,10 @@ impl KeyMap {
         self.map.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

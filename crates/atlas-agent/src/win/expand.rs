@@ -135,8 +135,7 @@ impl<D: Dir> Expander<D> {
         }
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.cache.len()
     }
 }
