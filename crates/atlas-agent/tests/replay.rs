@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atlas_agent::config::{Config, Ticks};
 use atlas_agent::counters::IntakeCounters;
@@ -22,7 +22,7 @@ use atlas_agent::input::{Header, Incoming, Session};
 use atlas_agent::intake::{Intake, Queues};
 use atlas_agent::pipeline::{Pipeline, Setup};
 use atlas_agent::process::Identity;
-use atlas_agent::services::{LiveProcess, Reply, Request, ValueData};
+use atlas_agent::services::{LiveProcess, Reply, Request, Snapshot, ValueData};
 use atlas_agent::time::Anchor;
 use atlas_etw::Provider;
 use atlas_etw::parse::{EventMeta, PointerSize, RawEvent, parse};
@@ -401,4 +401,102 @@ fn the_replay_is_deterministic() {
     let a: Vec<Vec<u8>> = run().0.into_iter().map(encode_event).collect();
     let b: Vec<Vec<u8>> = run().0.into_iter().map(encode_event).collect();
     assert_eq!(a, b);
+}
+
+/// The pipeline thread's cost per event (plan 1b-4a-p2, R3), the yardstick for
+/// its fixes: the recording, its time squeezed 10 times (about 4,500 events/s,
+/// normal use's order), replayed `ROUNDS` times through one pipeline with the
+/// kernel objects moved each round (so its maps grow as on a host), the
+/// driver's 10 ms ticks, and the fake workers' answers (the start-up seeding
+/// passes answered with an empty table). The best of `RUNS`.
+/// Run it in release:
+/// `cargo test --release -p atlas-agent --test replay -- --ignored --nocapture bench`
+#[test]
+#[ignore = "a benchmark: run it in release, with --nocapture"]
+fn bench_pipeline_per_event() {
+    const ROUNDS: i64 = 300;
+    const SQUEEZE: i64 = 10;
+    const RUNS: usize = 10;
+    let (mut best, mut events, mut emitted) = (f64::MAX, 0, 0);
+    for _ in 0..RUNS {
+        let Replay { mut p, intake, krx, urx, first, last, .. } = replay();
+        drop(intake);
+        let mut one: Vec<Incoming> = krx.try_iter().chain(urx.try_iter()).collect();
+        one.sort_by_key(|i| i.header.ts);
+        let span = (last - first) / SQUEEZE + FREQ / 100;
+        let mut all = Vec::with_capacity(one.len() * ROUNDS as usize);
+        for r in 0..ROUNDS {
+            for inc in &one {
+                let mut inc = inc.clone();
+                inc.header.ts = first + (inc.header.ts - first) / SQUEEZE + r * span;
+                shift(&mut inc.event, r as u64 * 0x10_0000);
+                all.push(inc);
+            }
+        }
+        events = all.len();
+        let step = FREQ / 100;
+        let mut now = first;
+        let mut out = 0;
+        let mut queue = all.into_iter().peekable();
+        let t0 = Instant::now();
+        loop {
+            while let Some(inc) = queue.next_if(|i| i.header.ts <= now) {
+                p.push(inc);
+            }
+            out += p.tick(now).len();
+            for r in p.take_requests() {
+                // The seeder answers the start-up passes with an empty table, as
+                // on a host whose earlier handles all closed.
+                let reply = match r {
+                    Request::Seed { kind, addresses } => Some(Reply::Snapshot(Snapshot {
+                        kind,
+                        taken: now,
+                        asked: addresses,
+                        named: vec![],
+                        unnamable: vec![],
+                    })),
+                    r => answer(&r),
+                };
+                if let Some(reply) = reply {
+                    p.reply(reply);
+                }
+            }
+            if queue.peek().is_none() {
+                break;
+            }
+            now += step;
+        }
+        out += p.stop().len();
+        best = best.min(t0.elapsed().as_secs_f64() * 1e6 / events as f64);
+        emitted = out;
+    }
+    println!("pipeline: {best:.3} us per event, best of {RUNS} ({events} events in, {emitted} out)");
+}
+
+/// Moves every kernel object address (file objects, IRPs, key objects) by `k`,
+/// so a replayed round names other objects than the last; a base of 0 (an
+/// absolute registry path) stays 0.
+fn shift(e: &mut RawEvent, k: u64) {
+    match e {
+        RawEvent::FileCreate(f) | RawEvent::FileCreateNew(f) => (f.irp, f.file_object) = (f.irp + k, f.file_object + k),
+        RawEvent::FileCleanup(f) | RawEvent::FileClose(f) => (f.irp, f.file_object) = (f.irp + k, f.file_object + k),
+        RawEvent::FileWrite(f) => (f.irp, f.file_object) = (f.irp + k, f.file_object + k),
+        RawEvent::FileSetInfo(f) | RawEvent::FileSetDelete(f) => {
+            (f.irp, f.file_object) = (f.irp + k, f.file_object + k)
+        }
+        RawEvent::FileOpEnd(f) => f.irp += k,
+        RawEvent::FileDeletePath(f) | RawEvent::FileRenamePath(f) => {
+            (f.irp, f.file_object) = (f.irp + k, f.file_object + k)
+        }
+        RawEvent::RegCreateKey(r) | RawEvent::RegOpenKey(r) => {
+            r.key_object += k;
+            if r.base_object != 0 {
+                r.base_object += k;
+            }
+        }
+        RawEvent::RegDeleteKey(r) | RawEvent::RegCloseKey(r) => r.key_object += k,
+        RawEvent::RegSetValue(r) => r.key_object += k,
+        RawEvent::RegDeleteValue(r) => r.key_object += k,
+        _ => {}
+    }
 }
