@@ -10,6 +10,7 @@
 //! taken as the delete (`file_delete_outcome_unknown`).
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use atlas_etw::parse::{FileCreate, FileHandle, FileOpEnd, FilePath, FileSetInfo};
 use atlas_schema::classes::file::{FileAction, FileSystemActivity};
@@ -33,6 +34,11 @@ const CONFIRMED_CAP: usize = 1 << 18;
 const OPENED_CAP: usize = 1 << 16;
 const CLEANUPS_CAP: usize = 1 << 16;
 const REQUESTS_CAP: usize = 1 << 14;
+/// FileObjects whose entry left after its Cleanup, kept to recognise a late
+/// write: at most this many, for at most this long (plan 1b-4a-p3, H1; 99.6%
+/// of late writes on the host came within 60 s).
+const CLEANED_CAP: usize = 1 << 16;
+const CLEANED_KEEP: Duration = Duration::from_secs(60);
 
 /// A watchlist Open's coalescing key: (actor, logged path lowercased).
 type OpenKey = (ProcessUid, String);
@@ -53,7 +59,8 @@ pub(crate) struct FileEntry {
     pub(crate) opener: Option<ProcessRef>,
     written: bool,
     delete_on_close: bool,
-    cleaned: bool,
+    /// QPC of its Cleanup, once the last handle closed.
+    cleaned: Option<i64>,
     /// QPC of the Create (or snapshot) that set it.
     pub(crate) since: i64,
     touched: u64,
@@ -120,6 +127,13 @@ pub struct Files {
     request_irps: RecentMap<u64, u64>,
     /// POSIX-style deletes already reported: (FileKey, kind) → when.
     posix_deleted: RecentMap<(u64, u64), i64>,
+    /// Entries past their Cleanup, in Cleanup order: (when due, QPC of the
+    /// Cleanup, FileObject). Each leaves the map once its outcome's window has
+    /// passed: Windows may send the Close long after, or not for hours (H1).
+    retiring: VecDeque<(i64, i64, u64)>,
+    /// FileObjects whose entry left after its Cleanup, so that a late write is
+    /// absorbed (`writes_after_cleanup`) instead of making a provisional entry.
+    cleaned: Recent<u64>,
 }
 
 /// Who asked for a delete (§5.3: the actor of the Delete).
@@ -152,21 +166,41 @@ impl Files {
             early_outcomes: RecentMap::new(REQUESTS_CAP),
             request_irps: RecentMap::new(REQUESTS_CAP),
             posix_deleted: RecentMap::new(REQUESTS_CAP),
+            retiring: VecDeque::new(),
+            cleaned: Recent::new(CLEANED_CAP),
         }
     }
 
-    /// (entries, capacity) of the confirmed and failed IRPs and the watchlist
-    /// opens (R6).
-    pub(super) fn recent_sizes(&self) -> [(usize, usize); 3] {
+    /// (entries, capacity) of the confirmed and failed IRPs, the watchlist
+    /// opens (R6) and the cleaned FileObjects (H1).
+    pub(super) fn recent_sizes(&self) -> [(usize, usize); 4] {
         [
             (self.confirmed.len(), self.confirmed.capacity()),
             (self.failed.len(), self.failed.capacity()),
             (self.opened.len(), self.opened.capacity()),
+            (self.cleaned.len(), self.cleaned.capacity()),
         ]
     }
 
+    /// Takes `fo`'s entry out of the map if it is still the one cleaned at
+    /// `at` and no event waits on it for the seeder. False if it must stay
+    /// longer; true once it is done with (gone, or replaced by a new Create).
+    fn retire(&mut self, fo: u64, at: i64) -> bool {
+        match self.map.get(&fo) {
+            Some(e) if e.cleaned == Some(at) => {
+                if !e.waiting.is_empty() {
+                    return false;
+                }
+                self.map.remove(&fo);
+                self.cleaned.insert(fo, at);
+                true
+            }
+            _ => true,
+        }
+    }
+
     #[cfg(test)]
-    pub(super) fn sizes(&self) -> [(&'static str, usize); 7] {
+    pub(super) fn sizes(&self) -> [(&'static str, usize); 9] {
         [
             ("file waiters", self.map.values().map(|e| e.waiting.len()).sum()),
             ("file waiter index", self.waiter_fo.len()),
@@ -175,6 +209,8 @@ impl Files {
             ("confirmed irps", self.confirmed.len()),
             ("watchlist opens", self.opened.len()),
             ("cleanups awaiting an outcome", self.cleanups.len() + self.early_outcomes.len() + self.request_irps.len()),
+            ("entries past their cleanup", self.retiring.len()),
+            ("cleaned file objects", self.cleaned.len()),
         ]
     }
 
@@ -217,7 +253,7 @@ fn entry(nt: Option<String>, opener: Option<ProcessRef>, since: i64) -> FileEntr
         opener,
         written: false,
         delete_on_close: false,
-        cleaned: false,
+        cleaned: None,
         since,
         touched: 0,
         waiting: Vec::new(),
@@ -298,6 +334,7 @@ impl<L: Lookups> Pipeline<L> {
             self.counters.file_object_replaced += 1;
         }
         self.seeding.changed(HandleKind::File, c.file_object, h.ts);
+        self.files.cleaned.remove(&c.file_object); // the address is reused
         let mut e = entry(Some(nt.clone()), opener.clone(), h.ts);
         e.delete_on_close = c.delete_on_close();
         self.files.insert(c.file_object, e);
@@ -350,13 +387,16 @@ impl<L: Lookups> Pipeline<L> {
 
     /// A Write, or a truncation (the overwrite case, §5.1).
     pub(super) fn on_file_write(&mut self, h: &Header, fo: u64) {
+        // A lazy-writer flush or a mapped page after the entry left (H1).
+        let after_cleanup = self.files.cleaned.get(&fo).is_some();
         match self.files.touch(fo) {
             Some(e) => {
-                if e.cleaned {
+                if e.cleaned.is_some() {
                     self.counters.writes_after_cleanup += 1;
                 }
                 e.written = true;
             }
+            None if after_cleanup => self.counters.writes_after_cleanup += 1,
             None => {
                 let mut e = entry(None, None, h.ts);
                 e.written = true;
@@ -599,17 +639,26 @@ impl<L: Lookups> Pipeline<L> {
         if let Some((oh, info)) = early {
             self.on_cleanup_outcome(&oh, x.file_object, x.file_key, info);
         }
+        // Past its Cleanup an entry serves only the outcome, which follows at
+        // once: it leaves after the outcome's window, or now without
+        // OperationEnds, whenever its Close comes (H1).
+        let fo = x.file_object;
+        if self.files.map.get(&fo).is_some_and(|e| e.cleaned == Some(h.ts)) && (op_end || !self.files.retire(fo, h.ts))
+        {
+            let due = h.ts.saturating_add(self.files.window);
+            self.files.retiring.push_back((due, h.ts, fo));
+        }
     }
 
     fn cleanup_handle(&mut self, h: &Header, x: &FileHandle) {
         let op_end = self.cfg.file_op_end;
         let Some(e) = self.files.touch(x.file_object) else { return };
-        let update = e.written && !e.cleaned;
+        let update = e.written && e.cleaned.is_none();
         // With OperationEnds the outcome reports the delete, possibly on another
         // handle's Cleanup: the FileKey remembers who asked.
         let delete = e.delete_on_close && !op_end;
         let asked = if op_end && e.delete_on_close { e.opener.clone() } else { None };
-        e.cleaned = true;
+        e.cleaned.get_or_insert(h.ts);
         let opener = e.opener.clone();
         if let Some(a) = asked {
             self.files.requests.insert(x.file_key, h.ts, Requester::Opener(a));
@@ -637,6 +686,7 @@ impl<L: Lookups> Pipeline<L> {
 
     pub(super) fn on_file_close(&mut self, h: &Header, x: FileHandle) {
         self.files.map.remove(&x.file_object);
+        self.files.cleaned.remove(&x.file_object);
         self.seeding.changed(HandleKind::File, x.file_object, h.ts);
     }
 
@@ -678,6 +728,20 @@ impl<L: Lookups> Pipeline<L> {
                 self.files.confirmed.insert(irp, ts);
             }
         }
+        // Entries past their Cleanup leave once the outcome's window passed (H1);
+        // one an event still waits on is looked at again a window later (each
+        // at most once a pass: a final flush runs at the end of time).
+        for _ in 0..self.files.retiring.len() {
+            let Some(&(due, at, fo)) = self.files.retiring.front() else { break };
+            if due > stream {
+                break;
+            }
+            self.files.retiring.pop_front();
+            if !self.files.retire(fo, at) {
+                self.files.retiring.push_back((stream.saturating_add(window), at, fo));
+            }
+        }
+        self.files.cleaned.expire(stream.saturating_sub(self.ticks.of(CLEANED_KEEP)));
         self.files.failed.expire(stream.saturating_sub(window));
         // A Cleanup's OperationEnd follows it at once: a window is plenty.
         self.files.cleanups.expire(stream.saturating_sub(window));
