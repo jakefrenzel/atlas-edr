@@ -98,7 +98,7 @@ impl<L: Lookups> Pipeline<L> {
             completion: Completion::new(config.pending_cap),
             procs: ProcessCache::new(t(config.process_retention), config.process_cap),
             launches: Launches::default(),
-            files: Files::new(config.file_map_cap, t(config.confirm_window)),
+            files: Files::new(config.file_map_cap, t(config.confirm_window), t(crate::cleanup::OUTCOME_WINDOW)),
             keys: KeyMap::new(config.key_map_cap),
             reg: Registry::default(),
             net: Network::new(config.flow_cap, t(config.udp_idle)),
@@ -293,7 +293,7 @@ impl<L: Lookups> Pipeline<L> {
     pub fn sizes(&self) -> crate::health::Sizes {
         let (line, line_cap, pending, pending_cap) = self.completion.sizes();
         let (tcp, tcp_cap, flows, flows_cap) = self.net.sizes();
-        let [confirmed, failed, opened] = self.files.recent_sizes();
+        let [confirmed, failed, opened, cleaned, retiring] = self.files.recent_sizes();
         let n = |len: usize, cap: usize| (len as u64, cap as u64);
         let entries = [
             ("ordering", n(self.ordering.len(), self.ordering.capacity())),
@@ -305,6 +305,8 @@ impl<L: Lookups> Pipeline<L> {
             ("confirmed_irps", n(confirmed.0, confirmed.1)),
             ("failed_irps", n(failed.0, failed.1)),
             ("watch_opens", n(opened.0, opened.1)),
+            ("cleaned_fos", n(cleaned.0, cleaned.1)),
+            ("retiring_fos", n(retiring.0, retiring.1)),
             ("address_history", n(self.seeding.history_len(), self.seeding.history_capacity())),
             ("negative_cache", n(self.seeding.negative_cache_len(), self.seeding.negative_cache_capacity())),
             ("tcp", n(tcp, tcp_cap)),

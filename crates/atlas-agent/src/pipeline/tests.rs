@@ -625,6 +625,8 @@ fn the_sizes_name_each_bounded_structure() {
             "confirmed_irps",
             "failed_irps",
             "watch_opens",
+            "cleaned_fos",
+            "retiring_fos",
             "address_history",
             "negative_cache",
             "tcp",
@@ -1469,6 +1471,10 @@ fn bookkeeping_is_freed_when_no_reply_comes() {
     }
     let out = t.settle();
     assert!(!out.is_empty());
+    // An entry past its Cleanup leaves at the first pass after the events
+    // waiting on it for the seeder, a window later (plan 1b-4a-p3, H1).
+    let later = t.now / (FREQ / 1000) + 2_000;
+    t.at(later);
     no_bookkeeping_left(&t);
 }
 
@@ -1894,4 +1900,194 @@ fn a_request_that_succeeded_stands_against_a_later_failure_on_its_irp() {
     t.ev(50, 200, Some(key(20)), cleanup(10, 0xB, 0x50));
     t.ev(50, 200, Some(key(20)), outcome(10, crate::cleanup::FILE_DELETED));
     assert_eq!(files(&t.settle()), [("delete", r"C:\kept.txt".into(), 100)]);
+}
+
+// ---- plan 1b-4a-p3: entries leave the file map after their Cleanup (H1) ----
+
+fn size_of(t: &T, name: &str) -> u64 {
+    t.p.sizes().into_iter().find(|s| s.0 == name).map(|s| s.1).expect(name)
+}
+
+/// A walk like `du`'s: thousands of files opened and cleaned up whose Close
+/// Windows sends late or not for hours. Only the open handle stays mapped.
+#[test]
+fn a_walk_without_closes_leaves_only_open_handles_in_the_map() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\open.log", 0));
+    for i in 0..1_000u64 {
+        let f = format!(r"\Device\HarddiskVolume3\src\f{i}.js");
+        t.ev(6, 100, Some(key(10)), create(10 + i, 0x10_000 + i, &f, 0));
+        t.ev(7, 100, Some(key(10)), cleanup(10 + i, 0x10_000 + i, 0x90_000 + i));
+    }
+    t.at(2_000);
+    assert_eq!((size_of(&t, "file_map"), size_of(&t, "cleaned_fos")), (1, 1_000));
+    t.at(63_000); // the cleaned record keeps them 60 s
+    assert_eq!((size_of(&t, "file_map"), size_of(&t, "cleaned_fos")), (1, 0));
+    assert_eq!(t.p.counters().file_map_evictions, 0);
+}
+
+/// A lazy-writer flush after the entry left is absorbed, as before (§7.1);
+/// past the record's 60 s it is an unknown handle's write, today's rule.
+#[test]
+fn a_late_write_after_the_entry_left_is_absorbed() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+    t.ev(6, 100, Some(key(10)), write(0xA));
+    t.ev(7, 4, None, cleanup(1, 0xA, 0x50));
+    t.at(2_000);
+    assert_eq!(size_of(&t, "file_map"), 0, "the entry left");
+    t.ev(10_000, 4, None, write(0xA)); // 10 s after its Cleanup
+    t.at(12_000);
+    assert_eq!((t.p.counters().writes_after_cleanup, size_of(&t, "file_map")), (1, 0));
+    assert_eq!(files(&t.out), [("update", r"C:\a.txt".into(), 100)], "one Update");
+    t.ev(70_000, 4, None, write(0xA)); // past the record
+    t.at(72_000);
+    assert_eq!((t.p.counters().writes_after_cleanup, size_of(&t, "file_map")), (1, 1));
+}
+
+/// The outcome that follows a Cleanup still finds the entry: a delete-on-close
+/// handle's Delete keeps its path and its opener (§5.1).
+#[test]
+fn the_cleanup_outcome_still_finds_the_entry() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\tmp\d.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, f, FileCreate::DELETE_ON_CLOSE));
+    t.ev(6, 4, None, cleanup(2, 0xA, 0x50));
+    t.ev(900, 4, None, outcome(2, crate::cleanup::FILE_DELETED)); // late, inside the 1 s window (review M1)
+    let out = t.settle();
+    assert_eq!(files(&out), [("delete", r"C:\tmp\d.txt".into(), 100)]);
+    assert_eq!(t.p.counters().unknown_file_object, 0);
+}
+
+/// Without OperationEnds no outcome follows: the entry leaves at its Cleanup.
+#[test]
+fn without_operation_ends_an_entry_leaves_at_its_cleanup() {
+    for (op_end, mapped) in [(true, 1), (false, 0)] {
+        let mut t = T::with(Config { file_op_end: op_end, ..Config::default() }, FakeLookups::default());
+        running(&mut t, 100, 10, EXPLORER);
+        t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+        t.ev(6, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+        t.ev(7, 100, Some(key(10)), create(2, 0xB, r"\Device\HarddiskVolume3\b.txt", 0));
+        t.at(757); // stream time 7 ms: the Cleanup's window is still open
+        assert_eq!(size_of(&t, "file_map") - 1, mapped, "op_end {op_end}");
+    }
+}
+
+/// A Create or a Close on a recorded FileObject takes it out of the record:
+/// the address belongs to another file object now.
+#[test]
+fn a_reused_or_closed_address_leaves_the_cleaned_record() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+    t.ev(6, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    t.ev(7, 100, Some(key(10)), create(2, 0xB, r"\Device\HarddiskVolume3\b.txt", 0));
+    t.ev(8, 100, Some(key(10)), cleanup(2, 0xB, 0x51));
+    t.at(2_000);
+    assert_eq!(size_of(&t, "cleaned_fos"), 2);
+    t.ev(1_300, 100, Some(key(10)), create(3, 0xA, r"\Device\HarddiskVolume3\c.txt", 0));
+    t.at(2_100);
+    assert_eq!(size_of(&t, "cleaned_fos"), 1, "a Create reuses 0xA");
+    t.ev(1_400, 4, None, RawEvent::FileClose(handle(0xB)));
+    t.at(2_200);
+    assert_eq!(size_of(&t, "cleaned_fos"), 0, "0xB closed at last");
+}
+
+/// An address closed and opened again inside the first Cleanup's window: the
+/// first retirement leaves the new, open handle alone.
+#[test]
+fn a_reused_address_inside_the_window_keeps_its_new_entry() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+    t.ev(6, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    t.ev(7, 100, Some(key(10)), RawEvent::FileClose(handle(0xA)));
+    t.ev(8, 100, Some(key(10)), create(2, 0xA, r"\Device\HarddiskVolume3\b.txt", 0));
+    t.ev(9, 100, Some(key(10)), write(0xA));
+    t.ev(2_000, 100, Some(key(10)), cleanup(3, 0xA, 0x51)); // long after the first window
+    assert_eq!(files(&t.settle()), [("update", r"C:\b.txt".into(), 100)]);
+}
+
+/// The same address cleaned up twice inside one window: the second entry
+/// waits for its own outcome's window, not the first's.
+#[test]
+fn a_second_cleanup_on_a_reused_address_waits_for_its_own_outcome() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\tmp\d.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+    t.ev(6, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    t.ev(7, 100, Some(key(10)), RawEvent::FileClose(handle(0xA)));
+    t.ev(200, 100, Some(key(10)), create(2, 0xA, f, FileCreate::DELETE_ON_CLOSE));
+    t.ev(210, 4, None, cleanup(3, 0xA, 0x51));
+    // After the first Cleanup's window (6 + 1,000 ms), inside the second's.
+    t.ev(1_100, 4, None, outcome(3, crate::cleanup::FILE_DELETED));
+    assert_eq!(files(&t.settle()), [("delete", r"C:\tmp\d.txt".into(), 100)]);
+}
+
+/// An entry an event waits on for the start-up seeder stays past its
+/// Cleanup's window, so the answer still names the event; then it leaves.
+#[test]
+fn an_entry_waited_on_stays_until_answered() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), write(0xA)); // waits for the start-up pass
+    t.ev(6, 4, None, RawEvent::FileCleanup(handle(0xA)));
+    t.at(2_000); // stream time 1,250 ms: the Cleanup's window has passed
+    assert_eq!(size_of(&t, "file_map"), 1, "kept for the waiting Update");
+    t.reply(Reply::Snapshot(Snapshot {
+        kind: HandleKind::File,
+        taken: ms(1_500),
+        asked: vec![],
+        named: vec![Named { address: 0xA, owner_pid: 100, name: r"\Device\HarddiskVolume3\held.txt".into() }],
+        unnamable: vec![],
+    }));
+    t.at(3_000);
+    assert_eq!(files(&t.out), [("update", r"C:\held.txt".into(), 100)]);
+    t.at(4_000);
+    assert_eq!(size_of(&t, "file_map"), 0, "gone once answered");
+}
+
+/// An outcome exactly one window after its Cleanup is still the Cleanup's,
+/// as the callback pairs them, and still finds the entry (review nit).
+#[test]
+fn an_outcome_exactly_one_window_late_still_finds_its_entry() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    let f = r"\Device\HarddiskVolume3\tmp\d.txt";
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, f, FileCreate::DELETE_ON_CLOSE));
+    t.ev(6, 4, None, cleanup(2, 0xA, 0x50));
+    t.ev(1_006, 4, None, outcome(2, crate::cleanup::FILE_DELETED));
+    assert_eq!(files(&t.settle()), [("delete", r"C:\tmp\d.txt".into(), 100)]);
+}
+
+/// A Create on an address in the cleaned record is a reuse after a Close that
+/// never came: `file_object_replaced` counts it, as it did while such entries
+/// stayed until their Close (review m1).
+#[test]
+fn a_create_on_a_cleaned_address_counts_a_replaced_file_object() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+    t.ev(6, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    t.ev(2_000, 100, Some(key(10)), create(2, 0xA, r"\Device\HarddiskVolume3\b.txt", 0));
+    t.settle();
+    assert_eq!(t.p.counters().file_object_replaced, 1);
+}
+
+/// An outcome on a handle the agent never saw opened makes an entry that waits
+/// for the seeder; it is past its Cleanup, and leaves like any other (review m3).
+#[test]
+fn an_entry_an_outcome_makes_leaves_too() {
+    let mut t = T::new(); // the start-up pass never answers: the Delete waits
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(6, 100, Some(key(10)), cleanup(2, 0xA, 0x50));
+    t.ev(7, 100, Some(key(10)), outcome(2, crate::cleanup::FILE_DELETED));
+    t.settle();
+    let later = t.now / (FREQ / 1000) + 2_000;
+    t.at(later);
+    assert_eq!(size_of(&t, "file_map"), 0);
 }

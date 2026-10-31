@@ -228,7 +228,7 @@ impl Cleanups {
             requested: Recent::new(DELETE_REQUESTS_CAP),
             request_irps: FastMap::default(),
             on_close: Recent::new(DELETE_REQUESTS_CAP),
-            window: ticks.frequency.max(1),
+            window: ticks.of(cleanup::OUTCOME_WINDOW).max(1),
             counters,
         }
     }
