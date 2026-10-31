@@ -1606,11 +1606,14 @@ fn without_on_miss_seeding_only_the_start_up_pass_is_waited_for() {
     }));
     t.at(1_800);
     assert_eq!(files(&t.out), [("update", r"C:\held.txt".into(), 100)]);
-    // After the pass, an unknown handle is dropped at once.
+    // After the pass nothing can name an unknown handle: its write makes no
+    // entry, so its Cleanup has nothing to report (plan 1b-4a-p3, H2).
     t.ev(1_900, 100, Some(key(10)), write(0xB));
+    t.at(2_000);
+    assert!(!t.p.files.map.contains_key(&0xB), "no provisional entry");
     t.ev(1_901, 4, None, RawEvent::FileCleanup(handle(0xB)));
     t.at(2_700);
-    assert_eq!((t.p.counters().unknown_file_object, t.p.completion.pending_len()), (1, 0));
+    assert_eq!((t.p.counters().unknown_file_object, t.p.completion.pending_len()), (0, 0));
 }
 
 #[test]
@@ -2048,4 +2051,25 @@ fn an_entry_waited_on_stays_until_answered() {
     assert_eq!(files(&t.out), [("update", r"C:\held.txt".into(), 100)]);
     t.at(4_000);
     assert_eq!(size_of(&t, "file_map"), 0, "gone once answered");
+}
+
+/// With on-miss seeding on, a write on an unknown handle after the start-up
+/// pass still makes an entry and asks the seeder about it (H2 leaves it).
+#[test]
+fn with_on_miss_seeding_an_unknown_write_still_asks() {
+    let mut t = T::seeding_on_miss();
+    running(&mut t, 100, 10, EXPLORER);
+    t.at(1_000);
+    t.reply(Reply::Snapshot(Snapshot {
+        kind: HandleKind::File,
+        taken: ms(1_000),
+        asked: vec![],
+        named: vec![],
+        unnamable: vec![],
+    }));
+    t.at(2_000); // the start-up pass is applied
+    t.requests();
+    t.ev(1_900, 100, Some(key(10)), write(0xB));
+    t.at(2_700);
+    assert_eq!(seed_asks(&mut t, HandleKind::File), [vec![0xB]]);
 }

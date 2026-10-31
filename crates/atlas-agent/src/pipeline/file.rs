@@ -397,6 +397,11 @@ impl<L: Lookups> Pipeline<L> {
                 e.written = true;
             }
             None if after_cleanup => self.counters.writes_after_cleanup += 1,
+            // Once the start-up pass is done, and with on-miss seeding off,
+            // nothing can name a handle the agent never saw opened: its Update
+            // would be dropped, and an entry would hold memory until a Close
+            // that may never come (H2).
+            None if !self.cfg.seed_on_miss && !self.seeding.startup_pending(HandleKind::File) => {}
             None => {
                 let mut e = entry(None, None, h.ts);
                 e.written = true;
