@@ -1607,11 +1607,14 @@ fn without_on_miss_seeding_only_the_start_up_pass_is_waited_for() {
     }));
     t.at(1_800);
     assert_eq!(files(&t.out), [("update", r"C:\held.txt".into(), 100)]);
-    // After the pass, an unknown handle is dropped at once.
+    // After the pass nothing can name an unknown handle: its write makes no
+    // entry, so its Cleanup has nothing to report (plan 1b-4a-p3, H2).
     t.ev(1_900, 100, Some(key(10)), write(0xB));
+    t.at(2_000);
+    assert!(!t.p.files.map.contains_key(&0xB), "no provisional entry");
     t.ev(1_901, 4, None, RawEvent::FileCleanup(handle(0xB)));
     t.at(2_700);
-    assert_eq!((t.p.counters().unknown_file_object, t.p.completion.pending_len()), (1, 0));
+    assert_eq!((t.p.counters().unknown_file_object, t.p.completion.pending_len()), (0, 0));
 }
 
 #[test]
@@ -2090,4 +2093,50 @@ fn an_entry_an_outcome_makes_leaves_too() {
     let later = t.now / (FREQ / 1000) + 2_000;
     t.at(later);
     assert_eq!(size_of(&t, "file_map"), 0);
+}
+
+/// With on-miss seeding on, a write on an unknown handle after the start-up
+/// pass still makes an entry and asks the seeder about it (H2 leaves it).
+#[test]
+fn with_on_miss_seeding_an_unknown_write_still_asks() {
+    let mut t = T::seeding_on_miss();
+    running(&mut t, 100, 10, EXPLORER);
+    t.at(1_000);
+    t.reply(Reply::Snapshot(Snapshot {
+        kind: HandleKind::File,
+        taken: ms(1_000),
+        asked: vec![],
+        named: vec![],
+        unnamable: vec![],
+    }));
+    t.at(2_000); // the start-up pass is applied
+    t.requests();
+    t.ev(1_900, 100, Some(key(10)), write(0xB));
+    t.at(2_700);
+    assert_eq!(seed_asks(&mut t, HandleKind::File), [vec![0xB]]);
+}
+
+/// After the start-up pass a late write on a cleaned FileObject is still
+/// absorbed: the cleaned record is looked at before H2's rule (review m2).
+#[test]
+fn after_the_start_up_pass_a_late_write_is_still_absorbed() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.at(1_000);
+    t.reply(Reply::Snapshot(Snapshot {
+        kind: HandleKind::File,
+        taken: ms(1_000),
+        asked: vec![],
+        named: vec![],
+        unnamable: vec![],
+    }));
+    t.at(2_000); // the start-up pass is applied
+    t.ev(1_300, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\a.txt", 0));
+    t.ev(1_301, 100, Some(key(10)), write(0xA));
+    t.ev(1_302, 4, None, cleanup(1, 0xA, 0x50));
+    t.at(4_000);
+    assert_eq!(size_of(&t, "file_map"), 0, "the entry left");
+    t.ev(10_000, 4, None, write(0xA));
+    t.at(12_000);
+    assert_eq!(t.p.counters().writes_after_cleanup, 1);
 }
