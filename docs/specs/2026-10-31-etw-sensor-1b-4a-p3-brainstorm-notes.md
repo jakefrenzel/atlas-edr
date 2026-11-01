@@ -1,0 +1,40 @@
+# Sub-project 1, plan 1b-4a-p3 — The File Map's Memory: Brainstorm Notes
+
+**Status:** brainstorm and verify-first done (2026-10-31): H1 and H2 decided, both verified in a scratch worktree (`scratch/p3`) and on the host. Handoff notes: the decisions, the facts behind them, next steps. The plan these feed is **1b-4a-p3** (`docs/plans/2026-10-31-etw-sensor-1b-4a-p3-plan.md`).
+
+**Where this comes from:** the hour run (D6, R7.5) on the merged plan 1b-4a-p2 code met §13's CPU budget (1.59% of one core) but not the working set (281 MB against 150 MB). Only the file map grew (F2). R7.6 says an overrun comes back as a decision.
+
+## Decisions
+
+| # | Question | Chosen | Rejected |
+|---|---|---|---|
+| H1 | What to do about file map entries whose Close never comes | **A:** an entry leaves the map once its Cleanup's outcome is handled; a small bounded record of recently cleaned FileObjects absorbs late writes. The map then holds open handles only, and memory no longer follows how late Windows closes files | B: smaller entries (the opener by reference, shared paths): a walk like `du`'s still fills the map to its cap; C: a lower cap only: evicts long-open handles' names and still lets memory reach the cap |
+| H1.1–H1.5 | The details (accepted together, after F4) | 1. **When:** the entry leaves when its Cleanup's wait ends, one confirm window after the Cleanup (the window the Cleanup's outcome record already lives for); without OperationEnds (`file.op_end` off), at the Cleanup itself; an entry that an event waits on for the seeder stays until the event is answered, then leaves a window later. 2. **The record:** FileObject values only (no path: F4 found no event that would need one), kept 60 s, at most 65,536, oldest out first (about 2 MB); a write that finds its FileObject there counts `writes_after_cleanup` as before; past it a late write is an unknown handle's, today's rule. 3. **Reuse:** a Create or a Close on a recorded FileObject takes it out. 4. **Observability:** `sizes=` gains `cleaned_fos=`; the file map's 262,144 cap stays and now bounds open handles only; no new counter. 5. **Tests:** each rule gets a unit test checked by reverting it; a walk test leaves the map at its open-handle count; then the hour run again | One at a time |
+| H2 | Provisional entries nothing can name (F5) | **A:** after the start-up pass, with on-miss seeding off, a write on a FileObject the agent never saw opened makes no entry. Its Update would be dropped as `unknown_file_object` anyway; the entry would hold memory until a Close that may not come. During the start-up pass, and with on-miss seeding on, writes make provisional entries as before. Side effect: `unknown_file_object` no longer counts the Update a later Cleanup of such a handle would have dropped (in F5's run none of them got a Cleanup) | B: expire provisional entries through the same retire queue (more code, the same effect, keeps only the count); C: leave it for 1b-4c (bounded by the cap; a 24-hour run would sit near it, about 100 MB of map) |
+
+## Facts
+
+- **F1, the hour run** (2026-10-31, 74.7 minutes of normal use, AC power, the Silent plan; `spikes/results/1b4a-hour/summary-20261031-135154.json`): CPU 1.59% of one core (per-minute p10 / p50 / p90 / max 0.67 / 0.98 / 3.35 / 7.87%), within the 2% workday budget (plan 1b-4a's run: 10.1%). Nothing lost; both unpaired-Cleanup parts 0; 109 enrichment misses, all in one busy minute. Working set 51 → 281 MB, over budget. The run scripts now log the power source and plan at start and end, and the summary the per-minute CPU spread (October 12's run reads 3.4 / 6.0 / 24.1 / 69.4%).
+- **F2, where the memory went** (the log's `sizes=` lines, copied out of the admin-only log folder by `spikes/copy-1b4a-hour-log.ps1`): every structure stayed flat but the file map, which grew by 3,000–5,000 entries a minute, quiet minutes included, from 12:49, to its 262,144 cap (at 13:48 it evicted the oldest eighth, 32,768). Each jump in the working set was one doubling of its table (114k → 229k slots: 144 → 182 MB; 229k → 458k: 202 → 268 MB). At the stop the working set fell to 64 MB: the memory was held, not fragmented. An entry is also costly: it holds a full copy of the opener's `ProcessRef` (image name and path, user), separate heap allocations per entry.
+- **F3, what the map held** (a probe on `scratch/fm-probe`, never for `main`: per health poll, the entries by state, age, opener, extension and folder, and the map's traffic; a 30-minute run, `logs-20261031-144310`): 204,526 of 231,340 entries were files Git Bash's `du` had looked at under the user's projects folder, 99.99% of them past their Cleanup with no Close. Two `du` processes, started from another Claude session at 12:54 and 14:23, ran through both runs (the user ended them). Windows sends the Close of such a FileObject late or not for a long time: 12,000 of `du`'s entries left at once in one minute, by real Closes, with no eviction. The agent's own hash reads linger the same way (2,600). Close (14) is on the session's allow-list and intake passes every one to the pipeline, so nothing is lost on the way. The entries still open stayed small (5k–23k).
+- **F4, which events reach a FileObject past its Cleanup** (the probe extended; `spikes/run-p3-probe.ps1`: 45 s settle, 120 s of `d6load`'s synthetic mix, 300 s of normal use with apps opened and closed; `results/p3-probe/20261031-151443`):
+
+  | Event | On an entry past its Cleanup | Time after the Cleanup |
+  |---|---|---|
+  | SetAttributes | **0** (41,102 on open entries; R5's System bursts hit open handles) | — |
+  | Rename, SetDelete | 0 | — |
+  | The Cleanup's outcome | 20,310 (all) | all < 100 ms |
+  | Write (late) | 2,246 | 58% < 1 s, 77% < 10 s, **99.6% < 60 s**, 10 within 10 min |
+  | Close | 1.06M | 98% < 100 ms; the rest within 10 min |
+
+  So past its Cleanup an entry serves only the outcome (the delete's path and actor, the POSIX-style check) and late writes; the record needs no path (H1.2).
+- **F5, provisional entries:** in F3's run, entries still open grew 4.7k → 22.4k in 30 minutes, 17.5k of them provisional (made by a write on a FileObject never seen opened), none of them ever cleaned up or closed, aging past 10 minutes; about 400–600 a minute, with or without `du` running. With on-miss seeding off (R2) nothing names them after the start-up pass, and any event on them is dropped as `unknown_file_object` (`file_action_on` cannot wait) (H2).
+- **F6, the H1 build on the host** (`spikes/run-p3-host.ps1`: the agent, then Git's `du -s` over the projects folder for 10 minutes, then 3 quiet minutes; `results/p3-host/20261031-162452`): working set at most 70 MB (F3's run: 312 MB), the file map 4.6k → 9.6k entries (F3: 231k), `cleaned_fos` 3.5k–6k during the walk (a minute of `du`'s files), 80 after it. The remaining growth, about 380 entries a minute after `du` stopped too, was F5's.
+- **F7, the H1 + H2 build on the host** (the same script; `results/p3-host/20261031-165224`): the file map 4,485 → 4,511 entries over 13 minutes, the working set at most 71 MB (36 MB at the stop), `cleaned_fos` 3k–5k during the walk and 0 a minute after; nothing lost, no queue drop.
+- **F8, tooling:** the first host try walked nothing: Windows PowerShell 5.1's `Start-Process` does not quote arguments, so the spaced path reached `du` as three; the script now quotes it and stops if `du` exits within 30 s or fails. The agent's log file rolls over at UTC midnight (the summary script reads every file). The revert tool now fails a revert whose test filter matches no test (a renamed test once passed as a "miss").
+
+## Next steps
+
+1. ~~Verify-first~~ done: `scratch/p3` (H1 `eef2877`, H2 `d2e0274`), CI green on both; 15 reverts caught; F6, F7.
+2. Plan 1b-4a-p3 (this branch), the round trip, an independent review, the user's approval.
+3. The build PR (the task commits), then the hour run again: §13's working set, judged from the Sensor Health reports and `sizes=`. Then the profiling step ends and the 1b-4b brainstorm starts.
