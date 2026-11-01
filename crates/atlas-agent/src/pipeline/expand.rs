@@ -50,7 +50,9 @@ impl Expansion {
 
 #[derive(Default)]
 pub struct Expands {
-    by_slot: FastMap<(PendingId, u8), Expansion>,
+    /// Each slot's expansion, with the NT path it asked about when it fills a
+    /// map entry: the FileObject may hold another file by the time it comes.
+    by_slot: FastMap<(PendingId, u8), (Expansion, Option<String>)>,
     /// Per event: slots still unanswered, and how many it asked for.
     outstanding: FastMap<PendingId, (u8, u8)>,
 }
@@ -106,14 +108,15 @@ impl<L: Lookups> Pipeline<L> {
         }
         for (slot, (nt_path, x)) in expansions.into_iter().enumerate() {
             let slot = slot as u8;
-            self.expands.by_slot.insert((id, slot), x);
+            let asked = x.fo.map(|_| nt_path.clone());
+            self.expands.by_slot.insert((id, slot), (x, asked));
             self.requests.push(Request::Expand { id, slot, nt_path });
         }
         Some(id)
     }
 
     pub(super) fn on_expanded(&mut self, id: PendingId, slot: u8, long: Option<String>) {
-        let Some(x) = self.expands.by_slot.remove(&(id, slot)) else { return };
+        let Some((x, asked)) = self.expands.by_slot.remove(&(id, slot)) else { return };
         let left = match self.expands.outstanding.get_mut(&id) {
             Some((n, _)) => {
                 *n = n.saturating_sub(1);
@@ -137,8 +140,11 @@ impl<L: Lookups> Pipeline<L> {
         if let Some(l) = long {
             let file = self.file_obj(&l);
             self.completion.update(id, |e| set_path(e, x.slot, file));
+            // Only into the entry it was asked for: the address may have been
+            // closed and reused, or the file renamed, since (plan 1b-4a-p3 review).
             if let Some(fo) = x.fo
                 && let Some(e) = self.files.map.get_mut(&fo)
+                && e.nt == asked
             {
                 e.expanded = Some(l.clone());
             }
