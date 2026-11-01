@@ -2140,3 +2140,31 @@ fn after_the_start_up_pass_a_late_write_is_still_absorbed() {
     t.at(12_000);
     assert_eq!(t.p.counters().writes_after_cleanup, 1);
 }
+
+/// A late expansion does not name the next file at the same address: A's long
+/// path stays A's when B reuses its FileObject before the answer comes
+/// (plan 1b-4a-p3 review).
+#[test]
+fn a_late_expansion_does_not_name_the_next_file_at_its_address() {
+    let mut t = T::new();
+    running(&mut t, 100, 10, EXPLORER);
+    t.ev(5, 100, Some(key(10)), create(1, 0xA, r"\Device\HarddiskVolume3\PROGRA~1\a.txt", 0));
+    t.ev(6, 100, Some(key(10)), write(0xA));
+    t.ev(7, 100, Some(key(10)), cleanup(1, 0xA, 0x50));
+    t.ev(8, 100, Some(key(10)), RawEvent::FileClose(handle(0xA)));
+    t.ev(10, 100, Some(key(10)), create(2, 0xA, r"\Device\HarddiskVolume3\b.txt", 0));
+    t.ev(11, 100, Some(key(10)), write(0xA));
+    t.at(1_000);
+    for r in t.requests() {
+        if let Request::Expand { id, slot, .. } = r {
+            t.reply(Reply::Expanded {
+                id,
+                slot,
+                long_path: Some(r"\Device\HarddiskVolume3\Program Files\a.txt".into()),
+            });
+        }
+    }
+    t.ev(1_100, 100, Some(key(10)), cleanup(3, 0xA, 0x51));
+    let out = t.settle();
+    assert_eq!(files(&out), [("update", r"C:\Program Files\a.txt".into(), 100), ("update", r"C:\b.txt".into(), 100)]);
+}
