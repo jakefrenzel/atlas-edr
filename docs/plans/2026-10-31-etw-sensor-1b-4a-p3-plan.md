@@ -1,6 +1,6 @@
 # Sub-project 1b-4a-p3 — The File Map's Memory Implementation Plan
 
-> **Status:** Draft (2026-11-02), after an independent review (Review Log; its fixes are in), for the user's approval. **For agentic workers:** steps use checkbox (`- [ ] `) syntax for tracking. Task 4 is a run on the host by the user, from a script. Nothing in this plan needs the VM or a kernel driver.
+> **Status:** Approved by the user (2026-11-02), after an independent review (Review Log; its fixes are in). **For agentic workers:** steps use checkbox (`- [ ] `) syntax for tracking. Task 4 is a run on the host by the user, from a script. Nothing in this plan needs the VM or a kernel driver.
 
 **Goal:** Bring the agent's working set within §13's 150 MB over a workday. The hour run (decision log, 2026-10-31) met the CPU budget (1.59% of one core) but reached 281 MB: the file map kept FileObjects whose Close Windows sends late or not at all. Two fixes, each decided from measured facts (the p3 notes, H1 and H2), and two the review found next to them (H3 and Task 3):
 - **entries leave the file map after their Cleanup** (H1), not at their Close: past its Cleanup an entry serves only the Cleanup's outcome and late writes; a 60 s record of cleaned FileObjects absorbs late writes;

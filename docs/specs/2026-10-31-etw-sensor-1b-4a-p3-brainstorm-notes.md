@@ -39,5 +39,5 @@
 ## Next steps
 
 1. ~~Verify-first~~ done: `scratch/p3` (H1 `eef2877`, H2 `d2e0274`), CI green on both; 15 reverts caught; F6, F7.
-2. ~~Plan 1b-4a-p3, the round trip, an independent review~~ done: the review's fixes on `scratch/p3-review` (Task 1 `027585a`, Task 2 `a9cf02c`, Task 3 `afa65fa`, the spec text `cbd46a1`), CI green, 23 reverts caught, F9. Next: the user's approval.
+2. ~~Plan 1b-4a-p3, the round trip, an independent review~~ done: the review's fixes on `scratch/p3-review` (Task 1 `027585a`, Task 2 `a9cf02c`, Task 3 `afa65fa`, the spec text `cbd46a1`), CI green, 23 reverts caught, F9. Approved by the user (2026-11-02).
 3. The build PR (the task commits), then the hour run again: §13's working set, judged from the Sensor Health reports and `sizes=`. Then the profiling step ends and the 1b-4b brainstorm starts.
