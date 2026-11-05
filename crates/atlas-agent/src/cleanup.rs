@@ -8,7 +8,14 @@
 //! doing it, and an undelete (a disposition set, then cleared) reports
 //! `FILE_REMAINS`.
 
+use std::time::Duration;
+
 use atlas_etw::parse::RawEvent;
+
+/// How long after a Cleanup its Irp's OperationEnd is taken as its outcome
+/// (§5.1): the callback pairs them within it, and the pipeline keeps the
+/// Cleanup's record and its file map entry as long (plan 1b-4a-p3, review M1).
+pub const OUTCOME_WINDOW: Duration = Duration::from_secs(1);
 
 /// The file system did not say (SMB shares).
 pub const UNKNOWN: u64 = 0;
