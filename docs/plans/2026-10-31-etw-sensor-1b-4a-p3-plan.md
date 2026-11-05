@@ -154,7 +154,7 @@ docs/specs/2026-10-01-etw-sensor-design.md   Task 5
 ## Interfaces for later plans
 
 - **The hour run** (Task 4) ends the profiling step: normal use for an hour, judged against §13 from the Sensor Health reports and the `sizes=` lines. If the working set is still over budget, what holds it comes back as a decision.
-- **Plan 1b-4b (blinding detection):** plan 1b-4a-p2's interfaces, plus one item from this review: if the start-up pass never replies (its handle-table read fails), `startup_pending` stays true for the whole run and H2 never applies; Sensor Health should see it, and a deadline may end the pass.
+- **Plan 1b-4b (blinding detection):** plan 1b-4a-p2's interfaces, plus one item from this review: if the start-up pass never replies (its handle-table read fails), `startup_pending` stays true for the whole run and H2 never applies; Sensor Health should see it, and a deadline may end the pass. And one from the build's CI (spec §15.3, F11): under load at start-up a launch can still go out without its hash and signature, which fails `agent-live` now and then. The brainstorm decides what to do about it.
 - **Plan 1b-4c (the service):** the 24-hour run reads `file_map=`, `cleaned_fos=` and `retiring_fos=` in `sizes=`; with H1 and H2 the map should stay near the machine's open-handle count. A machine with on-miss seeding turned on still makes provisional entries (H2 leaves it), bounded by the cap.
 
 ---
