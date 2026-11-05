@@ -38,6 +38,7 @@ A probe on `scratch/p4-probe` (never merged): each hash job stamped at request, 
 - **P9, the deadline clock on a release build** (the same run, 8 runs each, overload of about 1.2M events on release and 2.5M on debug): release: 2 of 3,109 Launches missed on the pipeline's side and the live test's Launch kept its hash in 8 of 8. Debug: 1,639 of 4,363, the hash missing in 6 of 8, and most other checks failing too, because the debug pipeline cannot keep up. So the flaw is real but, at these loads, almost entirely a debug-build effect.
 - **P10, queue drops did not get worse at normal priority** (2026-11-05, from the same runs' reports): `no_queue_drops` failed in 2 of 24 runs at below normal and 0 of 56 at normal. No thread of the agent runs above normal, so at normal the hash workers share the CPU with the ETW consumers and the pipeline as equals. The live test's report does not carry the ETW sessions' own loss, so these runs say nothing about it.
 - **P11, the check can fail** (2026-11-05, run 42078592869): `the_workers_run_at_normal_priority` reads each thread's priority from the running agent. Putting the call back on the hash workers, the seeder or the namer failed that check and no other of the 52; the thread showed -1 (below normal), and 0 without a revert.
+- **P12, `agent-live`'s tests watched at normal priority, no load added** (2026-11-05, run 42079443395, `scratch/p4`, 8 fresh VMs, 2 passes each): the live test passed 16 of 16 and the binary test 16 of 16, every check. One pass happened to reach the real failure's scale, 257,826 events delivered against its 228k: 3 misses, and its Launch kept its hash. That is a single run. Misses were 0 in 13 passes, 3 in two, and 63 in one, a light pass of 14,476 events whose Launch also kept its hash. The 63 are not explained: the reports hold no timing, they do not follow `late_arrivals` (a pass with 310 had none), and being in flight at stop (P7) is possible but not shown. So misses remain at normal priority; what these runs show is that the live test's Launch stopped losing its hash.
 
 ## What is not shown
 
@@ -48,7 +49,7 @@ A probe on `scratch/p4-probe` (never merged): each hash job stamped at request, 
 
 ## Next steps
 
-1. Verify-first on `scratch/p4` (from `main`): Task 1 (C1) and Task 2 (C2) done, CI green, three reverts caught (P11). `agent-live` watched over 16 passes.
+1. Verify-first on `scratch/p4` (from `main`): Task 1 (C1) and Task 2 (C2) done, CI green, three reverts caught (P11), `agent-live`'s tests watched over 16 passes (P12).
 2. The host run, `spikes/run-p4-cost.ps1`: what normal priority costs other programs, and whether it costs ETW loss. The two builds, each with every CPU busy and cold hashes.
 3. The spec: §3.2, §6.3 and §7.4 (priorities), §13 (the host run), §15.3 (P1–P11 and the host run), §16 (the deadline clock), §17 (clarifications).
 4. The plan, review, approval, build. Then plan 1b-4b-1.
