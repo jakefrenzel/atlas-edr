@@ -11,6 +11,7 @@
 //! 3. an actor (this test binary again, `ATLAS_BINARY_ACTOR=1`) creates,
 //!    renames and deletes a file, creates a registry key and value and deletes
 //!    them, opens a TCP connection, resolves two names and runs `cmd.exe`;
+//!    the agent's workers are then found at normal priority;
 //! 4. after the first periodic Sensor Health report, Ctrl+Break stops the
 //!    agent, which must exit 0 after a clean stop;
 //! 5. the buffer is read twice, through `atlas-agent dump` and directly, and
@@ -42,11 +43,17 @@ use atlas_schema::classes::registry::{RegistryKeyAction, RegistryValueAction};
 use atlas_schema::classes::sensor_health::{HealthReport, SensorHealthAction};
 use atlas_schema::{Event, EventKind, decode_event};
 use serde_json::{Value, json};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::System::Console::{AllocConsole, CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetConsoleWindow};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_OPTION_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
     RegSetValueExW,
+};
+use windows::Win32::System::Threading::{
+    GetThreadDescription, GetThreadPriority, OpenThread, THREAD_PRIORITY_NORMAL, THREAD_QUERY_LIMITED_INFORMATION,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -55,6 +62,9 @@ const ACTOR_ENV: &str = "ATLAS_BINARY_ACTOR";
 const RESULT: &str = "ATLAS_BINARY_RESULT ";
 const SESSIONS: [&str; 2] = ["Atlas-Sensor", "Atlas-Process"];
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+/// Below normal, a busy machine starves these past the deadlines they serve
+/// (plan 1b-4a-p4, C1).
+const NORMAL_PRIORITY_THREADS: [&str; 2] = ["atlas-hash-0", "atlas-hash-1"];
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
@@ -308,6 +318,14 @@ fn binary_run_and_dump() {
         .unwrap_or_else(|| panic!("the actor gave no result: {text}"));
     let actor_pid = result["pid"].as_u64().unwrap() as u32;
 
+    // Plan 1b-4a-p4: read here, well after each thread's first instructions.
+    let threads = thread_priorities(agent_pid);
+    let at_normal = NORMAL_PRIORITY_THREADS.iter().all(|name| {
+        let mut named = threads.iter().filter(|(n, _)| n == name).peekable();
+        named.peek().is_some() && named.all(|(_, p)| *p == THREAD_PRIORITY_NORMAL.0)
+    });
+    report.check("the_workers_run_at_normal_priority", at_normal, format!("{threads:?}"));
+
     // ---- a periodic report, then the clean stop ----
     // A report that lists the threads: the first one after a minute, a loss
     // report included (review m6).
@@ -506,6 +524,32 @@ fn stop_during_start(report: &mut Report, data: &Path) {
         last.is_some_and(|e| matches!(e.kind, EventKind::SensorHealth(_))),
         "",
     );
+}
+
+/// The name and base priority of each of `pid`'s threads.
+fn thread_priorities(pid: u32) -> Vec<(String, i32)> {
+    let mut threads = Vec::new();
+    // SAFETY: the snapshot and each thread handle are closed here; `entry` is a
+    // writable THREADENTRY32 with its size set; the description is freed once read.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).expect("a thread snapshot");
+        let mut entry = THREADENTRY32 { dwSize: size_of::<THREADENTRY32>() as u32, ..Default::default() };
+        let mut more = Thread32First(snapshot, &mut entry).is_ok();
+        while more {
+            if entry.th32OwnerProcessID == pid
+                && let Ok(thread) = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, entry.th32ThreadID)
+            {
+                if let Ok(name) = GetThreadDescription(thread) {
+                    threads.push((name.to_string().unwrap_or_default(), GetThreadPriority(thread)));
+                    let _ = LocalFree(Some(HLOCAL(name.as_ptr().cast())));
+                }
+                let _ = CloseHandle(thread);
+            }
+            more = Thread32Next(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    threads
 }
 
 fn unix_now() -> i64 {
