@@ -1,6 +1,6 @@
 # Sub-project 1, plan 1b-4a-p4 — A Launch Without Its Hash: Brainstorm Notes
 
-**Status:** brainstorm done (2026-11-04): C1 and C2 decided; the host run and C3 done (2026-11-05); the plan is reviewed and approved ([plan 1b-4a-p4](../plans/2026-11-05-etw-sensor-1b-4a-p4-plan.md)). Comes before plan 1b-4b-1 ([1b-4b notes](2026-11-04-etw-sensor-1b-4b-brainstorm-notes.md), B2). The question: why a Launch can go out without its hash and signature under load (spec §15.3, plan 1b-4a-p3's F11), which fails `agent-live` now and then.
+**Status:** brainstorm done (2026-11-04): C1 and C2 decided; the host run and C3 done (2026-11-05); the plan is reviewed, approved and built ([plan 1b-4a-p4](../plans/2026-11-05-etw-sensor-1b-4a-p4-plan.md)). Comes before plan 1b-4b-1 ([1b-4b notes](2026-11-04-etw-sensor-1b-4b-brainstorm-notes.md), B2). The question: why a Launch can go out without its hash and signature under load (spec §15.3, plan 1b-4a-p3's F11), which fails `agent-live` now and then.
 
 ## Decisions
 
@@ -76,4 +76,4 @@ A probe on `scratch/p4-probe` (never merged): each hash job stamped at request, 
 1. Verify-first on `scratch/p4` (from `main`): Task 1 (C1) and Task 2 (C2) done, CI green, three reverts caught (P11), `agent-live`'s tests watched over 16 passes (P12).
 2. The host run, `spikes/run-p4-cost.ps1`: done (2026-11-05, P13).
 3. The spec text: `scratch/p4-review`, as the plan's Task 3 (§3.2, §6.3, §7.4, §13, §15.3, §16, §17).
-4. The plan: reviewed (M1 and its fixes), C3 decided again, approved (2026-11-05). Then the build, and plan 1b-4b-1.
+4. The plan: reviewed (M1 and its fixes), C3 decided again, approved and built (2026-11-05). Plan 1b-4b-1 is next.

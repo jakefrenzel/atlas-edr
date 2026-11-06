@@ -34,9 +34,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::Registry::{HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW};
-use windows::Win32::System::Threading::{
-    GetCurrentThread, GetThreadTimes, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-};
+use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
 use windows::core::w;
 
 use super::handles::{Entry, FileName, FileNamer, duplicate, object_name, open_process, table};
@@ -256,17 +254,14 @@ impl Seeder {
     }
 }
 
-/// The seeder thread: answers `Request::Seed`, below normal priority.
+/// The seeder thread: answers `Request::Seed`. At normal priority (plan
+/// 1b-4a-p4, C2): below normal, a busy machine held the start-up pass for 12 s or more.
 pub(crate) fn run(
     mut seeder: Seeder,
     jobs: Receiver<(HandleKind, Vec<u64>)>,
     replies: Sender<Reply>,
     cfg: &ServiceConfig,
 ) {
-    // SAFETY: lowers this thread's priority.
-    unsafe {
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
     let counters = seeder.counters.clone();
     let mut budget = Budget::new(cfg.seeder_cpu, cfg.seeder_cpu_window);
     let mut waiting = Waiting::default();

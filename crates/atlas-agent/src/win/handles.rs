@@ -19,10 +19,7 @@ use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_I
 use windows::Win32::Foundation::{DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE, UNICODE_STRING};
 use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_NT};
 use windows::Win32::System::IO::{CancelSynchronousIo, IO_STATUS_BLOCK};
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, OpenProcess, PROCESS_DUP_HANDLE, SetThreadPriority,
-    THREAD_PRIORITY_BELOW_NORMAL,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
 
 use super::util::{Owned, aligned, as_bytes};
 
@@ -224,10 +221,6 @@ impl Helper {
         let thread = std::thread::Builder::new()
             .name("atlas-seeder-namer".into())
             .spawn(move || {
-                // SAFETY: lowers this thread's priority, as the seeder's.
-                unsafe {
-                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                }
                 for h in jobs {
                     let name = disk_file_name(&h);
                     // A failed send means the seeder gave up on this query; `h` closes here.

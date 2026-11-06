@@ -1,13 +1,14 @@
 //! The services' threads and the routing of [`Request`]s to them (sensor spec
 //! §3.2 [4] and [8]; plan 1b-3b, D5).
 //!
-//! - **Hash workers** (2, below normal): `Enrich`, Launch images first (plan
-//!   1b-4a-p2, R4): while the cache is cold a Launch would otherwise wait
-//!   behind dozens of module loads and miss its 1 s deadline (F9).
+//! - **Hash workers** (2): `Enrich`, Launch images first (plan 1b-4a-p2, R4):
+//!   while the cache is cold a Launch would otherwise wait behind dozens of
+//!   module loads and miss its 1 s deadline (F9). They run at normal priority
+//!   (plan 1b-4a-p4, C1): below normal, a busy machine starved them past it.
 //! - **Reader lane** (1): value reads, on the ordered path and the fast path.
 //!   It does no file I/O, so a slow directory never delays a value read (R-M2).
 //! - **Expander lane** (1): 8.3 expansion (D4).
-//! - **Seeder** (1, below normal): `Seed`, when `SeDebugPrivilege` is available.
+//! - **Seeder** (1): `Seed`, when `SeDebugPrivilege` is available.
 //!
 //! Lanes are bounded and never block the caller. A full lane drops the request
 //! and counts it: a dropped `Enrich`, `ReadValue`, `Expand` or `Seed` costs its
@@ -17,22 +18,20 @@
 //! parked worker costs about 22 µs of CPU, and every file Update, Rename and
 //! Delete invalidates both caches. The hash cache's invalidations go on a
 //! channel the workers drain before their next lookup: the caller (the
-//! pipeline thread) sends without taking a lock a below-normal worker could
-//! hold (review 4). Its key holds the USN, so they only free memory, and past
-//! the lane's capacity the newest is dropped. The expansion cache's wait in a
-//! list the expander applies before its next expansion, so none is applied
-//! late; if the list fills first, the expander clears its whole cache instead
-//! (R-M3), and the list keeps nothing more until then (review 3). Neither is a
-//! counted drop. Replies come back on one channel, which the driver (plan
-//! 1b-3c) feeds to `Pipeline::reply`.
+//! pipeline thread) sends without taking a lock a worker could hold (review 4).
+//! Its key holds the USN, so they only free memory, and past the lane's
+//! capacity the newest is dropped. The expansion cache's wait in a list the
+//! expander applies before its next expansion, so none is applied late; if the
+//! list fills first, the expander clears its whole cache instead (R-M3), and
+//! the list keeps nothing more until then (review 3). Neither is a counted
+//! drop. Replies come back on one channel, which the driver (plan 1b-3c) feeds
+//! to `Pipeline::reply`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Instant;
-
-use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
 
 use super::expand::{Dir, Expander, NtDir};
 use super::hash::{Enricher, HashCache};
@@ -328,10 +327,6 @@ fn hash_worker(
     counters: &ServiceCounters,
     size_cap: u64,
 ) {
-    // SAFETY: lowers this thread's priority.
-    unsafe {
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
     let enricher = Enricher::new(size_cap);
     while let Some((id, nt_path)) = jobs.pop() {
         forgets.apply(cache);
