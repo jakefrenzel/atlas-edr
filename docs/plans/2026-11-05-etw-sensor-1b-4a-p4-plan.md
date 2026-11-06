@@ -1,6 +1,6 @@
 # Sub-project 1b-4a-p4 — A Launch Without Its Hash Implementation Plan
 
-> **Status:** Draft, after an independent review (Review Log; its fixes are in), for the user's approval. **For agentic workers:** steps use checkbox (`- [ ] `) syntax for tracking. Nothing in this plan needs the VM, a kernel driver or a run by the user: the host run it depends on is done (P13).
+> **Status:** Approved by the user (2026-11-05), after an independent review (Review Log; its fixes are in). **For agentic workers:** steps use checkbox (`- [ ] `) syntax for tracking. Nothing in this plan needs the VM, a kernel driver or a run by the user: the host run it depends on is done (P13).
 
 **Goal:** Stop a busy machine from starving the agent's enrichment. Under load a Launch could go out without its hash and signature, which failed `agent-live` now and then (spec §15.3, plan 1b-4a-p3's F11), and an attacker can make that load on purpose. Two fixes, each decided from measured facts (the p4 notes, C1 and C2):
 - **the hash workers run at normal priority** (C1): the live test's Launch lost its hash in 13 of 24 runs below normal, and 0 of 56 at normal;
