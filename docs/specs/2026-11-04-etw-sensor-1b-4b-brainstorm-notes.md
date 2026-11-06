@@ -25,5 +25,5 @@
 
 ## Next steps
 
-1. Plan 1b-4a-p4: brainstorm and host run done ([p4 notes](2026-11-04-etw-sensor-1b-4a-p4-brainstorm-notes.md): C1, C2, C3); [plan](../plans/2026-11-05-etw-sensor-1b-4a-p4-plan.md) reviewed and approved; the build next.
+1. Plan 1b-4a-p4: brainstorm and host run done ([p4 notes](2026-11-04-etw-sensor-1b-4a-p4-brainstorm-notes.md): C1, C2, C3); [plan](../plans/2026-11-05-etw-sensor-1b-4a-p4-plan.md) built (2026-11-05).
 2. Brainstorm 1b-4b-1.
