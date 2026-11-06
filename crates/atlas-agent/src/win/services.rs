@@ -8,7 +8,7 @@
 //! - **Reader lane** (1): value reads, on the ordered path and the fast path.
 //!   It does no file I/O, so a slow directory never delays a value read (R-M2).
 //! - **Expander lane** (1): 8.3 expansion (D4).
-//! - **Seeder** (1, below normal): `Seed`, when `SeDebugPrivilege` is available.
+//! - **Seeder** (1): `Seed`, when `SeDebugPrivilege` is available.
 //!
 //! Lanes are bounded and never block the caller. A full lane drops the request
 //! and counts it: a dropped `Enrich`, `ReadValue`, `Expand` or `Seed` costs its

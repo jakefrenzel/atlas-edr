@@ -63,8 +63,8 @@ const RESULT: &str = "ATLAS_BINARY_RESULT ";
 const SESSIONS: [&str; 2] = ["Atlas-Sensor", "Atlas-Process"];
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// Below normal, a busy machine starves these past the deadlines they serve
-/// (plan 1b-4a-p4, C1).
-const NORMAL_PRIORITY_THREADS: [&str; 2] = ["atlas-hash-0", "atlas-hash-1"];
+/// (plan 1b-4a-p4, C1 and C2).
+const NORMAL_PRIORITY_THREADS: [&str; 4] = ["atlas-hash-0", "atlas-hash-1", "atlas-seeder", "atlas-seeder-namer"];
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
