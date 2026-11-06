@@ -19,10 +19,11 @@
 
 - **F11 (spec §15.3):** under load at start-up a launch can go out without its hash and signature, which fails `agent-live` now and then. Goes to plan 1b-4a-p4 (B2).
 - **H2 (plan 1b-4a-p3, Interfaces):** if the start-up pass never replies, `startup_pending` stays true for the whole run and H2 never applies; Sensor Health should see it, and a deadline may end the pass.
+- **Session A's stalls (plan 1b-4a-p4, P13, C3):** with every CPU busy, delivery stalled for about the 750 ms hold three times in 8 host runs, on both priorities, dropping 21 and 11 Launch halves (`actor_dropped`) in 1,800 launches each: probably as many Launches without their command line and user. Not explained, and not tied to the workers' priority or cleared of it. A stall during the binary test would fail `every_report_measures_zero_loss`. The watchdog looks at delivery, so 1b-4b-1's brainstorm takes this up; the ETW consumer's priority is one thing to try.
 - **A restarted session's counters start from 0** (plan 1b-4a, Interfaces): reset the health base, or the 32-bit wrap reports about 4.29e9 lost.
 - **A spare `FastRead`** (plan 1b-3c, Interfaces): made before the driver takes the services.
 
 ## Next steps
 
-1. Plan 1b-4a-p4: brainstorm done ([p4 notes](2026-11-04-etw-sensor-1b-4a-p4-brainstorm-notes.md): C1, C2); spec, plan and build next.
+1. Plan 1b-4a-p4: brainstorm and host run done ([p4 notes](2026-11-04-etw-sensor-1b-4a-p4-brainstorm-notes.md): C1, C2, C3); [plan](../plans/2026-11-05-etw-sensor-1b-4a-p4-plan.md) drafted; review, approval and build next.
 2. Brainstorm 1b-4b-1.
