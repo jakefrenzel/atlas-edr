@@ -3,6 +3,7 @@ name: ci
 
 on:
   push:
+    branches-ignore: [scratch/b4-probe]
   pull_request:
 
 permissions:

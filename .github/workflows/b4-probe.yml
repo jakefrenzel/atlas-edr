@@ -1,0 +1,31 @@
+name: b4-probe
+
+on:
+  push:
+    branches: [scratch/b4-probe]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.97"
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        vm: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+      - name: Probe
+        shell: bash
+        run: cargo test -p atlas-etw --test restart_probe --release -- --ignored --test-threads=1 --nocapture
